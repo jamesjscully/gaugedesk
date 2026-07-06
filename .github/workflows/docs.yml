@@ -1,0 +1,45 @@
+# Build and deploy the user documentation (docs/ → docs.gaugewright.com).
+# Runs only when the docs change; gates on `mkdocs build --strict` (broken
+# links/nav fail), then deploys to the Cloudflare Pages project `gaugewright-docs`.
+#
+# Requires two repo secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   — scoped token with Account › Cloudflare Pages › Edit
+#   CLOUDFLARE_ACCOUNT_ID  — (repo secret)
+name: Deploy docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-deploy
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install docs dependencies
+        run: pip install -r docs/requirements.txt
+      - name: Build (strict — broken links/nav fail the build)
+        run: mkdocs build --strict
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name=gaugewright-docs --branch=main

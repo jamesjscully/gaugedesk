@@ -1,0 +1,536 @@
+/**
+ * The per-project **Engagement** pane (`FED-7`) — the product surface for handing a
+ * project's home to a client machine and co-owning it, opened **from a project** (its
+ * id comes from context, never typed). It replaces the old global `FederationPanel`
+ * modal's project half: no raw `offer`/`sync`/`commit`/`abort` controls, no typed
+ * project id, no typed payload "handle".
+ *
+ * It renders projections — the [[handoff]] status, participants, and connected data —
+ * and submits control-plane commands (`INV-5`): one **Hand off** action (relocate the
+ * home to a paired peer; the two-phase commit runs underneath, invisible), per-owner
+ * **revoke** (licensing, future-only), and **Connect a folder** (a native folder
+ * picker; the data handle is derived under the hood, never shown). Device pairing and
+ * incoming consent live in the global Devices modal (Settings ▸ Devices).
+ */
+
+import { createResource, createSignal, For, Show, type JSX } from "solid-js";
+import { describeFailure, type ProjectId } from "@gaugewright/control-plane-client";
+import {
+    type EngagementInvite,
+    type FederationPeer,
+    type HandoffStatus,
+    type ConnectedData,
+    type Participant,
+    type PlacedRun,
+    type QueuedRun,
+    type RunResult,
+} from "@gaugewright/control-plane-client";
+import { qrSvg } from "./qr-code";
+
+const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/** A human label for where the project's home is, from the folded handoff status. */
+function homeLabel(s: HandoffStatus | null | undefined): string {
+    if (!s || s.phase === "draft") return "this device";
+    if (s.phase === "committed") return s.home === "target" ? "the client's device" : "this device";
+    if (s.phase === "offered" || s.phase === "log_synced") return "this device (handoff in flight)";
+    return "this device";
+}
+
+export interface EngagementPaneApi {
+    handoffStatus(project: ProjectId): Promise<HandoffStatus>;
+    handoffParticipants(project: ProjectId): Promise<Participant[]>;
+    handoffData(project: ProjectId): Promise<ConnectedData[]>;
+    listPeers(): Promise<FederationPeer[]>;
+    runQueue(): Promise<QueuedRun[]>;
+    handoffRelocate(project: ProjectId, peer: string): Promise<HandoffStatus>;
+    invite(project: ProjectId): Promise<EngagementInvite>;
+    inviteStatus(inviteId: string): Promise<{ accepted: boolean; accepted_by: string | null; confirm_code: string }>;
+    handoffAbort(project: ProjectId): Promise<HandoffStatus>;
+    handoffRevoke(project: ProjectId, authority: string, owns: string): Promise<void>;
+    placeRun(
+        peer: string,
+        project: ProjectId,
+        archetype: string,
+        dataHandle: string,
+        prompt: string,
+    ): Promise<PlacedRun>;
+    runResult(correlation: string): Promise<RunResult>;
+    admitRunOnce(correlation: string): Promise<void>;
+    allowRuns(project: ProjectId, operator: string): Promise<void>;
+    denyRun(correlation: string): Promise<void>;
+    handoffConnectData(project: ProjectId, handle: string, label?: string): Promise<void>;
+}
+
+export function EngagementPane(props: {
+    api: EngagementPaneApi;
+    project: ProjectId;
+    projectName: string;
+    onClose: () => void;
+}): JSX.Element {
+    const [status, setStatus] = createSignal("");
+    const [peer, setPeer] = createSignal("");
+    // A minted combined invite (FED-7 Slice 2): shown as a QR + link + confirm code
+    // while waiting for the client to accept on a fresh device.
+    const [invite, setInvite] = createSignal<EngagementInvite | null>(null);
+    const [accepted, setAccepted] = createSignal(false);
+    // The folder a non-Tauri (browser/e2e) host connects, since there is no native
+    // picker there — an inline field stands in for the dialog.
+    const [folder, setFolder] = createSignal("");
+    const [showFolderField, setShowFolderField] = createSignal(false);
+
+    const [handoff, { refetch: refetchHandoff }] = createResource(
+        () => props.project,
+        (p) => props.api.handoffStatus(p),
+    );
+    const [participants, { refetch: refetchParticipants }] = createResource(
+        () => props.project,
+        (p) => props.api.handoffParticipants(p),
+    );
+    const [connected, { refetch: refetchData }] = createResource(
+        () => props.project,
+        (p) => props.api.handoffData(p),
+    );
+    const [peers] = createResource(() => props.api.listPeers());
+    // Co-drive (FED-7): the host's admission queue (pending operator runs for this
+    // project), and the operator's place-a-run controls.
+    const [queue, { refetch: refetchQueue }] = createResource(
+        () => props.project,
+        async (p) => (await props.api.runQueue()).filter((r) => r.project === p),
+    );
+    const [runArchetype, setRunArchetype] = createSignal("");
+    const [runPrompt, setRunPrompt] = createSignal("");
+
+    const refetchAll = () => {
+        void refetchHandoff();
+        void refetchParticipants();
+        void refetchData();
+    };
+
+    const phase = () => handoff()?.phase ?? "draft";
+    const handedOff = () => phase() === "committed";
+    const inFlight = () => phase() === "offered" || phase() === "log_synced";
+    const pairedPeers = () => (peers() ?? []).filter((p: FederationPeer) => p.active);
+
+    const handOff = async () => {
+        const target = peer() || pairedPeers()[0]?.authority;
+        if (!target) {
+            setStatus("pair a device first (in Paired devices)");
+            return;
+        }
+        try {
+            const s = await props.api.handoffRelocate(props.project, target);
+            setStatus(
+                s.phase === "committed"
+                    ? `handed off to ${target} — home is now there`
+                    : `invite sent to ${target} — waiting for them to accept`,
+            );
+            refetchAll();
+        } catch (e) {
+            setStatus(describeFailure("hand off", e));
+        }
+    };
+    // Mint a combined invite for a *new* device (first contact, no prior pairing) and
+    // poll until the client accepts — one link that pairs and hands off (ADR 0047).
+    const inviteNewDevice = async () => {
+        try {
+            const inv = await props.api.invite(props.project);
+            setInvite(inv);
+            setAccepted(false);
+            setStatus("invite ready — share the QR or link; waiting for the client to accept");
+            void pollInvite(inv.invite_id);
+        } catch (e) {
+            setStatus(describeFailure("create the invite", e));
+        }
+    };
+    const pollInvite = async (inviteId: string) => {
+        for (let i = 0; i < 60 && !accepted(); i++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            try {
+                const s = await props.api.inviteStatus(inviteId);
+                if (s.accepted) {
+                    setAccepted(true);
+                    setStatus(`accepted by ${s.accepted_by ?? "a device"} · confirm code ${s.confirm_code}`);
+                    refetchAll();
+                    return;
+                }
+            } catch {
+                /* keep polling */
+            }
+        }
+    };
+    const copyInvite = async () => {
+        const url = invite()?.invite_url;
+        if (url) {
+            try {
+                await navigator.clipboard?.writeText(url);
+                setStatus("invite link copied");
+            } catch {
+                /* selectable regardless */
+            }
+        }
+    };
+    const cancel = async () => {
+        try {
+            await props.api.handoffAbort(props.project);
+            setStatus("handoff cancelled — the project stays here");
+            refetchAll();
+        } catch (e) {
+            setStatus(describeFailure("cancel the handoff", e));
+        }
+    };
+    const revoke = async (authority: string, owns: string) => {
+        try {
+            await props.api.handoffRevoke(props.project, authority, owns);
+            setStatus(`revoked ${authority}'s access to ${owns}`);
+            refetchParticipants();
+        } catch (e) {
+            setStatus(describeFailure("revoke access", e));
+        }
+    };
+    // Operator: place a run on the host (executes if allowed, else queues for admission).
+    const placeRun = async () => {
+        const target = peer() || pairedPeers()[0]?.authority;
+        if (!target) {
+            setStatus("no paired host to place a run on");
+            return;
+        }
+        try {
+            const r = await props.api.placeRun(
+                target,
+                props.project,
+                runArchetype().trim() || "archetype",
+                connected()?.[0]?.handle ?? "data",
+                runPrompt().trim() || "go",
+            );
+            setStatus(
+                r.status === "admitted"
+                    ? `run executed on the host (${r.observations_admitted ?? 0} observations)`
+                    : r.status === "pending"
+                      ? "run placed — waiting for the host to admit it"
+                      : `run refused: ${r.reason ?? "?"}`,
+            );
+            setRunPrompt("");
+            refetchQueue();
+            // If it landed pending, poll for the host's "Allow once" delivery.
+            if (r.status === "pending") void pollRunResult(r.correlation);
+        } catch (e) {
+            setStatus(describeFailure("place the run", e));
+        }
+    };
+    const pollRunResult = async (correlation: string) => {
+        for (let i = 0; i < 120; i++) {
+            await new Promise((res) => setTimeout(res, 1000));
+            try {
+                const r = await props.api.runResult(correlation);
+                if (r.status === "done") {
+                    setStatus(`host ran it (${r.observations_admitted ?? 0} observations)`);
+                    return;
+                }
+            } catch {
+                /* keep polling */
+            }
+        }
+    };
+    // Host: admit a queued operator run — once, or as a standing per-project allow — or deny.
+    const admitOnce = async (correlation: string) => {
+        try {
+            await props.api.admitRunOnce(correlation);
+            setStatus("ran it once");
+            refetchQueue();
+        } catch (e) {
+            setStatus(describeFailure("allow once", e));
+        }
+    };
+    const allowProject = async (operator: string) => {
+        try {
+            await props.api.allowRuns(props.project, operator);
+            setStatus(`allowed ${operator}'s runs on this project`);
+            refetchQueue();
+        } catch (e) {
+            setStatus(describeFailure("allow runs", e));
+        }
+    };
+    const denyRun = async (correlation: string) => {
+        try {
+            await props.api.denyRun(correlation);
+            setStatus("run denied");
+            refetchQueue();
+        } catch (e) {
+            setStatus(describeFailure("deny the run", e));
+        }
+    };
+    const connectFolder = async () => {
+        let path = folder().trim();
+        if (isTauri()) {
+            const { open } = await import("@tauri-apps/plugin-dialog");
+            const picked = await open({
+                directory: true,
+                multiple: false,
+                title: `Connect a folder to ${props.projectName}`,
+            });
+            if (typeof picked !== "string") return;
+            path = picked;
+        } else if (!showFolderField()) {
+            // First click in a browser host reveals the stand-in field for the picker.
+            setShowFolderField(true);
+            return;
+        }
+        if (!path) return;
+        try {
+            // The handle is derived from the folder path; the user never sees it.
+            const label = path.split("/").filter(Boolean).pop() ?? path;
+            await props.api.handoffConnectData(props.project, path, label);
+            setStatus(`connected ${label}`);
+            setFolder("");
+            setShowFolderField(false);
+            refetchData();
+        } catch (e) {
+            setStatus(describeFailure("connect the folder", e));
+        }
+    };
+
+    return (
+        <div class="modal-overlay" data-engagement-modal onClick={() => props.onClose()}>
+            <div
+                class="modal engagement-pane"
+                data-engagement-pane={props.project}
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => e.key === "Escape" && props.onClose()}
+            >
+                <div class="modal-head">
+                    <h3>Engagement — {props.projectName}</h3>
+                    <button type="button" onClick={() => props.onClose()}>close</button>
+                </div>
+
+                {/* Home + connectivity */}
+                <p class="status" data-engagement-home>
+                    Home: <strong>{homeLabel(handoff())}</strong>
+                    {" · "}
+                    <span data-engagement-phase>{phase()}</span>
+                </p>
+
+                {/* The single state-driven action — never the raw state machine. */}
+                <Show
+                    when={!handedOff()}
+                    fallback={
+                        <p class="status" data-engagement-status>
+                            This project's home is on the client's device. You drive runs they admit.
+                        </p>
+                    }
+                >
+                    <Show
+                        when={inFlight()}
+                        fallback={
+                            <div class="engagement-handoff">
+                                <Show
+                                    when={invite()}
+                                    fallback={
+                                        <div class="pair-device-actions">
+                                            {/* First contact: one invite that pairs + hands off. */}
+                                            <button
+                                                type="button"
+                                                class="tree-action"
+                                                data-engagement-invite
+                                                onClick={() => void inviteNewDevice()}
+                                            >
+                                                Invite a new device
+                                            </button>
+                                            {/* Already-paired device: hand off directly. */}
+                                            <Show when={pairedPeers().length > 0}>
+                                                <select
+                                                    class="fed-paste"
+                                                    data-engagement-peer
+                                                    value={peer()}
+                                                    onChange={(e) => setPeer(e.currentTarget.value)}
+                                                >
+                                                    <For each={pairedPeers()}>
+                                                        {(p) => <option value={p.authority}>{p.authority}</option>}
+                                                    </For>
+                                                </select>
+                                                <button
+                                                    type="button"
+                                                    class="tree-action"
+                                                    data-engagement-handoff
+                                                    onClick={() => void handOff()}
+                                                >
+                                                    Hand off to this device
+                                                </button>
+                                            </Show>
+                                        </div>
+                                    }
+                                >
+                                    {(inv) => (
+                                        <div class="engagement-invite">
+                                            <p class="status">Have the client scan this or open the link:</p>
+                                            <div
+                                                class="pd-qr"
+                                                data-engagement-qr
+                                                innerHTML={qrSvg(inv().invite_url)}
+                                            />
+                                            <code class="pair-ticket" data-engagement-invite-link>
+                                                {inv().invite_url}
+                                            </code>
+                                            <p class="status">
+                                                Confirm code: <strong>{inv().confirm_code}</strong> — verify the
+                                                client reads this back.
+                                            </p>
+                                            <div class="pair-device-actions">
+                                                <button
+                                                    type="button"
+                                                    class="tree-action"
+                                                    data-engagement-invite-copy
+                                                    onClick={() => void copyInvite()}
+                                                >
+                                                    copy link
+                                                </button>
+                                            </div>
+                                            <Show when={accepted()}>
+                                                <p class="status" data-engagement-accepted>
+                                                    ✓ accepted — home moving to the client
+                                                </p>
+                                            </Show>
+                                        </div>
+                                    )}
+                                </Show>
+                            </div>
+                        }
+                    >
+                        <div class="engagement-handoff pair-device-actions">
+                            <span class="status" data-engagement-status>
+                                Invite sent — waiting for the client to accept.
+                            </span>
+                            <button type="button" class="tree-action" data-engagement-cancel onClick={() => void cancel()}>
+                                cancel
+                            </button>
+                        </div>
+                    </Show>
+                </Show>
+
+                {/* Participants & ownership (revoke = licensing, not secrecy). */}
+                <Show when={(participants() ?? []).length > 0}>
+                    <p class="status" style={{ margin: "12px 0 4px" }}>People &amp; ownership:</p>
+                    <ul class="fed-participants" data-engagement-participants>
+                        <For each={participants() ?? []}>
+                            {(p) => (
+                                <li class="fed-participant" data-engagement-participant={p.authority}>
+                                    <span class="fed-peer-name">{p.authority}</span>
+                                    <span>{p.role} · owns {p.owns}</span>
+                                    <Show when={!p.revoked} fallback={<span class="fed-peer-grant">revoked</span>}>
+                                        <button
+                                            type="button"
+                                            class="tree-action"
+                                            data-engagement-revoke={p.owns}
+                                            onClick={() => void revoke(p.authority, p.owns)}
+                                        >
+                                            {p.owns === "data" ? "Stop sharing" : "Revoke access"}
+                                        </button>
+                                    </Show>
+                                </li>
+                            )}
+                        </For>
+                    </ul>
+                </Show>
+
+                {/* Connected data — a folder picker, never a handle. */}
+                <p class="status" style={{ margin: "12px 0 4px" }}>Connected data:</p>
+                <ul class="fed-data" data-engagement-data>
+                    <For
+                        each={connected() ?? []}
+                        fallback={<li class="status">No folder connected yet.</li>}
+                    >
+                        {(d) => <li data-engagement-data-item={d.handle}>{d.label ?? d.handle}</li>}
+                    </For>
+                </ul>
+                <Show when={showFolderField() && !isTauri()}>
+                    <input
+                        class="fed-paste"
+                        data-engagement-folder
+                        value={folder()}
+                        placeholder="/path/to/folder"
+                        onInput={(e) => setFolder(e.currentTarget.value)}
+                    />
+                </Show>
+                <button
+                    type="button"
+                    class="tree-action"
+                    data-engagement-connect-data
+                    onClick={() => void connectFolder()}
+                >
+                    Connect a folder
+                </button>
+
+                {/* Co-drive: the host's admission queue + the operator's place-a-run. */}
+                <p class="status" style={{ margin: "12px 0 4px" }}>Co-drive runs:</p>
+                <Show when={(queue() ?? []).length > 0}>
+                    <ul class="fed-incoming" data-engagement-run-queue>
+                        <For each={queue() ?? []}>
+                            {(r) => (
+                                <li class="fed-incoming-item" data-engagement-run={r.correlation}>
+                                    <span>
+                                        <strong>{r.operator}</strong> wants to run{" "}
+                                        <strong>{r.archetype}</strong> on <code>{r.data_handle}</code>
+                                    </span>
+                                    <button
+                                        type="button"
+                                        class="tree-action"
+                                        data-engagement-run-once={r.correlation}
+                                        onClick={() => void admitOnce(r.correlation)}
+                                    >
+                                        Allow once
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="tree-action"
+                                        data-engagement-run-allow={r.operator}
+                                        onClick={() => void allowProject(r.operator)}
+                                    >
+                                        Allow for project
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="tree-action"
+                                        data-engagement-run-deny={r.correlation}
+                                        onClick={() => void denyRun(r.correlation)}
+                                    >
+                                        Deny
+                                    </button>
+                                </li>
+                            )}
+                        </For>
+                    </ul>
+                </Show>
+                <Show when={handedOff()}>
+                    <div class="pair-device-actions">
+                        <input
+                            class="fed-paste"
+                            data-engagement-run-archetype
+                            value={runArchetype()}
+                            placeholder="archetype"
+                            onInput={(e) => setRunArchetype(e.currentTarget.value)}
+                        />
+                        <input
+                            class="fed-paste"
+                            data-engagement-run-prompt
+                            value={runPrompt()}
+                            placeholder="what should it do?"
+                            onInput={(e) => setRunPrompt(e.currentTarget.value)}
+                        />
+                        <button
+                            type="button"
+                            class="tree-action"
+                            data-engagement-place-run
+                            onClick={() => void placeRun()}
+                        >
+                            Place a run
+                        </button>
+                    </div>
+                </Show>
+
+                <Show when={status()}>
+                    <p class="status" data-engagement-feedback>{status()}</p>
+                </Show>
+            </div>
+        </div>
+    );
+}

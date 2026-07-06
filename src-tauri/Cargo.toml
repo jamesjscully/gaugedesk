@@ -1,0 +1,30 @@
+# gaugewright desktop shell (Tauri v2). Its own workspace — building it needs the
+# Tauri CLI + system webkit deps, so it is deliberately outside the backend
+# cargo workspace (which stays self-contained and green).
+[package]
+name = "gaugewright-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "GaugeBench desktop workbench (Tauri v2 shell + co-resident control plane)."
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+# Self-update: verifies signed update artifacts against the pubkey in
+# tauri.conf.json (plugins.updater) and fetches the GitHub Release `latest.json`.
+tauri-plugin-updater = "2"
+gaugewright-app = { path = "../crates/app", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# `tauri::generate_context!()` expands to code that parses the bundled config via
+# serde_json, so it must be a direct dependency (else E0433: serde_json not in crate root).
+serde_json = "1"
+
+[features]
+# Production builds embed custom-protocol assets; dev uses the Vite server.
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,6 @@
+# Also ignored at the repo root, but the Tauri CLI's frontend-dir walker runs
+# with parents(false) — it only reads ignore files inside the walked tree. The
+# CI-vendored package.json beside bin/pi otherwise wins frontend detection, and
+# beforeBuildCommand's `npm --prefix ../web` then resolves to vendor/web.
+# Resource bundling is unaffected (plain glob, not gitignore-aware).
+vendor/

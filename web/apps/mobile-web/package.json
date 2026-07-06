@@ -1,0 +1,40 @@
+{
+  "name": "@gaugewright/mobile-web",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Transitional open-source mobile web app root.",
+  "dependencies": {
+    "@gaugewright/control-plane-client": "0.0.0",
+    "@gaugewright/workbench-ui": "0.0.0",
+    "solid-js": "^1.9.0"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./MobileApp": "./src/MobileApp.tsx",
+    "./main": "./src/main.tsx",
+    "./mobile-control-plane": "./src/mobile-control-plane.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ../../tsconfig.mobile-client.json",
+    "build": "vite build --config vite.config.ts"
+  },
+  "gaugewright": {
+    "artifactKind": "app",
+    "ciTarget": "npm run typecheck:mobile-client",
+    "dependencyPolicy": {
+      "mayDependOn": [
+        "open-source"
+      ],
+      "mustNotDependOn": [
+        "source-available-enterprise",
+        "private-managed-services"
+      ]
+    },
+    "extractionPhase": "monorepo-transitional",
+    "licenseTarget": "Apache-2.0",
+    "repoTarget": "open-source",
+    "sourcePosture": "open-source"
+  }
+}

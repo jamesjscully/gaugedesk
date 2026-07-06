@@ -1,0 +1,369 @@
+//! Engagement→`main` merge lifecycle — policy-gated, conflict-repairable. Ported
+//! from `specs/models/merge-lifecycle.qnt` (itself from the TLA+
+//! `WorkstreamMergeRepair`).
+//!
+//! Git reconciliation is automatic, but advancing the standing ref (`main` in M0)
+//! is **gated**: it happens only on a clean git merge AND an admitted policy (the
+//! human review — D1). A git conflict or a policy reject **isolates** the
+//! engagement with a preserved candidate and a repair context; repair retries are
+//! idempotent (the ref advances at most once). A partial merge is never settled.
+//!
+//! The reducer is pure: the imperative shell runs git and surfaces the human's
+//! review, then issues `GitClean`/`GitConflict` and `PolicyAdmit`/`PolicyReject`.
+//! Discharges (`INV`-grade): standing-advance-requires-git-and-policy ·
+//! rejected-preserves-repair-basis · partial-merge-never-standing ·
+//! repair-retry-idempotent · isolated-thread-not-current-without-repair ·
+//! mainline-integration-requires-boundary (`[M1]`).
+
+use std::collections::BTreeSet;
+
+use crate::Rejection;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MergePhase {
+    Idle,
+    Merging,
+    Clean,
+    Rejected,
+    Repairing,
+    Advanced,
+    /// `[M1]` the workstream→mainline hop.
+    Integrated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GitOutcome {
+    Unknown,
+    Success,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PolicyOutcome {
+    Unknown,
+    Admitted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ThreadState {
+    Current,
+    MergePending,
+    Isolated,
+    Repairing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MergeState {
+    pub phase: MergePhase,
+    pub git_outcome: GitOutcome,
+    pub policy_outcome: PolicyOutcome,
+    pub candidate_preserved: bool,
+    pub repair_context_created: bool,
+    pub thread_state: ThreadState,
+    pub partial_merge_exposed: bool,
+    pub standing_advanced: bool,
+    pub standing_advance_count: u32,
+    pub retry_keys_used: BTreeSet<String>,
+    pub boundary_command_admitted: bool,
+}
+
+impl Default for MergeState {
+    fn default() -> Self {
+        Self {
+            phase: MergePhase::Idle,
+            git_outcome: GitOutcome::Unknown,
+            policy_outcome: PolicyOutcome::Unknown,
+            candidate_preserved: false,
+            repair_context_created: false,
+            thread_state: ThreadState::Current,
+            partial_merge_exposed: false,
+            standing_advanced: false,
+            standing_advance_count: 0,
+            retry_keys_used: BTreeSet::new(),
+            boundary_command_admitted: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeCommand {
+    /// The engagement's work is committed; attempt to merge into the standing ref.
+    StartMerge,
+    /// Shell ran git: a clean merge (no partial state exposed).
+    GitClean,
+    /// Shell ran git: a conflict (abort, isolate, preserve candidate).
+    GitConflict,
+    /// The human reviewed the diff and admitted.
+    PolicyAdmit,
+    /// The human reviewed the diff and rejected.
+    PolicyReject,
+    /// Advance the standing ref (`main`) — only on clean git + admitted policy.
+    AdvanceStandingRef,
+    /// Submit a repair for an isolated engagement.
+    SubmitRepair,
+    /// Retry the merge after repair (idempotent by `key`).
+    RetryRepair(String),
+    /// `[M1]` admit the boundary command for workstream→mainline.
+    AdmitBoundaryIntegration,
+    /// `[M1]` integrate the workstream into mainline.
+    IntegrateToMainline,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MergeEvent {
+    MergeStarted,
+    GitCleaned,
+    GitConflicted,
+    PolicyAdmitted,
+    PolicyRejected,
+    StandingRefAdvanced,
+    RepairSubmitted,
+    RepairRetried(String),
+    BoundaryIntegrationAdmitted,
+    IntegratedToMainline,
+}
+
+fn reject(reason: &'static str) -> Result<Vec<MergeEvent>, Rejection> {
+    Err(Rejection { reason })
+}
+
+pub fn decide(state: &MergeState, command: MergeCommand) -> Result<Vec<MergeEvent>, Rejection> {
+    use MergePhase::*;
+    match command {
+        // Re-enters and resets the cycle: the merge is branch-vs-`main`,
+        // re-evaluated each turn. Only the transient `Merging` (git running) blocks.
+        MergeCommand::StartMerge => match state.phase {
+            Merging => reject("startMerge: a merge is already running"),
+            _ => Ok(vec![MergeEvent::MergeStarted]),
+        },
+        MergeCommand::GitClean => match state.phase {
+            Merging => Ok(vec![MergeEvent::GitCleaned]),
+            _ => reject("gitClean: not merging"),
+        },
+        MergeCommand::GitConflict => match state.phase {
+            Merging => Ok(vec![MergeEvent::GitConflicted]),
+            _ => reject("gitConflict: not merging"),
+        },
+        MergeCommand::PolicyAdmit => {
+            if state.phase == Clean && state.git_outcome == GitOutcome::Success {
+                Ok(vec![MergeEvent::PolicyAdmitted])
+            } else {
+                reject("policyAdmit: not a clean merge awaiting review")
+            }
+        }
+        MergeCommand::PolicyReject => match state.phase {
+            Clean => Ok(vec![MergeEvent::PolicyRejected]),
+            _ => reject("policyReject: not a clean merge awaiting review"),
+        },
+        // STANDING_ADVANCE_REQUIRES_GIT_AND_POLICY + idempotent (≤ once).
+        MergeCommand::AdvanceStandingRef => {
+            let gated = state.phase == Clean
+                && state.git_outcome == GitOutcome::Success
+                && state.policy_outcome == PolicyOutcome::Admitted;
+            if gated && state.standing_advance_count == 0 {
+                Ok(vec![MergeEvent::StandingRefAdvanced])
+            } else {
+                reject("advanceStandingRef: needs clean git + admitted policy, once")
+            }
+        }
+        MergeCommand::SubmitRepair => {
+            if state.phase == Rejected && state.repair_context_created {
+                Ok(vec![MergeEvent::RepairSubmitted])
+            } else {
+                reject("submitRepair: no repair context")
+            }
+        }
+        // Idempotent: a used key cannot re-advance; advances at most once.
+        MergeCommand::RetryRepair(key) => {
+            let ok = state.phase == Repairing
+                && !state.retry_keys_used.contains(&key)
+                && state.standing_advance_count == 0;
+            if ok {
+                Ok(vec![MergeEvent::RepairRetried(key)])
+            } else {
+                reject("retryRepair: not repairing, key used, or already advanced")
+            }
+        }
+        MergeCommand::AdmitBoundaryIntegration => match state.phase {
+            Advanced => Ok(vec![MergeEvent::BoundaryIntegrationAdmitted]),
+            _ => reject("admitBoundaryIntegration: not advanced"),
+        },
+        // MAINLINE_INTEGRATION_REQUIRES_BOUNDARY.
+        MergeCommand::IntegrateToMainline => {
+            if state.phase == Advanced && state.boundary_command_admitted {
+                Ok(vec![MergeEvent::IntegratedToMainline])
+            } else {
+                reject("integrateToMainline: needs an admitted boundary command")
+            }
+        }
+    }
+}
+
+pub fn evolve(state: &MergeState, event: MergeEvent) -> MergeState {
+    use MergePhase as P;
+    let mut s = state.clone();
+    match event {
+        MergeEvent::MergeStarted => {
+            // Reset the cycle (re-entrant per turn), then enter merging.
+            s = MergeState {
+                phase: P::Merging,
+                thread_state: ThreadState::MergePending,
+                ..MergeState::default()
+            };
+        }
+        MergeEvent::GitCleaned => {
+            s.phase = P::Clean;
+            s.git_outcome = GitOutcome::Success;
+        }
+        MergeEvent::GitConflicted => {
+            s.phase = P::Rejected;
+            s.git_outcome = GitOutcome::Conflict;
+            s.candidate_preserved = true;
+            s.repair_context_created = true;
+            s.thread_state = ThreadState::Isolated;
+        }
+        MergeEvent::PolicyAdmitted => s.policy_outcome = PolicyOutcome::Admitted,
+        MergeEvent::PolicyRejected => {
+            s.phase = P::Rejected;
+            s.policy_outcome = PolicyOutcome::Rejected;
+            s.candidate_preserved = true;
+            s.repair_context_created = true;
+            s.thread_state = ThreadState::Isolated;
+        }
+        MergeEvent::StandingRefAdvanced => {
+            s.phase = P::Advanced;
+            s.standing_advanced = true;
+            s.standing_advance_count += 1;
+            s.thread_state = ThreadState::Current;
+        }
+        MergeEvent::RepairSubmitted => {
+            s.phase = P::Repairing;
+            s.thread_state = ThreadState::Repairing;
+        }
+        MergeEvent::RepairRetried(key) => {
+            s.retry_keys_used.insert(key);
+            s.git_outcome = GitOutcome::Success;
+            s.policy_outcome = PolicyOutcome::Admitted;
+            s.standing_advanced = true;
+            s.standing_advance_count += 1;
+            s.phase = P::Advanced;
+            s.thread_state = ThreadState::Current;
+        }
+        MergeEvent::BoundaryIntegrationAdmitted => s.boundary_command_admitted = true,
+        MergeEvent::IntegratedToMainline => s.phase = P::Integrated,
+    }
+    s
+}
+
+impl crate::Lifecycle for MergeState {
+    type State = MergeState;
+    type Command = MergeCommand;
+    type Event = MergeEvent;
+    const KIND: &'static str = "merge";
+    fn decide(state: &MergeState, command: MergeCommand) -> Result<Vec<MergeEvent>, Rejection> {
+        decide(state, command)
+    }
+    fn evolve(state: &MergeState, event: MergeEvent) -> MergeState {
+        evolve(state, event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn apply(state: &MergeState, command: MergeCommand) -> MergeState {
+        match decide(state, command) {
+            Ok(events) => events.into_iter().fold(state.clone(), |s, e| evolve(&s, e)),
+            Err(_) => state.clone(),
+        }
+    }
+
+    #[test]
+    fn clean_admit_advances() {
+        use MergeCommand::*;
+        let s = MergeState::default();
+        let s = apply(&s, StartMerge);
+        let s = apply(&s, GitClean);
+        let s = apply(&s, PolicyAdmit);
+        let s = apply(&s, AdvanceStandingRef);
+        assert_eq!(s.phase, MergePhase::Advanced);
+        assert!(s.standing_advanced && s.standing_advance_count == 1);
+    }
+
+    #[test]
+    fn conflict_isolates_then_repairs() {
+        use MergeCommand::*;
+        let s = MergeState::default();
+        let s = apply(&s, StartMerge);
+        let s = apply(&s, GitConflict);
+        assert_eq!(s.phase, MergePhase::Rejected);
+        assert!(s.candidate_preserved && s.thread_state == ThreadState::Isolated);
+        let s = apply(&s, SubmitRepair);
+        let s = apply(&s, RetryRepair("k1".into()));
+        assert_eq!(s.phase, MergePhase::Advanced);
+        assert_eq!(s.standing_advance_count, 1);
+    }
+
+    #[test]
+    fn policy_reject_isolates_main_untouched() {
+        use MergeCommand::*;
+        let s = MergeState::default();
+        let s = apply(&s, StartMerge);
+        let s = apply(&s, GitClean);
+        let s = apply(&s, PolicyReject);
+        assert_eq!(s.phase, MergePhase::Rejected);
+        assert!(!s.standing_advanced && s.thread_state == ThreadState::Isolated);
+    }
+
+    fn arb_command() -> impl Strategy<Value = MergeCommand> {
+        use MergeCommand::*;
+        let key = prop_oneof![Just("k1".to_string()), Just("k2".to_string())];
+        prop_oneof![
+            Just(StartMerge),
+            Just(GitClean),
+            Just(GitConflict),
+            Just(PolicyAdmit),
+            Just(PolicyReject),
+            Just(AdvanceStandingRef),
+            Just(SubmitRepair),
+            key.prop_map(RetryRepair),
+            Just(AdmitBoundaryIntegration),
+            Just(IntegrateToMainline),
+        ]
+    }
+
+    proptest! {
+        /// All six merge invariants hold over every reachable trace.
+        #[test]
+        fn merge_invariants(commands in prop::collection::vec(arb_command(), 0..60)) {
+            let mut s = MergeState::default();
+            for c in commands {
+                s = apply(&s, c);
+                // STANDING_ADVANCE_REQUIRES_GIT_AND_POLICY
+                if s.standing_advanced {
+                    prop_assert_eq!(s.git_outcome, GitOutcome::Success);
+                    prop_assert_eq!(s.policy_outcome, PolicyOutcome::Admitted);
+                }
+                // REJECTED_MERGE_PRESERVES_REPAIR_BASIS
+                if s.phase == MergePhase::Rejected {
+                    prop_assert!(s.candidate_preserved && s.repair_context_created);
+                }
+                // PARTIAL_MERGE_NOT_STANDING
+                prop_assert!(!s.partial_merge_exposed);
+                // REPAIR_RETRY_IDEMPOTENT
+                prop_assert!(s.standing_advance_count <= 1);
+                // ISOLATED_THREAD_NOT_CURRENT_WITHOUT_REPAIR
+                if s.phase == MergePhase::Rejected {
+                    prop_assert_eq!(s.thread_state, ThreadState::Isolated);
+                }
+                // MAINLINE_INTEGRATION_REQUIRES_BOUNDARY
+                if s.phase == MergePhase::Integrated {
+                    prop_assert!(s.boundary_command_admitted);
+                }
+            }
+        }
+    }
+}

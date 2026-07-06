@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [],
+  "files": [
+    "packages/enterprise-client/src/control-plane-enterprise.ts",
+    "packages/enterprise-client/src/enterprise-control-plane.ts",
+    "../../web/packages/control-plane-client/src/browser-route-json.ts",
+    "../../web/packages/control-plane-client/src/control-plane-transport.ts",
+    "../../web/packages/control-plane-client/src/auth-session.ts"
+  ]
+}

@@ -1,0 +1,1659 @@
+//! The library surface (ADR 0027): agents, projects, bindings, chats — and the
+//! `/workspace` facet tree the nav renders. CRUD here writes durable records
+//! (latest-wins / tombstone) and mutates the in-memory [`Library`] projection;
+//! creating a chat creates a worktree in the right instance and seeds its
+//! `.agent-config.json` from the agent's config.
+//!
+//! Delete is a **cascade** with one hard ordering rule: shut a chat's Pi session
+//! down **before** touching its worktree on disk, or the child process holds a
+//! deleted dir open.
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::library::{gen_id, ProjectRecord, RecordOp};
+use crate::library_state::{
+    AgentDeleteError, BindPlacementError, BoundaryAcceptError, BoundaryAttestationInput,
+    CreateArchetypeChatError, CreateArchetypeError, ForkArchetypeError, ForkChatError,
+    PullArchetypeError, UpgradePlacementError,
+};
+use crate::{LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT};
+use gaugewright_store::AdmitError;
+use gaugewright_workspace::MergeOutcome;
+
+// ---- helpers -------------------------------------------------------------
+
+// Every library mutation funnels through these four `write_*` helpers (creates,
+// renames via upsert, removals via tombstone) — so each pushes a workspace-change
+// REFERENCE (record kind + id + op) after recording the change, and every connected
+// client resolves the affected projection live. (The few inline chat appends below
+// do the same.) The reference never carries protected content (INV-10).
+fn write_project(wb: &mut Workbench, r: ProjectRecord) {
+    wb.write_project_record(r);
+}
+/// Create a chat (engagement) in `inst_id`, seeding `.agent-config.json` from the
+/// bound agent's config. Returns the created chat's id + title JSON, or an error.
+fn create_chat_in(
+    wb: &mut Workbench,
+    inst_id: &str,
+    title: &str,
+) -> Result<serde_json::Value, String> {
+    wb.create_chat_in_instance(inst_id, title)
+}
+
+// ---- GET /workspace ------------------------------------------------------
+
+/// The nav facet tree (ADR 0035/0036), project-first vocabulary:
+/// - `archetypes` — the reusable methods (each → its edit chats);
+/// - `projects` — trust boundaries (each → its `placements` → work chats); the
+///   hidden default "Personal" project is omitted;
+/// - `recent` — a flat current-first chat list.
+///
+/// Each chat carries a derived `kind` (`"edit"` | `"work"`), never a stored mode.
+pub async fn get_workspace(
+    State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let vis = wb.project_visibility(crate::net_http::bearer(&headers));
+    Json(scope_workspace_value(&wb, workspace_value(&wb), &vis)).into_response()
+}
+
+/// **ENTSEC-2** ([ADR 0065]): prune a workspace projection to what the caller may see — drop
+/// projects that are not visible and any recent chat outside a visible project. Under
+/// [`ProjectVisibility::All`] (solo / owner / admin / bootstrap) it is a no-op, so the
+/// single-user shape is untouched. The archetype library is shared method truth (a placement
+/// shows its archetype's name as lineage), so it is not project-scoped here.
+pub fn scope_workspace_value(
+    wb: &Workbench,
+    mut value: serde_json::Value,
+    vis: &crate::workbench_auth::ProjectVisibility,
+) -> serde_json::Value {
+    use crate::workbench_auth::ProjectVisibility;
+    if matches!(vis, ProjectVisibility::All) {
+        return value;
+    }
+    if let Some(projects) = value.get_mut("projects").and_then(|p| p.as_array_mut()) {
+        projects.retain(|p| {
+            p.get("id")
+                .and_then(|i| i.as_str())
+                .map(|id| vis.allows(id))
+                .unwrap_or(false)
+        });
+    }
+    if let Some(recent) = value.get_mut("recent").and_then(|r| r.as_array_mut()) {
+        recent.retain(|c| {
+            c.get("id")
+                .and_then(|i| i.as_str())
+                .map(|id| wb.chat_visible(id, vis))
+                .unwrap_or(false)
+        });
+    }
+    value
+}
+
+/// Build the workspace projection tree (archetypes → edit chats; projects →
+/// placements → work chats; recent). Shared by the bare `GET /workspace` and the
+/// freshness-carrying `GET /projections/library/workspace` carriage (ADR 0037), so
+/// both serve the identical value — only the carriage adds the freshness stamp.
+pub fn workspace_value(wb: &Workbench) -> serde_json::Value {
+    wb.workspace_value()
+}
+
+// ---- GET /search : content search across chat transcripts (SEARCH-1) ------
+
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: String,
+}
+
+/// Search chat **content** — the chat-log relevance tier of `navigation.md`
+/// "Search scope and relevance". A server projection over the event log
+/// (`INV-5`, projection-first): for each chat we fold its `transcript` records,
+/// pull the human-readable text (user/assistant/admitted `text` and streamed
+/// `delta`), and case-insensitively substring-match the query, returning the
+/// matching chat ids with a one-line snippet of the hit. The client never folds
+/// transcripts itself; the title tier (label match) is a separate pure
+/// client-side filter over the workspace projection. File content is the
+/// deferred third tier (SEARCH-2).
+pub async fn search(
+    State(wb): State<SharedWorkbench>,
+    Query(sq): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    Json(wb.search_transcripts_value(&sq.q)).into_response()
+}
+
+// ---- GET /tasks : the human task queue -----------------------------------
+
+/// The human task queue (`navigation.md`: "a projection over review-needed /
+/// approvals / follow-ups"). M0 sources it from our own merge lifecycle: a chat
+/// whose finished turn left a clean diff (`MergePhase::Clean`) is **awaiting the
+/// human's keep/reject** — that is a review task. Current-first (most recent).
+pub async fn get_tasks(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    Json(wb.task_queue_value()).into_response()
+}
+
+// ---- agents --------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateAgent {
+    pub name: String,
+}
+
+/// Create an agent + its authoring instance (a fresh repo).
+pub async fn create_agent(
+    State(wb): State<SharedWorkbench>,
+    Json(body): Json<CreateAgent>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.create_archetype(body.name) {
+        Ok(archetype) => (
+            StatusCode::CREATED,
+            Json(json!({ "id": archetype.id, "name": archetype.name })),
+        )
+            .into_response(),
+        Err(CreateArchetypeError::Create(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ForkArchetype {
+    pub name: Option<String>,
+}
+
+/// Fork an archetype (ADR 0035/0038): copy its **method** (the Pi-native definition
+/// surface — `.pi/**`, `AGENTS.md`, …) and configuration into a fresh, independent
+/// archetype. Editing the fork never touches the source.
+///
+/// **Owner-only.** Solo, the user owns every archetype, so this is always allowed;
+/// the guard is the seam that protects a vendor package's IP in distribution — a
+/// placement of someone else's archetype cannot fork it (ADR 0035).
+pub async fn fork_archetype(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<ForkArchetype>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.fork_archetype(&id, body.name) {
+        Ok(archetype) => (
+            StatusCode::CREATED,
+            Json(json!({ "id": archetype.id, "name": archetype.name })),
+        )
+            .into_response(),
+        Err(ForkArchetypeError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such archetype" })),
+        )
+            .into_response(),
+        Err(ForkArchetypeError::SourceNotOpen) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "source archetype not open" })),
+        )
+            .into_response(),
+        Err(ForkArchetypeError::Create(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+/// Pull the source archetype's improvements into this fork (ADR 0038): a real 3-way
+/// merge of the source's current `main` over the shared fork point. Only an archetype
+/// with `forked_from` can pull. A conflict aborts cleanly (the fork is never left
+/// half-merged) and asks the owner to reconcile in an edit chat.
+pub async fn post_pull_from_source(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.pull_archetype_from_source(&id) {
+        Ok(MergeOutcome::Clean) => (StatusCode::OK, Json(json!({ "outcome": "clean" }))).into_response(),
+        Ok(MergeOutcome::Conflict) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "outcome": "conflict", "error": "pull hit a conflict with your fork's edits — reconcile it in an edit chat" })),
+        )
+            .into_response(),
+        Err(PullArchetypeError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such archetype" })),
+        )
+            .into_response(),
+        Err(PullArchetypeError::NotFork) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "not a fork — nothing to pull" })),
+        )
+            .into_response(),
+        Err(PullArchetypeError::SourceMissing) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "the source archetype no longer exists" })),
+        )
+            .into_response(),
+        Err(PullArchetypeError::SourceNotOpen) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "source archetype not open" })),
+        )
+            .into_response(),
+        Err(PullArchetypeError::ForkNotOpen) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "fork not open" })),
+        )
+            .into_response(),
+        Err(PullArchetypeError::Workspace(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// One agent's record (name + raw config) — what the settings editor loads.
+pub async fn get_agent(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.agent_record(&id) {
+        Some(a) => Json(json!({ "id": a.id, "name": a.name, "config": a.config })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such agent" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAgent {
+    pub name: Option<String>,
+    /// Raw `.agent-config.json` — validated before persisting.
+    pub config: Option<String>,
+}
+
+/// Rename / re-configure an agent (append a newer record).
+pub async fn update_agent(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateAgent>,
+) -> impl IntoResponse {
+    if let Some(cfg) = &body.config {
+        if let Err(e) = gaugewright_boundary::AgentConfig::from_json(cfg) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid agent config: {e}") })),
+            )
+                .into_response();
+        }
+    }
+    let mut wb = wb.lock_unpoisoned();
+    let Some(updated) = wb.update_agent_record(&id, body.name, body.config) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such agent" })),
+        )
+            .into_response();
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "id": updated.id, "name": updated.name })),
+    )
+        .into_response()
+}
+
+/// Delete an agent + its authoring instance (cascade its chats). Refuses the
+/// default agent, and refuses while the agent is bound into any project (409).
+pub async fn delete_agent(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.delete_agent_cascade(&id) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "deleted": id }))).into_response(),
+        Err(AgentDeleteError::DefaultAgent) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "rejected": "the default agent can't be deleted" })),
+        )
+            .into_response(),
+        Err(AgentDeleteError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such agent" })),
+        )
+            .into_response(),
+        Err(AgentDeleteError::BoundElsewhere) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "rejected": "unbind this agent from its projects first" })),
+        )
+            .into_response(),
+    }
+}
+
+// ---- projects ------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateProject {
+    pub name: String,
+}
+
+/// `GET /projects/:id/home` — the **project-home rollup** (`UX-2`, `mvp-workbench.md` "Project
+/// Home"): the per-project summary derived **from data** (`INV-5`; never inferred from command
+/// receipts). For each work chat across the project's placements it folds the chat's lifecycle
+/// scopes (chat id = the run/merge scope) into:
+/// - `recent_runs` — `{chat,title,phase,ran}` from each chat's `RunState`, most-recent-first;
+/// - `outputs` — `{chat,title,phase}` from each chat's `MergeState` for chats with a **live**
+///   (non-`Clean`/non-`Init`) output/review state — the review/output summaries;
+/// - `audit` — `{placements,chats,events}`, the audit summary (event counts across the
+///   project's chat scopes; references only, `INV-10`).
+///
+/// 404 on an unknown project. Read-only — placement version/upgrade display is the workspace
+/// projection (`UX-9`), so this rollup is the remaining run/output/audit half.
+pub async fn project_home(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.project_home_value(&id) {
+        Some(value) => (StatusCode::OK, Json(value)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such project" })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn create_project(
+    State(wb): State<SharedWorkbench>,
+    Json(body): Json<CreateProject>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let id = gen_id("proj");
+    write_project(
+        &mut wb,
+        ProjectRecord {
+            id: id.clone(),
+            op: RecordOp::Upsert,
+            name: body.name.clone(),
+            is_default: false,
+            network_isolated: false,
+            deployment_mode: None,
+        },
+    );
+    // Every project gets a built-in general placement at creation — the default
+    // archetype installed on it under a deterministic id, mirroring the hidden Personal
+    // project. A project is therefore a real placement home the moment it exists: it
+    // hosts plain work chats and workstreams with no manual "place an archetype" step,
+    // and the nav shows those chats directly under the project (the general placement is
+    // implementation detail, never a node). Deliberately placing other archetypes adds
+    // visible placements alongside it.
+    let placement =
+        place_archetype_with_id(&mut wb, &id, DEFAULT_AGENT, &general_placement_id(&id)).ok();
+    (
+        StatusCode::CREATED,
+        Json(json!({ "id": id, "name": body.name, "placement": placement })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpdateProject {
+    /// Rename (omitted ⇒ name unchanged).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Network egress posture (omitted ⇒ unchanged). `true` isolates the project's
+    /// chats from the network (fail-closed); `false` opens egress (the app default).
+    #[serde(default)]
+    pub network_isolated: Option<bool>,
+    /// The project's **deployment mode** (`DEPLOY-1`): the `(operator, attested)` placement
+    /// the consultant declares as the engagement boundary ceiling. Omitted ⇒ unchanged.
+    #[serde(default)]
+    pub deployment_mode: Option<gaugewright_core::boundary_lifecycle::Placement>,
+}
+
+pub async fn update_project(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateProject>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(updated) =
+        wb.update_project_record(&id, body.name, body.network_isolated, body.deployment_mode)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such project" })),
+        )
+            .into_response();
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": id,
+            "name": updated.name,
+            "network_isolated": updated.network_isolated,
+            "deployment_mode": updated.deployment_mode,
+        })),
+    )
+        .into_response()
+}
+
+/// Delete a project: tear down every using-instance it holds, then tombstone it.
+pub async fn delete_project(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    if wb.delete_project_cascade(&id) {
+        (StatusCode::OK, Json(json!({ "deleted": id }))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such project" })),
+        )
+            .into_response()
+    }
+}
+
+// ---- binding: agent -> project (a using instance) ------------------------
+
+#[derive(Deserialize)]
+pub struct BindAgent {
+    pub agent_id: String,
+}
+
+/// Bind a library agent into a project: create a *using* instance (its own repo).
+/// Create a **placement** (a Using instance) of `agent_id` on `project_id`, returning
+/// the new instance id. Shared by explicit binding (a named project, [`bind_agent`])
+/// and the **eager Personal placement** minted when an archetype is created
+/// ([`create_agent`]/[`fork_archetype`]) so every archetype is immediately usable in
+/// the hidden Personal project with no placement ceremony (ADR 0045/0036).
+/// The stable id of a project's **built-in general placement** — the auto-created
+/// default-archetype placement every project gets (primitives/project.md). Deterministic
+/// from the project id so the projection can flag it (and the nav hide it) without a
+/// persisted marker; deliberately-placed archetypes get random `gen_id` ids instead.
+pub fn general_placement_id(project_id: &str) -> String {
+    format!("inst-general-{project_id}")
+}
+
+/// Place `agent_id` on `project_id` under a caller-chosen instance id — used to give a
+/// project's built-in general placement its deterministic [`general_placement_id`].
+fn place_archetype_with_id(
+    wb: &mut Workbench,
+    project_id: &str,
+    agent_id: &str,
+    inst_id: &str,
+) -> Result<String, String> {
+    // The built-in general placement is always active (APPROVE-1): a project is never
+    // without something to chat with, so it is never approval-gated.
+    wb.place_archetype_on_project_with_id(
+        project_id,
+        agent_id,
+        inst_id,
+        crate::library::Admission::Active,
+    )
+}
+
+pub async fn bind_agent(
+    State(wb): State<SharedWorkbench>,
+    Path(pid): Path<String>,
+    Json(body): Json<BindAgent>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.bind_agent_to_project(&pid, &body.agent_id) {
+        Ok(inst_id) => {
+            (StatusCode::CREATED, Json(json!({ "instance_id": inst_id }))).into_response()
+        }
+        Err(BindPlacementError::ProjectNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such project" })),
+        )
+            .into_response(),
+        Err(BindPlacementError::AgentNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such agent" })),
+        )
+            .into_response(),
+        Err(BindPlacementError::Create(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+// ---- versioning: publish a new archetype version, upgrade a placement (UX-9, ADR 0063) ----
+
+#[derive(Deserialize)]
+pub struct PublishArchetype {
+    /// Optionally set the owner's auto-upgrade preference at publish time.
+    #[serde(default)]
+    pub auto_upgrade: Option<bool>,
+}
+
+/// Publish a new version of an archetype (`UX-9`): bump its `current_version`. Every placement
+/// of this archetype then has an **upgrade available**; where the owner opted into auto-upgrade
+/// **and** the hosting org allows it ([ADR 0063]), those placements advance automatically, else
+/// they wait for a manual `/placements/:id/upgrade`.
+pub async fn post_publish_archetype(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<PublishArchetype>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.publish_archetype_version(&id, body.auto_upgrade) {
+        Some((new_version, auto_upgraded)) => (
+            StatusCode::OK,
+            Json(json!({ "version": new_version, "auto_upgraded": auto_upgraded })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such archetype" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Upgrade a placement to its archetype's current published version (`UX-9`, manual default).
+/// Idempotent — a placement already current stays put. (Content reconciliation on a diverged
+/// placement is a follow-on per [ADR 0063]; this re-points the version pointer.)
+/// Accept a pending placement (`APPROVE-1`, ADR 0064): the project owner's second
+/// explicit act, flipping it `Pending → Active` so it can host work chats. Idempotent on
+/// an already-active placement; 404 on an unknown one.
+pub async fn post_accept_placement(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.accept_placement(&id) {
+        Some(_) => (
+            StatusCode::OK,
+            Json(json!({ "placement": id, "admission": "active" })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such placement" })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn post_upgrade_placement(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.upgrade_placement_version(&id) {
+        Ok(version) => (StatusCode::OK, Json(json!({ "version": version }))).into_response(),
+        Err(UpgradePlacementError::PlacementNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such placement" })),
+        )
+            .into_response(),
+        Err(UpgradePlacementError::ArchetypeNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such archetype" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Unbind: tear down a using instance (and its chats).
+pub async fn unbind_agent(
+    State(wb): State<SharedWorkbench>,
+    Path((_pid, iid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    if wb.unbind_instance(&iid) {
+        (StatusCode::OK, Json(json!({ "unbound": iid }))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such instance" })),
+        )
+            .into_response()
+    }
+}
+
+// ---- chat creation -------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateChat {
+    #[serde(default = "default_title")]
+    pub title: String,
+}
+fn default_title() -> String {
+    "new chat".into()
+}
+
+/// New chat under an agent (its authoring instance).
+pub async fn create_chat_under_agent(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<CreateChat>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.create_chat_under_agent(&id, &body.title) {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(CreateArchetypeChatError::ArchetypeNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such agent" })),
+        )
+            .into_response(),
+        Err(CreateArchetypeChatError::Create(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// New chat under a project's using-instance.
+pub async fn create_chat_under_instance(
+    State(wb): State<SharedWorkbench>,
+    Path((_pid, iid)): Path<(String, String)>,
+    Json(body): Json<CreateChat>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match create_chat_in(&mut wb, &iid, &body.title) {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// **Use** an archetype with no placement ceremony (ADR 0045/0036): open a *work*
+/// chat rooted on the archetype's placement in the hidden Personal project. The
+/// placement is minted eagerly at creation; this finds it (and lazily creates it
+/// for archetypes that predate eager placement), then roots a chat on it.
+pub async fn use_archetype(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<CreateChat>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.use_archetype_chat(&id, &body.title) {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(CreateArchetypeChatError::ArchetypeNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such archetype" })),
+        )
+            .into_response(),
+        Err(CreateArchetypeChatError::Create(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// Fork a chat (ADR 0038): **clone the whole thread** into a new chat rooted on the
+/// **same** placement/archetype and kind, recording `forked_from`. The fork's worktree
+/// inherits the parent's files, and its Pi session is a copy of the parent's managed
+/// `<worktree>.pisession` — so the fork's agent remembers the parent's conversation.
+pub async fn fork_chat(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.fork_chat(&id) {
+        Ok(forked) => (
+            StatusCode::CREATED,
+            Json(json!({ "id": forked.id, "title": forked.title, "forked_from": forked.forked_from })),
+        )
+            .into_response(),
+        Err(ForkChatError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such chat" })),
+        )
+            .into_response(),
+        Err(ForkChatError::SourceNotLive) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "source chat not live" })),
+        )
+            .into_response(),
+        Err(ForkChatError::InstanceNotOpen) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "instance not open" })),
+        )
+            .into_response(),
+        Err(ForkChatError::Create(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+// ---- chat delete / rename ------------------------------------------------
+
+pub async fn delete_chat(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    if wb.delete_chat_cascade(&id) {
+        (StatusCode::OK, Json(json!({ "deleted": id }))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such chat" })),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RenameChat {
+    pub title: String,
+}
+
+pub async fn rename_chat(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameChat>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(updated) = wb.rename_chat_record(&id, body.title) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such chat" })),
+        )
+            .into_response();
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "id": id, "title": updated.title })),
+    )
+        .into_response()
+}
+
+// ---- boundary acceptance (D-ATTEST / ADR 0040, ATTEST-7) -----------------
+
+/// The optional attestation payload a participant presents when accepting an
+/// *attested* boundary (ATTEST-2): the [`CodeMeasurement`] the host claims to run,
+/// the freshness `nonce` the verifier issued, the opaque TEE report `quote_bytes`,
+/// and — optionally — a `sealed_key_id` to release on the same verified evidence.
+///
+/// Absent entirely, the acceptance is *unattested*: the body carries only the
+/// `participant` and the boundary admits an `Accept { evidence: None }` (ATTEST-2
+/// requires no evidence on an unattested placement). Present, the route runs the
+/// [`accept_boundary_attested`] gate so a bad quote never admits the acceptance.
+#[derive(Deserialize)]
+pub struct AttestationPayload {
+    /// Lower-case hex of the reproducible-build image measurement the host proves.
+    pub measurement: String,
+    /// The freshness nonce the host echoed *inside* its quote report.
+    pub nonce: String,
+    /// The freshness challenge the verifier issued and requires the report to echo
+    /// (anti-replay). Defaults to `nonce` when the caller does not separate them —
+    /// a real flow carries the challenge from a separate `/challenge` issue; the
+    /// loopback route lets a test supply a mismatching pair to exercise `StaleNonce`.
+    #[serde(default)]
+    pub expected_nonce: Option<String>,
+    /// Opaque TEE-specific report bytes — parsed only behind the verifier seam.
+    #[serde(default)]
+    pub quote_bytes: Vec<u8>,
+    /// The AMD **VCEK** (DER) endorsing the host chip/TCB, carried in the host's cert
+    /// table alongside the report (ADR 0049). **Required** for the real SEV-SNP
+    /// verifier path (`AttestationMode::RealRequired`); the built-in ARK/ASK roots
+    /// chain to it. Ignored by the loopback verifier. Empty in `RealRequired` ⇒ `400`.
+    #[serde(default)]
+    pub vcek: Vec<u8>,
+    /// A sealed key to release to the verified evidence, if one is requested.
+    #[serde(default)]
+    pub sealed_key_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AcceptBoundary {
+    /// The participant authority accepting the boundary (NO_GHOST_ACCEPT: it must
+    /// be one of the proposed participants, or the reducer rejects).
+    pub participant: String,
+    /// Present iff this is an *attested* acceptance; absent ⇒ unattested.
+    #[serde(default)]
+    pub attestation: Option<AttestationPayload>,
+}
+
+/// Body for `POST /boundaries/:bid/challenge`.
+#[derive(Deserialize)]
+pub struct ChallengeRequest {
+    /// The participant the challenge is minted for — it must bind this nonce into its
+    /// attestation report before accepting.
+    pub participant: String,
+}
+
+/// `POST /boundaries/:bid/challenge` — mint a fresh, server-chosen freshness nonce for
+/// `participant` and record it (ADR 0049, real anti-replay). The host must bind **this**
+/// nonce into its attestation `report_data`; [`accept_boundary`] then checks the quote
+/// against the recorded challenge, never a caller-supplied value, so a replayed stale
+/// quote (carrying an old nonce) can never satisfy freshness. Returns `{ "nonce": … }`.
+pub async fn issue_boundary_challenge(
+    State(wb): State<SharedWorkbench>,
+    Path(bid): Path<String>,
+    Json(body): Json<ChallengeRequest>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.issue_boundary_challenge(&bid, &body.participant) {
+        Ok(nonce) => (StatusCode::OK, Json(json!({ "nonce": nonce }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:?}") })),
+        )
+            .into_response(),
+    }
+}
+
+fn boundary_accept_err(e: BoundaryAcceptError) -> axum::response::Response {
+    match e {
+        BoundaryAcceptError::PolicyRejected => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "rejected": "org placement policy does not admit this boundary's declared deployment mode"
+            })),
+        )
+            .into_response(),
+        BoundaryAcceptError::Rejected(reason) => {
+            (StatusCode::CONFLICT, Json(json!({ "rejected": reason }))).into_response()
+        }
+        BoundaryAcceptError::Store(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:?}") })),
+        )
+            .into_response(),
+        BoundaryAcceptError::QuoteRejected(reason) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "rejected": reason }))).into_response()
+        }
+        BoundaryAcceptError::MissingVcek => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "rejected": "attested acceptance requires the host VCEK \
+                             (DER) for SEV-SNP verification"
+            })),
+        )
+            .into_response(),
+        BoundaryAcceptError::RealVerifierUnavailable => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "rejected": "real attested acceptance is unavailable in this build"
+            })),
+        )
+            .into_response(),
+        BoundaryAcceptError::InvalidEndorsement(reason) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "rejected": format!("invalid endorsement material: {reason}") })),
+        )
+            .into_response(),
+    }
+}
+
+fn boundary_attestation_input(att: AttestationPayload) -> BoundaryAttestationInput {
+    BoundaryAttestationInput {
+        measurement: att.measurement,
+        nonce: att.nonce,
+        expected_nonce: att.expected_nonce,
+        quote_bytes: att.quote_bytes,
+        vcek: att.vcek,
+        sealed_key_id: att.sealed_key_id,
+    }
+}
+
+pub async fn accept_boundary(
+    State(wb): State<SharedWorkbench>,
+    Path(bid): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AcceptBoundary>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    // ITGOV-3(c): accepting a boundary admits a counterparty into this org's execution boundary
+    // — in enterprise mode it must be an authenticated **active member** (ENTSEC-1); solo /
+    // bootstrap is unchanged. Fail-closed (`INV-20`; ADR 0066 §C).
+    if let Err((code, msg)) = wb.authenticate_request(crate::net_http::bearer(&headers)) {
+        return (code, msg).into_response();
+    }
+    match wb.accept_boundary(
+        &bid,
+        body.participant,
+        body.attestation.map(boundary_attestation_input),
+    ) {
+        Ok(out) => (StatusCode::OK, Json(out)).into_response(),
+        Err(e) => boundary_accept_err(e),
+    }
+}
+
+// A chat's kind (edit/work) is **fixed at creation** by what it is rooted on
+// (ADR 0035): an edit chat is created under an archetype, a work chat under a
+// placement. There is no mid-life toggle — the old `set_chat_mode` / `Use⇄Edit`
+// control is removed.
+
+// ---- device pairing (D-MOBILE / ADR 0009, MOB-027) -----------------------
+
+/// `POST /pairing-requests` body: a paired device asks the owner to bind it to a
+/// fresh boundary's bridge grant. The device presents its stable [`DeviceId`] and
+/// the [`BridgeGrantId`] the grant was issued under — the typed `(device, grant)`
+/// pair the boundary's `DeviceBinding` phase pins so a later federated delivery
+/// must match exactly (MOB-001/MOB-004). The pairing scope (the boundary id) is
+/// server-minted, so a request never names an existing boundary it could hijack.
+#[derive(Deserialize)]
+pub struct PairingRequest {
+    /// The device asking to pair — its stable handle, presented by the client.
+    pub device: String,
+    /// The bridge grant the device pairs under. Defaults to a server-minted grant
+    /// id when the caller does not supply one (the loopback flow mints both ends).
+    #[serde(default)]
+    pub bridge_grant: Option<String>,
+}
+
+/// `POST /pairing-requests` — open a device-pairing boundary and bind the device
+/// to it in one step (MOB-027), driving the boundary lifecycle exactly as the rest
+/// of the control plane does: `Propose` the owner authority as the sole required
+/// participant, `DeclareCeiling` a local placement, then `BindDevice` the typed
+/// `(DeviceId, BridgeGrantId)` so the boundary advances `Declared → DeviceBinding`.
+///
+/// The boundary id is the pairing id the client then polls via
+/// `GET /pairing-status/:id`. A bind on a non-declared boundary, or a second bind
+/// of a different device, is rejected by the reducer (no silent device swap) — the
+/// route does not bypass `DEVICE_BINDS_DECLARED_BOUNDARY`.
+pub async fn create_pairing_request(
+    State(wb): State<SharedWorkbench>,
+    Json(body): Json<PairingRequest>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.create_pairing_request(body.device, body.bridge_grant) {
+        Ok(pairing) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "pairing_id": pairing.pairing_id,
+                "device": pairing.device,
+                "bridge_grant": pairing.bridge_grant,
+                "status": pairing.status,
+            })),
+        )
+            .into_response(),
+        Err(e) => boundary_err(e),
+    }
+}
+
+/// `GET /pairing-status/:id` — poll a pairing's progress (MOB-027). Reports the
+/// boundary phase, whether the device has been bound, the typed `(device, grant)`
+/// pinned by `DeviceBinding`, and whether the owner has accepted (the pairing is
+/// `paired` once the boundary is active). A pairing id with no boundary is `404`.
+pub async fn get_pairing_status(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.pairing_status_value(&id) {
+        Ok(Some(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such pairing" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:?}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Map an admission error from the pairing lifecycle to an HTTP response: a reducer
+/// rejection (e.g. a second bind, a bind on a non-declared boundary) is a `409`, an
+/// infrastructural error a `500`.
+fn boundary_err(e: AdmitError) -> axum::response::Response {
+    match e {
+        AdmitError::Rejected(r) => {
+            (StatusCode::CONFLICT, Json(json!({ "rejected": r.reason }))).into_response()
+        }
+        e => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:?}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `POST /boundaries/:bid/accept` (ATTEST-7): unattested and attested
+    //! acceptance over the control-plane route, exercising the boundary keeper gate.
+    //! These exercise only open routes (`/boundaries/*`, `/pairing-*`), so they
+    //! compose the open control plane; the attested **operator** surface tests
+    //! live with `gaugewright-cloud-attestation` (SPLIT-1).
+    use crate::{open_control_plane, Workbench, LOCAL_AUTHORITY};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use gaugewright_core::attestation::CodeMeasurement;
+    use gaugewright_core::boundary_lifecycle::{Operator, Placement};
+    use http_body_util::BodyExt;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    const BID: &str = "boundary-chat-1";
+    const PARTICIPANT_A: &str = "A";
+    const PARTICIPANT_B: &str = "B";
+    const MEASUREMENT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const NONCE: &str = "challenge-1";
+
+    /// A router whose store has a boundary at `BID` proposed for {A,B} and
+    /// ceiling-declared with the given attestation posture. The operator has
+    /// registered `MEASUREMENT` as a trusted reproducible build and sealed one key
+    /// to it (ATTEST-13 wiring) — so an attested quote for `MEASUREMENT` verifies
+    /// against the workbench's allow-list, and a quote for any other measurement does
+    /// not.
+    fn router_with_boundary(attested: bool) -> Router {
+        // The loopback/dev shape (C-3): opt into the in-process quote verifier.
+        router_with_boundary_mode(attested, crate::AttestationMode::Loopback)
+    }
+
+    fn router_with_boundary_mode(attested: bool, mode: crate::AttestationMode) -> Router {
+        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        // ADR 0065: these tests drive the attested operator surface (`/engagements/:eid/attested-*`),
+        // which is now gated off by default — opt it in for the suite.
+        let mut wb = Workbench::new(store)
+            .with_attestation_mode(mode)
+            .with_attestation_enabled(true);
+        let parts = BTreeSet::from([PARTICIPANT_A.to_string(), PARTICIPANT_B.to_string()]);
+        wb.seed_boundary_for_test(
+            BID,
+            parts,
+            Placement {
+                operator: Operator::Counterparty,
+                attested,
+            },
+        )
+        .unwrap();
+        wb.seed_attested_boundary_release_for_test(
+            "registry/gaugewright-host",
+            "1.0.0",
+            CodeMeasurement::new(MEASUREMENT),
+            "sealed-1",
+            vec![9, 8, 7],
+        );
+        open_control_plane(Arc::new(Mutex::new(wb)))
+    }
+
+    /// DEPLOY-3 / ITGOV-3: the same boundary, declared `(Counterparty, attested=false)`,
+    /// but with a configured org placement policy in the `org` scope — so the client's
+    /// accept consults it (the policy-gated pairing path). No attestation wiring is needed
+    /// because these exercise the unattested accept.
+    fn router_with_boundary_and_policy(
+        policy: gaugewright_core::boundary_lifecycle::PlacementPolicy,
+    ) -> Router {
+        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let mut wb = Workbench::new(store);
+        let parts = BTreeSet::from([PARTICIPANT_A.to_string(), PARTICIPANT_B.to_string()]);
+        wb.seed_boundary_for_test(
+            BID,
+            parts,
+            Placement {
+                operator: Operator::Counterparty,
+                attested: false,
+            },
+        )
+        .unwrap();
+        let rec = crate::org::PlacementPolicyRecord {
+            id: "pp".into(),
+            op: crate::org::RecordOp::Upsert,
+            policy,
+        };
+        wb.seed_org_placement_policy_for_test(rec).unwrap();
+        open_control_plane(Arc::new(Mutex::new(wb)))
+    }
+
+    async fn post(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// Unattested boundary: a named participant accepts with no attestation payload,
+    /// and the acceptance is admitted (ATTEST-2: no evidence on an unattested placement).
+    #[tokio::test]
+    async fn accept_boundary_unattested_admits_named_participant() {
+        let app = router_with_boundary(false);
+        let (s, b) = post(
+            &app,
+            "/boundaries/boundary-chat-1/accept",
+            r#"{"participant":"A"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "got {b}");
+        assert!(b.contains(r#""accepted":true"#), "A accepted: {b}");
+        assert!(b.contains(r#""active":false"#), "still pending B: {b}");
+    }
+
+    /// DEPLOY-3 / ITGOV-3: an org placement policy whose `allowed_operators` excludes the
+    /// boundary's declared operator refuses the client's accept (`403`) — restrict-only,
+    /// fail-closed (`INV-20`). Proves the policy-gated pairing gate is wired to the live route.
+    #[tokio::test]
+    async fn accept_boundary_refused_when_org_placement_policy_excludes_operator() {
+        use gaugewright_core::boundary_lifecycle::PlacementPolicy;
+        let policy = PlacementPolicy {
+            require_attested: false,
+            allowed_operators: BTreeSet::from([Operator::Local]),
+        };
+        let app = router_with_boundary_and_policy(policy);
+        let (s, b) = post(
+            &app,
+            "/boundaries/boundary-chat-1/accept",
+            r#"{"participant":"A"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "got {b}");
+        assert!(b.contains("placement policy"), "policy refusal: {b}");
+    }
+
+    /// A policy that admits the declared (Counterparty) operator lets the accept through —
+    /// the gate narrows, it does not block a compliant deployment mode.
+    #[tokio::test]
+    async fn accept_boundary_admitted_when_org_placement_policy_allows_operator() {
+        use gaugewright_core::boundary_lifecycle::PlacementPolicy;
+        let policy = PlacementPolicy {
+            require_attested: false,
+            allowed_operators: BTreeSet::from([Operator::Counterparty]),
+        };
+        let app = router_with_boundary_and_policy(policy);
+        let (s, b) = post(
+            &app,
+            "/boundaries/boundary-chat-1/accept",
+            r#"{"participant":"A"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "got {b}");
+        assert!(b.contains(r#""accepted":true"#), "A accepted: {b}");
+    }
+
+    /// ITGOV-3(c): accepting a boundary admits a counterparty into this org's execution boundary.
+    /// In enterprise mode (IdP + provisioned directory) an anonymous accept is `401`; a valid
+    /// active member is let through. Solo mode is covered by the other accept tests (no bearer, OK).
+    #[tokio::test]
+    async fn accept_boundary_requires_member_auth_in_enterprise_mode() {
+        use crate::identity::LoopbackIdentityProvider;
+        use crate::org::{MembershipRecord, MembershipStatus, RecordOp, ORG_SCOPE};
+        use gaugewright_core::abac::AuthorityAttributes;
+        use gaugewright_core::ids::AuthorityId;
+
+        let idp = LoopbackIdentityProvider::new().enroll(
+            "member-token",
+            AuthorityId::new("member-auth"),
+            AuthorityAttributes::default(),
+        );
+        let mut wb = Workbench::new(gaugewright_store::Store::open_in_memory().unwrap())
+            .with_identity_provider(Arc::new(idp));
+        let parts = BTreeSet::from([PARTICIPANT_A.to_string(), PARTICIPANT_B.to_string()]);
+        wb.seed_boundary_for_test(
+            BID,
+            parts,
+            Placement {
+                operator: Operator::Counterparty,
+                attested: false,
+            },
+        )
+        .unwrap();
+        // Provision an active member so the gate engages (past bootstrap).
+        let member = MembershipRecord {
+            id: "member-auth".into(),
+            op: RecordOp::Upsert,
+            org_id: "org".into(),
+            authority: "member-auth".into(),
+            email: "m@e.com".into(),
+            role: "member".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        wb.store_mut()
+            .append_record(ORG_SCOPE, "membership", &serde_json::to_string(&member).unwrap())
+            .unwrap();
+        let app = open_control_plane(Arc::new(Mutex::new(wb)));
+
+        let accept = |bearer: Option<&str>| {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri("/boundaries/boundary-chat-1/accept")
+                .header("content-type", "application/json");
+            if let Some(t) = bearer {
+                b = b.header("authorization", format!("Bearer {t}"));
+            }
+            b.body(Body::from(r#"{"participant":"A"}"#)).unwrap()
+        };
+
+        let resp = app.clone().oneshot(accept(None)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an anonymous boundary-accept is refused in enterprise mode"
+        );
+        let resp = app.oneshot(accept(Some("member-token"))).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid member is let through the auth gate"
+        );
+    }
+
+    /// Both participants accepting an unattested boundary brings it active — the route
+    /// drives the conjunctive activation end to end.
+    #[tokio::test]
+    async fn accept_boundary_unattested_both_participants_activates() {
+        let app = router_with_boundary(false);
+        post(
+            &app,
+            "/boundaries/boundary-chat-1/accept",
+            r#"{"participant":"A"}"#,
+        )
+        .await;
+        let (s, b) = post(
+            &app,
+            "/boundaries/boundary-chat-1/accept",
+            r#"{"participant":"B"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "got {b}");
+        assert!(b.contains(r#""active":true"#), "boundary active: {b}");
+    }
+
+    /// A ghost participant (not proposed) is rejected by the reducer — the route does
+    /// not bypass NO_GHOST_ACCEPT.
+    #[tokio::test]
+    async fn accept_boundary_rejects_ghost_participant() {
+        let app = router_with_boundary(false);
+        let (s, b) = post(
+            &app,
+            "/boundaries/boundary-chat-1/accept",
+            r#"{"participant":"ghost"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "got {b}");
+    }
+
+    /// Attested boundary: a fresh quote for the trusted measurement verifies, and the
+    /// acceptance is admitted with evidence (the keeper gate, ATTEST-5).
+    #[tokio::test]
+    async fn accept_boundary_attested_verified_quote_admits() {
+        let app = router_with_boundary(true);
+        let body = serde_json::json!({
+            "participant": PARTICIPANT_A,
+            "attestation": { "measurement": MEASUREMENT, "nonce": NONCE, "quote_bytes": [1, 2, 3, 4] }
+        })
+        .to_string();
+        let (s, b) = post(&app, "/boundaries/boundary-chat-1/accept", &body).await;
+        assert_eq!(s, StatusCode::OK, "got {b}");
+        assert!(b.contains(r#""accepted":true"#), "A attested-accepted: {b}");
+        assert!(
+            b.contains(r#""ceiling""#),
+            "ceiling projection present: {b}"
+        );
+    }
+
+    /// C-3 fail-closed default (ADR 0049): in `RealRequired` mode (the default for any
+    /// real deployment) the attested-accept route routes to the real SEV-SNP verifier,
+    /// never the loopback stand-in. With no host VCEK on the request it cannot build the
+    /// AMD chain, so it refuses with `400` rather than fall back to loopback or release
+    /// a key — the loopback verifier can never gate a live key release.
+    #[tokio::test]
+    async fn accept_boundary_attested_real_required_needs_vcek() {
+        let app = router_with_boundary_mode(true, crate::AttestationMode::RealRequired);
+        let body = serde_json::json!({
+            "participant": PARTICIPANT_A,
+            // No `vcek` ⇒ the SEV-SNP path cannot verify; fail-closed.
+            "attestation": { "measurement": MEASUREMENT, "nonce": NONCE, "quote_bytes": [1, 2, 3, 4] }
+        })
+        .to_string();
+        let (s, b) = post(&app, "/boundaries/boundary-chat-1/accept", &body).await;
+        assert_eq!(
+            s,
+            StatusCode::BAD_REQUEST,
+            "real-required mode must refuse without a VCEK, not fall back to loopback: {b}"
+        );
+        assert!(
+            b.contains("VCEK"),
+            "structured VCEK-required rejection: {b}"
+        );
+        // The boundary did not advance — nothing was accepted, no key released.
+        assert!(!b.contains(r#""accepted":true"#), "must not accept: {b}");
+    }
+
+    /// The ATTEST-13 wiring tooth: the verifier trusts the *operator-registered*
+    /// allow-list, not the measurement the caller claims. A quote for a measurement
+    /// the operator never registered is `UnknownMeasurement` → 400, even though it is
+    /// a well-formed quote echoing the right nonce — the caller cannot self-assert a
+    /// host into the trusted set.
+    #[tokio::test]
+    async fn accept_boundary_attested_unregistered_measurement_is_rejected() {
+        let app = router_with_boundary(true);
+        let untrusted = "b".repeat(64);
+        let body = serde_json::json!({
+            "participant": PARTICIPANT_A,
+            "attestation": { "measurement": untrusted, "nonce": NONCE, "quote_bytes": [1, 2, 3, 4] }
+        })
+        .to_string();
+        let (s, b) = post(&app, "/boundaries/boundary-chat-1/accept", &body).await;
+        assert_eq!(
+            s,
+            StatusCode::BAD_REQUEST,
+            "unregistered measurement rejects: {b}"
+        );
+        assert!(
+            b.contains("UnknownMeasurement"),
+            "structured rejection: {b}"
+        );
+    }
+
+    /// ADR 0048 — the gate, end to end through the route: the *same* attested request
+    /// that releases a key when the engagement is entitled releases **nothing** when it
+    /// is not. Acceptance still admits (attestation is sound); only the key is gated.
+    #[tokio::test]
+    async fn accept_boundary_attested_without_entitlement_releases_no_key() {
+        let app = router_with_boundary(true);
+        // No entitlement activated for this engagement.
+        let body = serde_json::json!({
+            "participant": PARTICIPANT_A,
+            "attestation": {
+                "measurement": MEASUREMENT,
+                "nonce": NONCE,
+                "quote_bytes": [1, 2, 3, 4],
+                "sealed_key_id": "sealed-1"
+            }
+        })
+        .to_string();
+        let (s, b) = post(&app, "/boundaries/boundary-chat-1/accept", &body).await;
+        assert_eq!(s, StatusCode::OK, "acceptance still admits: {b}");
+        assert!(
+            b.contains(r#""accepted":true"#),
+            "participant accepted: {b}"
+        );
+        assert!(
+            b.contains(r#""released":false"#),
+            "unentitled engagement releases no key: {b}"
+        );
+    }
+
+    /// Attested boundary, stale nonce: the verifier rejects the quote, the route
+    /// returns 400, and the acceptance is never admitted.
+    #[tokio::test]
+    async fn accept_boundary_attested_stale_nonce_is_rejected() {
+        let app = router_with_boundary(true);
+        let body = serde_json::json!({
+            "participant": PARTICIPANT_A,
+            "attestation": {
+                "measurement": MEASUREMENT,
+                "nonce": "stale",
+                "expected_nonce": NONCE,
+                "quote_bytes": [1, 2, 3, 4]
+            }
+        })
+        .to_string();
+        let (s, b) = post(&app, "/boundaries/boundary-chat-1/accept", &body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "stale nonce rejects: {b}");
+        assert!(b.contains("StaleNonce"), "structured rejection: {b}");
+    }
+
+    /// An attested placement refuses an *unattested* acceptance: posting with no
+    /// attestation payload drives `Accept { evidence: None }`, which the reducer
+    /// rejects (ATTEST-2 requires evidence on an attested placement) → 409.
+    #[tokio::test]
+    async fn accept_boundary_attested_requires_evidence() {
+        let app = router_with_boundary(true);
+        let (s, b) = post(
+            &app,
+            "/boundaries/boundary-chat-1/accept",
+            r#"{"participant":"A"}"#,
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::CONFLICT,
+            "attested placement needs evidence: {b}"
+        );
+    }
+
+    // ---- device pairing (MOB-027) ----------------------------------------
+
+    /// A bare control plane over an empty in-memory workbench — the pairing routes
+    /// mint their own boundary scope, so they need no pre-seeded boundary.
+    fn bare_router() -> Router {
+        let wb = Workbench::new(gaugewright_store::Store::open_in_memory().unwrap());
+        open_control_plane(Arc::new(Mutex::new(wb)))
+    }
+
+    async fn get(app: &Router, uri: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// `POST /pairing-requests` opens a boundary, declares its ceiling, and binds
+    /// the device in one step (MOB-027): the response carries the server-minted
+    /// pairing id and the typed `(device, grant)` the `DeviceBinding` phase pinned,
+    /// and the boundary sits in `DeviceBinding` awaiting the owner's acceptance.
+    #[tokio::test]
+    async fn pairing_request_binds_device_and_reports_status() {
+        let app = bare_router();
+        let (s, b) = post(
+            &app,
+            "/pairing-requests",
+            r#"{"device":"device:pixel-9","bridge_grant":"grant-7"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "got {b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let pairing_id = v["pairing_id"].as_str().unwrap().to_string();
+        assert!(
+            pairing_id.starts_with("pairing-"),
+            "server-minted pairing id: {b}"
+        );
+        assert_eq!(
+            v["status"]["phase"], "DeviceBinding",
+            "device bound, not yet accepted: {b}"
+        );
+        assert_eq!(
+            v["status"]["bound"]["device"], "device:pixel-9",
+            "typed device pinned: {b}"
+        );
+        assert_eq!(
+            v["status"]["bound"]["bridge_grant"], "grant-7",
+            "typed grant pinned: {b}"
+        );
+        assert_eq!(
+            v["status"]["paired"], false,
+            "not paired until the owner accepts: {b}"
+        );
+
+        // The status endpoint reports the same pinned binding for the minted id.
+        let (s, b) = get(&app, &format!("/pairing-status/{pairing_id}")).await;
+        assert_eq!(s, StatusCode::OK, "got {b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(
+            v["bound"]["device"], "device:pixel-9",
+            "status reflects binding: {b}"
+        );
+        assert_eq!(v["paired"], false, "still pending the owner's accept: {b}");
+    }
+
+    /// The owner accepting the pairing boundary drives it active — at which point
+    /// the pairing status flips to `paired` (MOB-027 ties the pairing handshake to
+    /// the same boundary lifecycle the rest of the control plane rides).
+    #[tokio::test]
+    async fn pairing_completes_when_owner_accepts() {
+        let app = bare_router();
+        let (_, b) = post(
+            &app,
+            "/pairing-requests",
+            r#"{"device":"device:pixel-9","bridge_grant":"grant-7"}"#,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let pairing_id = v["pairing_id"].as_str().unwrap().to_string();
+
+        // The owner authority accepts the pairing boundary (unattested, no evidence).
+        let accept_body = serde_json::json!({ "participant": LOCAL_AUTHORITY }).to_string();
+        let (s, b) = post(
+            &app,
+            &format!("/boundaries/{pairing_id}/accept"),
+            &accept_body,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "owner accepts: {b}");
+
+        let (s, b) = get(&app, &format!("/pairing-status/{pairing_id}")).await;
+        assert_eq!(s, StatusCode::OK, "got {b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["paired"], true, "active boundary ⇒ paired: {b}");
+        assert_eq!(v["phase"], "Active", "boundary went active: {b}");
+    }
+
+    /// Status for a pairing id that was never opened is `404`, not a ghost `Init`
+    /// pairing — a never-proposed boundary scope folds to the default state, which
+    /// the route must not report as a real pairing.
+    #[tokio::test]
+    async fn pairing_status_unknown_id_is_not_found() {
+        let app = bare_router();
+        let (s, b) = get(&app, "/pairing-status/pairing-nope").await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "no such pairing: {b}");
+    }
+
+    /// A pairing request with no `bridge_grant` mints one server-side — the loopback
+    /// flow provisions both ends, and the response surfaces the minted grant id so
+    /// the client can present it on the later federated delivery (MOB-004).
+    #[tokio::test]
+    async fn pairing_request_mints_grant_when_absent() {
+        let app = bare_router();
+        let (s, b) = post(&app, "/pairing-requests", r#"{"device":"device:pixel-9"}"#).await;
+        assert_eq!(s, StatusCode::CREATED, "got {b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let grant = v["bridge_grant"].as_str().unwrap();
+        assert!(grant.starts_with("grant-"), "server-minted grant id: {b}");
+        assert_eq!(
+            v["status"]["bound"]["bridge_grant"], grant,
+            "bound under the minted grant: {b}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    //! Content search (SEARCH-1): `GET /search?q=` folds chat transcripts and
+    //! returns the chats whose **log** matches, with a snippet — the chat-log
+    //! relevance tier of `navigation.md`.
+    use crate::library::ChatRecord;
+    use crate::stream::ServerEvent;
+    use crate::{open_control_plane, Workbench};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    async fn get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
+    fn chat(id: &str, title: &str, pos: i64) -> ChatRecord {
+        ChatRecord {
+            id: id.into(),
+            op: Default::default(),
+            instance_id: "i1".into(),
+            title: title.into(),
+            created_position: pos,
+            forked_from: None,
+        }
+    }
+
+    /// Two chats: chat-1's *log* mentions "bridge"/"deadline"; chat-2 only has
+    /// "deadline" in its *title* (its log is unrelated).
+    fn seed() -> axum::Router {
+        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let mut wb = Workbench::new(store);
+        wb.write_chat_record(chat("chat-1", "weekly sync", 0));
+        wb.write_chat_transcript_event(
+            "chat-1",
+            ServerEvent::User {
+                text: "please review the deadline for the bridge".into(),
+            },
+        )
+        .unwrap();
+        wb.write_chat_record(chat("chat-2", "deadline planning", 1));
+        wb.write_chat_transcript_event(
+            "chat-2",
+            ServerEvent::Assistant {
+                text: "nothing relevant in this log".into(),
+            },
+        )
+        .unwrap();
+        open_control_plane(Arc::new(Mutex::new(wb)))
+    }
+
+    #[tokio::test]
+    async fn content_match_surfaces_chat_with_snippet() {
+        let (status, v) = get(&seed(), "/search?q=bridge").await;
+        assert_eq!(status, StatusCode::OK);
+        let hits = v["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "only chat-1's log mentions bridge");
+        assert_eq!(hits[0]["id"], "chat-1");
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("bridge"));
+    }
+
+    #[tokio::test]
+    async fn search_is_case_insensitive_and_log_only() {
+        // "DEADLINE" is in chat-1's log and chat-2's *title*; content search is
+        // the log tier, so it returns chat-1 only (the title tier is client-side).
+        let (_, v) = get(&seed(), "/search?q=DEADLINE").await;
+        let ids: Vec<&str> = v["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["chat-1"]);
+    }
+
+    #[tokio::test]
+    async fn empty_query_returns_no_hits() {
+        let (status, v) = get(&seed(), "/search?q=").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(v["hits"].as_array().unwrap().is_empty());
+    }
+}

@@ -1,0 +1,45 @@
+# gaugewright-ee — the source-available enterprise band (SPLIT-1).
+# Owns the enterprise admin/SSO/SCIM control-plane surface extracted from
+# `crates/app`: the org admin routes + ENTSEC-1 data-route auth middleware
+# (`org_routes`), the OIDC auth-code + PKCE login shell and startup SSO
+# activation (`auth_oidc`), the OIDC id-token verifier core (`identity_oidc`),
+# the SAML sidecar adapter (`identity_saml`), and SCIM provisioning
+# (`scim_routes`). GitLab-style source-available subtree of the platform repo
+# (ADR 0069): it lives at `ee/` and is licensed BUSL-1.1 (the license text
+# itself lands in SPLIT-5), NOT under the workspace's open license. The open
+# substrate it composes over (org/audit/workbench_auth/identity records,
+# traits, and Workbench accessors) stays in `crates/app`.
+[package]
+name = "gaugewright-ee"
+edition.workspace = true
+version.workspace = true
+# Deliberately NOT `license.workspace`: this subtree is the future BUSL band
+# (ADR 0069 GitLab-style); the final license text lands in SPLIT-5.
+license = "BUSL-1.1"
+description = "gaugewright source-available enterprise band: org admin, SSO (OIDC/SAML), SCIM, and enterprise data-route auth over the open app substrate (BUSL-1.1 ee/ subtree, ADR 0069)."
+
+[dependencies]
+gaugewright-core = { path = "../../crates/core" }
+gaugewright-store = { path = "../../crates/store" }
+gaugewright-app = { path = "../../crates/app", default-features = false }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+# OIDC SSO adapter (M3 ID-3): id-token (JWT) verification behind the
+# `IdentityProvider` seam. `ring` is the crypto backend (already in the tree via
+# tokio-rustls), keeping the build OpenSSL- and cmake-free to match the app's
+# `crypto_nossl` choice. `use_pem` gives RS256/ES256 key loading from PEM.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+# base64 for the enterprise OIDC auth-code state/claims decoding (ID-3).
+base64 = "0.22"
+
+[dev-dependencies]
+gaugewright-workspace = { path = "../../crates/workspace" }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

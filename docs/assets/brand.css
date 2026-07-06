@@ -1,0 +1,61 @@
+/* GaugeBench docs — brand tokens + type, mirroring the GaugeWright brand
+   SSOT (hub: brand/palette.css, brand/typography.css). Navy-led, brand-blue
+   accent, serif-voice headings. Honest capability-status badges below. */
+
+@import url('https://fonts.googleapis.com/css2?family=STIX+Two+Text:wght@400;500;600;700&display=swap');
+
+:root {
+  --gw-navy: #0e2d50;
+  --gw-blue: #1f61c4;
+  --gw-serif: "STIX Two Text", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+
+  --md-primary-fg-color: var(--gw-navy);
+  --md-accent-fg-color: var(--gw-blue);
+  --md-typeset-a-color: var(--gw-blue);
+}
+
+/* Dark scheme: lighten accents for contrast on deep navy. */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #0c1a2e;
+  --md-accent-fg-color: #4f8fe6;
+  --md-typeset-a-color: #6aa3ff;
+}
+
+/* Serif carries the voice: headings + chrome titles. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-header__title,
+.md-nav__title {
+  font-family: var(--gw-serif);
+}
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+
+/* Inline capability-status badges, used throughout the docs.
+   Honest three-state vocabulary (plus "no"):
+   Available · Built (not deployed) · Planned · Not implemented. */
+.status {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0.05rem 0.45rem;
+  border-radius: 1rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  color: var(--md-default-fg-color--light);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.status.available { color: #2e9e6b; border-color: #2e9e6b66; background: #2e9e6b14; }
+.status.built     { color: #1f61c4; border-color: #1f61c466; background: #1f61c414; }
+.status.planned   { color: #c6952f; border-color: #c6952f66; background: #c6952f14; }
+.status.none      { color: #b5342b; border-color: #b5342b66; background: #b5342b14; }
+[data-md-color-scheme="slate"] .status.available { color: #7fd6a6; }
+[data-md-color-scheme="slate"] .status.built     { color: #6aa3ff; }
+[data-md-color-scheme="slate"] .status.planned   { color: #e0b24e; }
+[data-md-color-scheme="slate"] .status.none      { color: #e0655c; }

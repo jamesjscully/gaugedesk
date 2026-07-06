@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>GaugeWright embed example</title>
+        <style>
+            body { font-family: system-ui, sans-serif; margin: 0; background: #f6f7f9; }
+            main { max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
+            h1 { font-size: 1.25rem; }
+            /* The host page sizes the panels; their internals are shadow-isolated. */
+            gw-session { display: grid; gap: 1rem; grid-template-columns: 1fr 1fr; }
+            gw-chat { grid-column: 1 / 2; min-height: 320px; }
+            gw-viewer, gw-files { grid-column: 2 / 3; min-height: 150px; }
+        </style>
+    </head>
+    <body>
+        <main>
+            <h1>Embedded agent</h1>
+            <p>The workbench panels, embedded as web components against a scoped session.</p>
+            <div id="mount"></div>
+        </main>
+        <script type="module" src="/packages/gw-embed/src/example.ts"></script>
+    </body>
+</html>

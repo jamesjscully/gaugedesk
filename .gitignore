@@ -1,0 +1,61 @@
+# Rust backend workspace
+/target/
+
+# Docs site build output (mkdocs build → site/)
+/site/
+
+# Web island (Solid)
+web/node_modules/
+web/dist/
+web/dist-embed/
+web/dist-open/
+web/dist-apps-open/
+web/dist-app-workbench-web/
+web/dist-app-mobile-web/
+
+# Enterprise web workspace (ee/web, SPLIT-2)
+ee/web/node_modules/
+ee/web/dist-apps-enterprise/
+ee/web/dist-app-admin-console/
+
+node_modules/
+dist/
+dist-types/
+__pycache__/
+**/__pycache__/
+
+# Playwright / playwright-bdd E2E artifacts
+web/.features-gen/
+web/test-results/
+web/playwright-report/
+web/blob-report/
+
+# Local control-plane state (git instance + event store)
+.gaugewright/
+gaugewright.db
+# legacy data dir (pre-rename), kept ignored so orphaned runtime state stays out of git
+.untie/
+untie.db
+*.db-wal
+*.db-shm
+
+# Tauri build artifacts
+src-tauri/target/
+
+# Vendored bundle payload — Pi binary + plugin, fetched/compiled by the release
+# lane (.github/workflows/release.yml), never committed (SELFHOST-1 Phase B).
+src-tauri/vendor/
+
+# Apalache (TLA+) model-checker output
+_apalache-out/
+
+# Claude Code local agent config / state
+.claude/
+
+# Cloudflare Wrangler local state (DOCS-1 deploy; regenerable)
+.wrangler/
+
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example

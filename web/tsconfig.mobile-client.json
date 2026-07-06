@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [],
+  "files": [
+    "apps/mobile-web/src/main.tsx",
+    "apps/mobile-web/src/MobileApp.tsx",
+    "apps/mobile-web/src/mobile-control-plane.ts"
+  ]
+}

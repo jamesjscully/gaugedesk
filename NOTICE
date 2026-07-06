@@ -1,0 +1,10 @@
+GaugeBench
+Copyright 2026 GaugeWright LLC
+
+This product includes software developed for the GaugeWright platform
+(https://gaugewright.com).
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use the files in this repository except in compliance with the License, with
+the following exception: the contents of the `ee/` directory are licensed
+under the Business Source License 1.1 — see `ee/LICENSE`.

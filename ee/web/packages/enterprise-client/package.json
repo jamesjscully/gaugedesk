@@ -1,0 +1,36 @@
+{
+  "name": "@gaugewright/enterprise-client",
+  "version": "0.0.0",
+  "private": true,
+  "license": "BUSL-1.1",
+  "type": "module",
+  "description": "Transitional source-available enterprise client package root.",
+  "dependencies": {
+    "@gaugewright/control-plane-client": "0.0.0"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./control-plane-enterprise": "./src/control-plane-enterprise.ts",
+    "./enterprise-control-plane": "./src/enterprise-control-plane.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ../../tsconfig.enterprise-client.json"
+  },
+  "gaugewright": {
+    "artifactKind": "package",
+    "ciTarget": "npm run typecheck:enterprise-client",
+    "dependencyPolicy": {
+      "mayDependOn": [
+        "open-source",
+        "source-available-enterprise"
+      ],
+      "mustNotDependOn": [
+        "private-managed-services"
+      ]
+    },
+    "extractionPhase": "monorepo-transitional",
+    "licenseTarget": "BUSL-1.1",
+    "repoTarget": "source-available-enterprise",
+    "sourcePosture": "source-available-enterprise"
+  }
+}

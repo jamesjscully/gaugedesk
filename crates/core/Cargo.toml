@@ -1,0 +1,15 @@
+[package]
+name = "gaugewright-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "gaugewright pure core: domain types and lifecycle reducers (no I/O), property-tested against the Quint models."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+
+[dev-dependencies]
+proptest = "1"

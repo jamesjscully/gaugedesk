@@ -1,0 +1,396 @@
+//! SCIM 2.0 provisioning end to end (M3 B13 / `SCIM-1`/`-2`/`-4`). Issue a SCIM
+//! token, provision a user (token-authenticated), reject a bad token, and
+//! deprovision via DELETE — asserting the offboarding marks the member
+//! deprovisioned and SCIM-managed.
+
+use std::sync::{Arc, Mutex};
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use http_body_util::BodyExt;
+use serde_json::Value;
+use tower::ServiceExt;
+
+use gaugewright_app::Workbench;
+use gaugewright_ee::org_routes::enterprise_control_plane;
+use gaugewright_store::Store;
+use gaugewright_workspace::Instance;
+
+fn workbench() -> (tempfile::TempDir, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let wb = Workbench::with_instance("inst-test", instance, store);
+    (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
+}
+
+async fn send(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut b = Request::builder().method(method).uri(uri);
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    let req = match body {
+        Some(body) => b
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    };
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Like `send`, but also stamps the `X-Gaugewright-Tenant` header (DEPLOY-6).
+async fn send_t(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    tenant: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-gaugewright-tenant", tenant);
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    let req = match body {
+        Some(j) => b
+            .header("content-type", "application/json")
+            .body(Body::from(j.to_string()))
+            .unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    };
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn scim_throttles_after_repeated_bad_tokens() {
+    // SECAUD-8 (CC6.6/CC6.7): a brute-force loop against the SCIM bearer is locked out
+    // after the failure threshold (10/min) — the 11th attempt is 429, not another 401,
+    // so guessing is slowed even if the edge rate-limit is absent.
+    let (_dir, app) = workbench();
+    for _ in 0..10 {
+        let (s, _) = send(
+            &app,
+            "POST",
+            "/scim/v2/Users",
+            Some(r#"{"userName":"x@e.com"}"#),
+            Some("bad-token"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "a bad token is unauthorized");
+    }
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"x@e.com"}"#),
+        Some("bad-token"),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "locked out after the threshold"
+    );
+}
+
+#[tokio::test]
+async fn scim_tokens_are_tenant_isolated() {
+    // DEPLOY-6 tail: a SCIM token issued for one tenant must NOT authenticate for another,
+    // and provisioning lands in the issuing tenant's directory.
+    let (_dir, app) = workbench();
+    let token_a = send_t(&app, "POST", "/admin/scim/token", "acme", None, None)
+        .await
+        .1["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token_g = send_t(&app, "POST", "/admin/scim/token", "globex", None, None)
+        .await
+        .1["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(token_a, token_g);
+
+    // acme's token provisions under acme.
+    let (s, _) = send_t(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        "acme",
+        Some(&token_a),
+        Some(r#"{"userName":"a@acme.com"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    // acme's token is REJECTED for globex — cross-tenant isolation (the key property).
+    let (s, _) = send_t(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        "globex",
+        Some(&token_a),
+        Some(r#"{"userName":"x@globex.com"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // globex's own token works for globex.
+    let (s, _) = send_t(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        "globex",
+        Some(&token_g),
+        Some(r#"{"userName":"g@globex.com"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn scim_provision_and_deprovision() {
+    let (_dir, app) = workbench();
+
+    // Admin issues a SCIM token (ungated in single-user mode); plaintext returned once.
+    let (s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let token = body["token"].as_str().expect("token issued").to_string();
+    assert!(!token.is_empty());
+
+    // A bad token cannot provision.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"alice@acme.com"}"#),
+        Some("not-the-token"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // No token cannot provision.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"alice@acme.com"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // The real token provisions an active, SCIM-managed member.
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"alice@acme.com"}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(body["userName"], "alice@acme.com");
+    assert_eq!(body["active"], true);
+
+    // It shows up in the directory, SCIM-managed and active.
+    let (s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let members = body["members"].as_array().unwrap();
+    let alice = members
+        .iter()
+        .find(|m| m["authority"] == "alice@acme.com")
+        .expect("alice present");
+    assert_eq!(alice["managed_by_scim"], true);
+    assert_eq!(alice["status"], "active");
+
+    // Offboarding via DELETE deprovisions (SCIM-2: access revoked).
+    let (s, body) = send(
+        &app,
+        "DELETE",
+        "/scim/v2/Users/alice@acme.com",
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["active"], false);
+
+    let (_s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let alice = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["authority"] == "alice@acme.com")
+        .unwrap()
+        .clone();
+    assert_eq!(alice["status"], "deprovisioned");
+}
+
+#[tokio::test]
+async fn scim_groups_map_to_roles() {
+    let (_dir, app) = workbench();
+    // Admin configures a group → role/team mapping (ungated single-user).
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/admin/scim/group-mapping",
+        Some(r#"{"group":"Engineering","role":"admin","team":"eng"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (_s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
+    let token = body["token"].as_str().unwrap().to_string();
+
+    // A user provisioned with that group takes the mapped role/team.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"e@acme.com","groups":[{"value":"Engineering"}]}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let (_s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let m = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["authority"] == "e@acme.com")
+        .unwrap()
+        .clone();
+    assert_eq!(m["role"], "admin");
+    assert_eq!(m["team"], "eng");
+
+    // A user with an unmapped group falls back to the default member role.
+    send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"x@acme.com","groups":[{"value":"Unknown"}]}"#),
+        Some(&token),
+    )
+    .await;
+    let (_s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let x = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["authority"] == "x@acme.com")
+        .unwrap()
+        .clone();
+    assert_eq!(x["role"], "member");
+}
+
+#[tokio::test]
+async fn rotating_the_token_invalidates_the_old_one() {
+    let (_dir, app) = workbench();
+    let (_s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
+    let first = body["token"].as_str().unwrap().to_string();
+    let (_s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
+    let second = body["token"].as_str().unwrap().to_string();
+    assert_ne!(first, second);
+
+    // The old token no longer authenticates; the new one does.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"x@acme.com"}"#),
+        Some(&first),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"x@acme.com"}"#),
+        Some(&second),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+}
+
+/// SCIM-1: the PATCH endpoint accepts the strict RFC 7644 PatchOp envelope that Okta / Entra
+/// actually send to deprovision — `{"schemas":[…],"Operations":[{"op":"replace","path":"active","value":false}]}`
+/// — end to end, deprovisioning the member (offboarding → access revoked, SCIM-2).
+#[tokio::test]
+async fn scim_patchop_envelope_deprovisions() {
+    let (_dir, app) = workbench();
+    let (_, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
+    let token = body["token"].as_str().unwrap().to_string();
+
+    // Provision an active member.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        Some(r#"{"userName":"bob@acme.com"}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // Deprovision via the real PatchOp envelope.
+    let (s, body) = send(
+        &app,
+        "PATCH",
+        "/scim/v2/Users/bob@acme.com",
+        Some(
+            r#"{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"replace","path":"active","value":false}]}"#,
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "PatchOp envelope accepted: {body}");
+    assert_eq!(body["active"], false);
+
+    // The directory reflects the deprovision (standing revoked).
+    let (_, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let bob = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["authority"] == "bob@acme.com")
+        .unwrap()
+        .clone();
+    assert_eq!(bob["status"], "deprovisioned");
+
+    // A PatchOp with no active-setting operation is a 400 (not a silent no-op).
+    let (s, _) = send(
+        &app,
+        "PATCH",
+        "/scim/v2/Users/bob@acme.com",
+        Some(r#"{"Operations":[{"op":"replace","path":"displayName","value":"X"}]}"#),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "no active op ⇒ 400");
+}

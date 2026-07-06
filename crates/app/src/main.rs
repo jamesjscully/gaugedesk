@@ -1,0 +1,26 @@
+//! gaugewright control-plane binary. Opens (or initializes) the local store + git
+//! instance under `.gaugewright/` and serves the co-resident HTTP control plane on
+//! loopback.
+
+#[tokio::main]
+async fn main() {
+    // Observability (RF-A8): a fmt subscriber gated by `RUST_LOG` (warn by
+    // default). Engine turns, admission, and pi spawns emit operational spans
+    // and events — metadata only (scope ids, phases, counts), never protected
+    // content. Set e.g. `RUST_LOG=gaugewright_app=info,gaugewright_pi_bridge=info`.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    let root = gaugewright_app::open_api::open_control_plane_root();
+    // The bind address is `GAUGEWRIGHT_ADDR` (default loopback `127.0.0.1:7878`). A
+    // multi-machine deployment runs two instances on distinct ports/roots, each
+    // with its own `GAUGEWRIGHT_AUTHORITY` identity (D-REMOTE / `SERVE-1`).
+    let addr = std::env::var("GAUGEWRIGHT_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+    gaugewright_app::open_api::open_serve(&addr, &root)
+        .await
+        .expect("serve open control plane");
+}

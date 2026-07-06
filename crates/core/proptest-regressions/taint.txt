@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fd7b3b6c6afd272ff271b5645bfecc066477e07332390072322f3d5581aa3306 # shrinks to ops = [Produce, Egress("B"), Read("method")]

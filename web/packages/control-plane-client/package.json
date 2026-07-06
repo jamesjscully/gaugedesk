@@ -1,0 +1,45 @@
+{
+  "name": "@gaugewright/control-plane-client",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Transitional open-source control-plane client package root.",
+  "dependencies": {
+    "solid-js": "^1.9.0"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./auth-session": "./src/auth-session.ts",
+    "./bridge": "./src/bridge.ts",
+    "./browser-route-json": "./src/browser-route-json.ts",
+    "./control-plane-account": "./src/control-plane-account.ts",
+    "./control-plane-domain": "./src/control-plane-domain.ts",
+    "./control-plane-embed": "./src/control-plane-embed.ts",
+    "./control-plane-federation": "./src/control-plane-federation.ts",
+    "./control-plane-transport": "./src/control-plane-transport.ts",
+    "./control-plane-workbench": "./src/control-plane-workbench.ts",
+    "./project-home": "./src/project-home.ts",
+    "./projection-carriage": "./src/projection-carriage.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ../../tsconfig.open-client.json"
+  },
+  "gaugewright": {
+    "artifactKind": "package",
+    "ciTarget": "npm run typecheck:open-client",
+    "dependencyPolicy": {
+      "mayDependOn": [
+        "open-source"
+      ],
+      "mustNotDependOn": [
+        "source-available-enterprise",
+        "private-managed-services"
+      ]
+    },
+    "extractionPhase": "monorepo-transitional",
+    "licenseTarget": "Apache-2.0",
+    "repoTarget": "open-source",
+    "sourcePosture": "open-source"
+  }
+}

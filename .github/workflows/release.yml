@@ -1,0 +1,211 @@
+# UNSIGNED packaging lane (D-RELEASE-LANES item 2, Band 1). On tag push the per-OS
+# Tauri build matrix produces **unsigned** installable bundles — .deb + .AppImage on
+# Linux, .dmg on macOS, .msi on Windows — and uploads them as workflow artifacts for
+# dogfooding. Signing / notarization stay clearly-commented placeholders (they need
+# certs/keys this repo does not hold — Band 3). See DEFERRED.md (D-RELEASE-LANES) and
+# specs/implementation/test-and-release-infra.md (Tier 4 "packaging & self-contained
+# distribution" + the Release lane in "CI lane structure").
+#
+# VALIDATED-BY-SYNTAX-HERE, RUNS-ON-CI: this environment has no webkit/Tauri
+# toolchain, so a Tauri build canNOT run locally. This file is validated only by YAML
+# syntax here (python3 -c "import yaml; yaml.safe_load(...)"); the actual bundle build
+# runs on GitHub's per-OS runners. The web build (web/) runs first because the bundle
+# embeds web/dist (frontendDist: ../web/dist).
+#
+# Tier-4 self-contained runtime (SELFHOST-1 Phase B) — PARTIAL:
+#   * Pi + the egress-membrane plugin ARE now vendored (the steps below compile Pi
+#     to a single self-contained executable via `bun build --compile` and copy the
+#     plugin into src-tauri/vendor/; the release-only overlay tauri.bundle.conf.json
+#     maps them into resource_dir as bin/pi + plugin/gaugewright-plugin.ts, which the
+#     shell's GAUGEWRIGHT_PI_BIN / GAUGEWRIGHT_PLUGIN_PATH seams resolve at startup). The control
+#     plane already roots in the OS app-data dir (control_plane_root(), done).
+#   * STILL NEEDS-INFRA: git is NOT vendored — git is not a single relocatable binary
+#     (it needs git-core helpers), so a truly-clean-machine bundle must ship the whole
+#     portable-git tree per OS. For the mac/Linux dogfood lane the runtime falls back
+#     to system git (GAUGEWRIGHT_GIT_BIN unset → PATH `git`), which dev/dogfood machines
+#     have. Full git vendoring + Windows (gated on D-SANDBOX-WINDOWS) remain open.
+#   * VALIDATE-ON-FIRST-CI-RUN: that the compiled `pi` runs `--mode rpc` without its
+#     interactive runtime assets (theme json / photon wasm), and that resource exec
+#     bits survive bundling on macOS/Linux. Neither is verifiable without the Tauri
+#     toolchain here. (test-and-release-infra.md)
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "tag or ref to build"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create the GitHub Release + upload bundle assets
+
+jobs:
+  bundle:
+    name: tauri bundle (${{ matrix.os-label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux -> .deb + .AppImage (unsigned)
+          - os-label: linux
+            runner: ubuntu-latest
+            bundles: deb,appimage
+          # macOS (Apple Silicon) -> .app.tar.gz (updater) + .dmg (download).
+          # The `app` target is REQUIRED for the self-update artifact: the updater
+          # bundle is a tar.gz of the .app, and `dmg` alone produces no .app.tar.gz,
+          # so v0.1.0's latest.json had no darwin-aarch64 entry. (unsigned — no notarization)
+          - os-label: macos
+            runner: macos-latest
+            bundles: app,dmg
+          # Windows -> .msi (unsigned — no Authenticode)
+          - os-label: windows
+            runner: windows-latest
+            bundles: msi
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: linux bundle deps
+        # NEEDS-INFRA: Tauri's Linux bundling needs gtk/webkit2gtk + appindicator.
+        if: matrix.os-label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf
+
+      - name: build web bundle
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: install bun (compiles Pi to a self-contained binary)
+        uses: oven-sh/setup-bun@v2
+
+      - name: vendor Pi + plugin into the bundle (SELFHOST-1 Phase B)
+        shell: bash
+        env:
+          # Pin to the dev-verified Pi (backend-stack.md: "Verified Pi 0.73.x").
+          # The package that carries the bun entrypoint is pi-coding-agent.
+          PI_VERSION: "0.73.0"
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/vendor/bin src-tauri/vendor/plugin
+          # Pi ships as a Node CLI (@mariozechner/pi-coding-agent) but exposes a bun
+          # entrypoint (dist/bun/cli.js) and an upstream `build:binary` recipe that
+          # does exactly this — compile it to ONE self-contained executable so the
+          # bundle needs no Node at runtime. Output name matches the OS (pi / pi.exe);
+          # the tauri.bundle.conf.json `vendor/bin/*` glob ships whichever exists.
+          npm install -g "@mariozechner/pi-coding-agent@${PI_VERSION}"
+          PI_PKG="$(npm root -g)/@mariozechner/pi-coding-agent"
+          # @mistralai/mistralai (a Pi dep) imports @opentelemetry/api, which npm
+          # leaves uninstalled (optional peer); bun's compile-time resolver fails on
+          # the unresolved import, so provide it next to the Pi package.
+          npm install --prefix "${PI_PKG}" --no-save @opentelemetry/api
+          OUT="src-tauri/vendor/bin/pi"
+          if [ "${{ matrix.os-label }}" = "windows" ]; then OUT="src-tauri/vendor/bin/pi.exe"; fi
+          bun build --compile "${PI_PKG}/dist/bun/cli.js" --outfile "${OUT}"
+          # The compiled binary resolves runtime assets relative to its own
+          # directory (upstream copy-binary-assets): package.json (version),
+          # theme/*.json (loaded even in --mode rpc), photon wasm (image ops).
+          cp "${PI_PKG}/package.json" src-tauri/vendor/bin/package.json
+          mkdir -p src-tauri/vendor/bin/theme
+          cp "${PI_PKG}"/dist/modes/interactive/theme/*.json src-tauri/vendor/bin/theme/
+          PHOTON_WASM="$(find "$(npm root -g)" -name photon_rs_bg.wasm -print -quit)"
+          if [ -n "${PHOTON_WASM}" ]; then cp "${PHOTON_WASM}" src-tauri/vendor/bin/; fi
+          chmod +x "${OUT}"
+          # The egress-membrane Pi plugin (the only TS in the backend) rides along.
+          cp plugin/gaugewright-plugin.ts src-tauri/vendor/plugin/gaugewright-plugin.ts
+
+      # -----------------------------------------------------------------------
+      # SIGNING STATUS:
+      #   * Tauri UPDATER artifacts ARE signed (env block below) — the keypair was
+      #     generated with `tauri signer generate`; the public key lives in
+      #     tauri.conf.json (plugins.updater.pubkey) and the private key + password
+      #     are the repo secrets TAURI_SIGNING_PRIVATE_KEY / *_PASSWORD. This signs
+      #     the update payload (latest.json + the per-OS update bundles), so the
+      #     installed app can verify and self-update.
+      #   * OS-level code signing / notarization is STILL UNSIGNED — those need
+      #     certs this repo does not hold (Band 3). Uncomment per-OS and wire the
+      #     named secrets when a signing identity exists:
+      #       macOS:   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+      #                APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+      #       Windows: WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD
+      # -----------------------------------------------------------------------
+
+      - name: tauri build (OS-unsigned, signed updater, ${{ matrix.bundles }})
+        # Bundles are NOT OS-code-signed (no Apple/Windows certs); UPDATE artifacts
+        # ARE signed via the TAURI_SIGNING_* env below. `--config tauri.bundle.conf.json`
+        # (in args) merges the release-only overlay that ships the vendored Pi + plugin
+        # from src-tauri/vendor/ into resource_dir AND enables createUpdaterArtifacts.
+        # The base tauri.conf.json stays free of those resources so `tauri dev` builds
+        # with an empty vendor/ (PATH/cwd fallback). The overlay must stay
+        # comment-free: Tauri validates the merged config against its schema, which
+        # rejects unknown keys (a "//" doc key failed the first v0.1.0 run). Overlay
+        # resource entries must use GLOB sources ("vendor/plugin/*"): a non-glob
+        # single-file source treats the dest as a full target filename (rename
+        # semantics) — v0.1.0 shipped the membrane plugin as a file named "plugin",
+        # which silently dropped the membrane from packaged runs.
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # tauri-action creates the draft GitHub Release + uploads assets with this
+          # (the permissions block alone doesn't inject it into the step env).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin frontend detection: the CLI otherwise globs for a package.json from
+          # its own cwd (which on CI is the checkout root, not src-tauri), making
+          # relative paths like beforeBuildCommand's `../web` resolve wrongly. The
+          # overlay also nulls out beforeBuildCommand — the `build web bundle` step
+          # above already produced web/dist, so the release build must not rebuild it.
+          TAURI_FRONTEND_PATH: ${{ github.workspace }}/web
+          # Tauri updater signing (matches plugins.updater.pubkey in tauri.conf.json):
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # # macOS notarization (uncomment with the secrets above):
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # # Windows Authenticode:
+          # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        with:
+          projectPath: src-tauri
+          # Draft a single GitHub Release that all three matrix legs upload into.
+          tagName: ${{ github.ref_name }}
+          releaseName: "GaugeBench ${{ github.ref_name }}"
+          releaseDraft: true
+          args: --bundles ${{ matrix.bundles }} --config tauri.bundle.conf.json
+
+      - name: upload unsigned bundles (workflow artifact)
+        # The unsigned .deb/.AppImage/.dmg/.msi for this OS, kept as a workflow
+        # artifact for dogfooding (and so a dry-run via workflow_dispatch without a
+        # tag still yields inspectable output). `error` so a build that produced no
+        # bundle fails loudly rather than silently uploading nothing.
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaugebench-bundles-${{ matrix.os-label }}
+          path: |
+            src-tauri/target/release/bundle/**
+          if-no-files-found: error

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": null
+  },
+  "bundle": {
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "vendor/bin/*": "bin/",
+      "vendor/bin/theme/*": "bin/theme/",
+      "vendor/plugin/*": "plugin/"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "gaugewright-harness"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "gaugewright runtime seam: the adapter-free Harness contract, egress gate, neutral turn/content types, and the OS sandbox."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

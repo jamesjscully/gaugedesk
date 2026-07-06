@@ -1,0 +1,68 @@
+# GaugeBench
+
+GaugeBench is a free, event-sourced, projection-first desktop workbench for
+governed, multi-party agentic work — a way to apply external expertise to
+private operational context under review, release, and audit controls.
+
+This repository is the open, source-available distribution of the GaugeBench
+platform.
+
+## What's here
+
+- **Core crates** — `crates/core` (pure, property-tested reducers), `crates/store`
+  (SQLite event log + admission), `crates/workspace` (git instance/worktrees),
+  `crates/boundary` (the egress membrane), `crates/pi-bridge` (drives
+  `pi --mode rpc`), and `crates/app` (engine orchestrator + axum control plane).
+- **Desktop shell** — `src-tauri/` (its own Cargo workspace).
+- **Web** — `web/` (workbench, mobile, `workbench-ui`, `control-plane-client`,
+  `gw-embed`) and the enterprise web workspace under `ee/web/`.
+- **Enterprise (`ee/`)** — org/SSO/OIDC/SAML, SCIM, RBAC, enterprise audit
+  (`ee/app`), and the SAML verifier sidecar (`ee/sidecar/saml-verify`).
+- **Federation protocol** and the open Pi membrane plugin (`plugin/`).
+- **Docs** — `docs/`, rendered to the documentation site.
+
+## Download
+
+Prebuilt desktop bundles — Linux `.deb`/`.AppImage`, macOS `.dmg`, Windows `.msi`
+— are on the [releases page](https://github.com/jamesjscully/gaugebench/releases).
+Installers are currently unsigned.
+
+## Licensing
+
+Two license bands, split by directory:
+
+- Everything outside `ee/` is **Apache-2.0** — see [`LICENSE`](LICENSE) and
+  [`NOTICE`](NOTICE).
+- Everything under `ee/` is **Business Source License 1.1** with the GaugeWright
+  Enterprise Use Grant — see [`ee/LICENSE`](ee/LICENSE). It is publicly readable
+  by design; production use is governed by the BUSL terms.
+
+## Quick start
+
+```sh
+# Backend
+cargo test --workspace
+
+# Web client
+cd web
+npm ci
+npm run dev                     # dev server
+npm run typecheck && npm run test
+```
+
+## Verifying the security claims
+
+GaugeBench's protection model is structural, and much of it is machine-checked.
+[Verifying the security claims](docs/reference/verifying-claims.md) maps each
+guarantee to the executable tests in this repository that exercise it. The formal
+Quint models those tests are derived from are maintained in a separate private
+repository; the tests that check the same properties are public here.
+
+## Related projects
+
+| Project | What it is |
+| --- | --- |
+| GaugeWright | The company that builds GaugeBench |
+| WhippleScript | Orchestration language + runtime |
+| `gaugewright-cloud` (private) | Hosted control plane, managed relay, embed host, attestation/KMS, settlement plane |
+| `gaugewright-directory` | The blind account directory service |

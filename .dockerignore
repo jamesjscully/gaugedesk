@@ -1,0 +1,14 @@
+# Keep the Docker build context small for the Tier-1 harness (docker/compose.yml).
+# The harness build needs only Cargo.toml, Cargo.lock, and crates/.
+target
+**/target
+web
+src-tauri
+node_modules
+**/node_modules
+.git
+docs
+specs
+plugin
+.gaugewright
+.untie

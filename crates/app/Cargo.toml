@@ -1,0 +1,76 @@
+[package]
+name = "gaugewright-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "gaugewright local control plane: the co-resident axum HTTP/WS server over the admission shell (Phase 0)."
+
+[features]
+default = [
+  "federation-protocol",
+]
+# Transitional repo-split feature band. The enterprise band extracted to the
+# `ee/app` crate (`gaugewright-ee`, SPLIT-1); federation is the only route
+# surface still gated by a feature in the open app crate.
+federation-protocol = []
+
+[dependencies]
+gaugewright-core = { path = "../core" }
+gaugewright-store = { path = "../store" }
+gaugewright-workspace = { path = "../workspace" }
+gaugewright-boundary = { path = "../boundary" }
+gaugewright-harness = { path = "../harness" }
+gaugewright-pi-bridge = { path = "../pi-bridge" }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+# ECDH for the ACCT-1 device-enrollment seal-to-subkey (ECIES: ECDH(subkey) -> HKDF-SHA256
+# -> AES-256-GCM). The subkey is a P-256 keypair; core uses p256/ecdsa, the app adds ecdh.
+p256 = { version = "0.13", features = ["ecdh"] }
+# Encryption-at-rest seam (M3 SEC-4): AES-256-GCM via ring (already in the tree via
+# tokio-rustls), keeping the build OpenSSL-free. The cipher is local/real; the
+# KMS-managed data key is the deferred infra half that attaches behind the seam.
+ring = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "6.0.0"
+# Cert-pinned TLS on the federation relay legs (D-REMOTE / ADR 0041): an
+# end-to-end TLS session between two paired authorities, tunnelled through the
+# blind rendezvous broker. `ring` (not aws-lc-rs) keeps the build OpenSSL- and
+# cmake-free on any CI runner, matching the `crypto_nossl` choice above.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# The shared outbound HTTP client (M3): the real impl behind the `HttpGet`/`HttpPost`
+# seams — OIDC discovery/JWKS (ID-3), Azure Key Vault wrapKey/unwrapKey (SEC-4), and the
+# Stripe Connect rail (BILL-2). Blocking, matching the sync seams (all are setup/login/
+# payment frequency, not the hot path). `rustls` TLS on `ring` (no native-tls), keeping
+# the build OpenSSL- and cmake-free to match the rest of the stack.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# Socket hand-off for hot-reload dev (DX): under `systemfd` the listening socket is
+# passed via the env, so a `cargo watch` restart inherits the *same* open socket —
+# clients queue across the rebuild instead of being refused. A no-op for a plain
+# run (no FD passed ⇒ normal bind). Dev ergonomics only; no production behaviour.
+listenfd = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+proptest = "1"
+
+[[test]]
+name = "federation_crossing"
+path = "tests/federation_crossing.rs"
+required-features = ["federation-protocol"]
+
+[[test]]
+name = "handoff_relocation"
+path = "tests/handoff_relocation.rs"
+required-features = ["federation-protocol"]

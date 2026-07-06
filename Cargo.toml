@@ -1,0 +1,22 @@
+# gaugewright — Rust backend workspace.
+# The functional-core / imperative-shell split (ADR 0004) is the crate boundary:
+# `core` is pure (reducers, no I/O), property-tested against the Quint models in
+# specs/models. The shell crates materialize non-determinism around it:
+# `store` (SQLite event log + admission), `workspace` (git instance/worktrees),
+# `boundary` (egress membrane + .agent-config.json policy), `harness` (the
+# adapter-free runtime seam + OS sandbox), `pi-bridge` (drives `pi --mode rpc`),
+# and `app` (the engine orchestrator + axum control plane).
+# See specs/implementation/backend-stack.md and mvp-plan.md.
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/app", "ee/app"]
+# The Tauri desktop shell is its own workspace (needs system webkit/CLI to build);
+# excluded so `cargo test` over the backend stays self-contained.
+exclude = ["src-tauri"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+# The platform default (ADR 0069 / SPLIT-5). Crates that are not Apache
+# override explicitly: ee/app is BUSL-1.1.
+license = "Apache-2.0"

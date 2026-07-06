@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [],
+  "files": [
+    "apps/workbench-web/src/main.tsx",
+    "apps/workbench-web/src/App.tsx",
+    "apps/workbench-web/src/workbench-control-plane.ts"
+  ]
+}

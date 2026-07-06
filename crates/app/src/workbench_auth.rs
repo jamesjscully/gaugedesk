@@ -1,0 +1,541 @@
+//! Workbench-local authorization and actor resolution helpers — the **open**
+//! admission substrate the route bands compose over: the source-available
+//! enterprise surface (`gaugewright-ee`) and the private settlement plane
+//! (`gaugewright-cloud-settlement`) both gate their routes through these seams.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+
+use crate::{identity, net_http, org, resource_store, throttle, Workbench};
+
+/// Which projects a request's caller may **see** in the nav/list projections (`ENTSEC-2`).
+/// This is the projection-visibility complement to the per-route [`Workbench::authorize_scope`]
+/// gate: the gate refuses *access* to another project's data; this stops another project even
+/// *appearing* in the nav for a scoped member (no information leak of project/chat existence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectVisibility {
+    /// See everything — solo/loopback (no IdP), bootstrap (unprovisioned directory), or an
+    /// `owner`/`admin` who bypasses scoping. The default, so the single-user shape is untouched.
+    All,
+    /// A scoped member sees **only** these explicitly-granted project ids (fail-closed: an
+    /// empty set means no client projects are visible).
+    Only(BTreeSet<String>),
+}
+
+impl ProjectVisibility {
+    /// Whether `project_id` is visible under this policy.
+    pub fn allows(&self, project_id: &str) -> bool {
+        match self {
+            ProjectVisibility::All => true,
+            ProjectVisibility::Only(set) => set.contains(project_id),
+        }
+    }
+}
+
+/// Gate an admin request by capability (`RBAC-5`); returns the error response to
+/// short-circuit with, or `None` to proceed. `cap = None` is a read (any console
+/// access). Ungated in single-user mode (no IdP) — see [`Workbench::authorize`].
+/// `pub` so the extracted enterprise band (`gaugewright-ee`) and settlement plane
+/// (`gaugewright-cloud-settlement`) reuse the RBAC gate across the crate boundary.
+pub fn deny(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    cap: Option<gaugewright_core::rbac::Capability>,
+) -> Option<axum::response::Response> {
+    wb.authorize(net_http::bearer(headers), cap)
+        .err()
+        .map(|(code, msg)| (code, msg).into_response())
+}
+
+/// The org store scope for a request's tenant (`DEPLOY-6`). Resolves the tenant from the
+/// `X-Gaugewright-Tenant` header (the hosted multi-tenant edge sets it from the host /
+/// subdomain); absent ⇒ the **default tenant** (solo / singleton), i.e. `ORG_SCOPE` — so a
+/// single-tenant deployment is unaffected. Reads + writes for a request all use this scope,
+/// keeping tenants isolated (`INV-1`/`INV-22`). `pub` so the extracted enterprise band and
+/// settlement plane resolve the same tenant scope across the crate boundary.
+pub fn req_scope(headers: &HeaderMap) -> String {
+    let tenant = headers
+        .get("x-gaugewright-tenant")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    org::tenant_scope(tenant)
+}
+
+impl Workbench {
+    /// The SCIM failed-attempt throttle (`SECAUD-8`).
+    pub fn scim_throttle(&self) -> &Arc<throttle::Throttle> {
+        &self.scim_throttle
+    }
+
+    /// The OIDC-callback failed-attempt throttle (`SECAUD-8`) — the per-tenant brute-force
+    /// guard on the SSO callback, mirroring [`scim_throttle`](Self::scim_throttle).
+    pub fn oidc_throttle(&self) -> &Arc<throttle::Throttle> {
+        &self.oidc_throttle
+    }
+
+    /// The live IT **session roster** (`ITGOV-2`): the active member sessions the data-route
+    /// admission has recorded — the authority (never the bearer), its age and idle. What the
+    /// IT console lists so an admin can see who is currently active. Empty in solo mode.
+    pub fn session_roster(&self) -> Vec<crate::session_activity::SessionInfo> {
+        let now = self.session_activity.now_ms();
+        self.session_activity.roster(now)
+    }
+
+    /// Wire an [`identity::IdentityProvider`] (enterprise mode, `RBAC-5`): the
+    /// adapter that authenticates a request's bearer credential. Without one the
+    /// workbench stays single-user/local and the admin routes are ungated. Builder.
+    pub fn with_identity_provider(
+        mut self,
+        idp: Arc<dyn identity::IdentityProvider + Send + Sync>,
+    ) -> Self {
+        self.idp = Some(idp);
+        self
+    }
+
+    /// Attach / clear the identity provider at runtime — the `&mut` counterpart of
+    /// [`with_identity_provider`](Self::with_identity_provider). `POST /admin/sso`
+    /// uses this to (de)activate OIDC verification from the stored connection without
+    /// a restart (`ID-3` enterprise-mode activation — the ee band's
+    /// `auth_oidc::build_oidc_idp`, `gaugewright-ee`).
+    pub fn set_identity_provider(
+        &mut self,
+        idp: Option<Arc<dyn identity::IdentityProvider + Send + Sync>>,
+    ) {
+        self.idp = idp;
+    }
+
+    /// Whether an identity provider is attached (enterprise mode active). `false` is
+    /// the single-user local shape (admin ungated).
+    pub fn has_idp(&self) -> bool {
+        self.idp.is_some()
+    }
+
+    /// Authorize an `/admin/*` request (`RBAC-5`). The gate:
+    ///
+    /// - **No IdP** (single-user local) ⇒ always `Ok` — the existing open behavior;
+    ///   M3 adds the org layer without changing the single-user shape (ADR 0020).
+    /// - **IdP, empty directory** ⇒ `Ok` (bootstrap): the directory must be seedable
+    ///   (by SCIM / the initial owner) before there is anyone to authorize against.
+    /// - **IdP, populated directory** ⇒ authenticate the bearer to an authority, read
+    ///   its **active**-member role from the directory, and require it (fail-closed,
+    ///   `INV-20`): a missing/invalid token is `401`; an authenticated actor without
+    ///   the capability (or any console access, for a read) is `403`. `cap = None`
+    ///   means "a read" — require any console access ([`rbac::can_access_console`]).
+    pub fn authorize(
+        &self,
+        bearer: Option<&str>,
+        cap: Option<gaugewright_core::rbac::Capability>,
+    ) -> Result<(), (StatusCode, &'static str)> {
+        let Some(idp) = &self.idp else {
+            return Ok(()); // single-user local: ungated
+        };
+        let org = org::Org::rebuild(self.store_ref())
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+        let provisioned = org
+            .members
+            .values()
+            .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned {
+            return Ok(()); // bootstrap: directory not yet provisioned
+        }
+        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+            return Err((StatusCode::UNAUTHORIZED, "authenticate to administer"));
+        };
+        let Some(role) = org.role_of(authority.as_str()) else {
+            return Err((StatusCode::FORBIDDEN, "not an active member"));
+        };
+        match cap {
+            None if gaugewright_core::rbac::can_access_console(&role) => Ok(()),
+            None => Err((StatusCode::FORBIDDEN, "role has no console access")),
+            Some(c) if gaugewright_core::rbac::role_can(&role, c) => Ok(()),
+            Some(_) => Err((StatusCode::FORBIDDEN, "role lacks capability")),
+        }
+    }
+
+    /// **ENTSEC-1**: authenticate a request to a *data* route (chats / resources / projections /
+    /// runs / workspace …) in enterprise mode. The gate, mirroring [`authorize`](Self::authorize)
+    /// but requiring only **active membership** (any role — these are not console actions; per-
+    /// scope RBAC is `ENTSEC-2`):
+    ///
+    /// - **No IdP** (single-user local / loopback) ⇒ `Ok` — the zero-friction solo shape is
+    ///   untouched (ADR 0020 / [ADR 0065]); the loopback channel is the local operator's own.
+    /// - **IdP, empty directory** ⇒ `Ok` (bootstrap — there is no one to authenticate against
+    ///   until SCIM / the initial owner provisions).
+    /// - **IdP, provisioned** ⇒ the bearer must authenticate to an **active member**; a
+    ///   missing/invalid token is `401`, a non-member is `403`, fail-closed (`INV-20`). So in a
+    ///   deployed (enterprise) workspace the data routes are no longer the open loopback API.
+    pub fn authenticate_request(
+        &self,
+        bearer: Option<&str>,
+    ) -> Result<(), (StatusCode, &'static str)> {
+        self.admit_data_request(bearer, None).map(|_| ())
+    }
+
+    /// **ENTSEC-2** ([ADR 0065]): authorize a request to a *project-scoped* data route. Layered
+    /// on top of [`authenticate_request`](Self::authenticate_request)'s membership check — the
+    /// actor is already an active member here; this narrows to the projects they may touch:
+    ///
+    /// - **No IdP** / **not provisioned** ⇒ `Ok` (solo / bootstrap, unchanged).
+    /// - **owner / admin** ⇒ `Ok` — the client org's own people see every project (role bypass).
+    /// - **any other member** ⇒ `Ok` only if explicitly **granted** `project_id`
+    ///   ([`Org::can_access_project`](org::Org::can_access_project)); else `403`, fail-closed
+    ///   (`INV-20`). A token that no longer authenticates is `401`.
+    pub fn authorize_scope(
+        &self,
+        bearer: Option<&str>,
+        project_id: &str,
+    ) -> Result<(), (StatusCode, &'static str)> {
+        self.admit_data_request(bearer, Some(project_id))
+            .map(|_| ())
+    }
+
+    /// **SECAUD-7** (SOC 2 CC6.1): the single fold-once admission for an enterprise data
+    /// route — fold the org **exactly once** and authenticate the bearer **exactly once**,
+    /// then run membership and (if the path is project-scoped) project-scope against that
+    /// one consistent read, returning the resolved **actor** label for the audit trail.
+    ///
+    /// Folding the directory twice (membership, then scope) opened a TOCTOU window: a
+    /// concurrent deprovision / grant-revoke between the two reads could admit on the first
+    /// and mis-decide on the second. One fold closes it. Solo (no IdP) ⇒ the local authority;
+    /// bootstrap (not provisioned) ⇒ the best-effort actor; otherwise an active member, with
+    /// `owner`/`admin` seeing every project and any other member needing an explicit grant
+    /// (`INV-20`, fail-closed). `pub` so the extracted enterprise band's ENTSEC-1
+    /// data-route middleware (`gaugewright-ee`) admits through the same fold-once seam.
+    pub fn admit_data_request(
+        &self,
+        bearer: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<String, (StatusCode, &'static str)> {
+        let Some(idp) = &self.idp else {
+            // single-user local / loopback: the operator's own channel.
+            return Ok(self.authority().as_str().to_string());
+        };
+        let org = org::Org::rebuild(self.store_ref())
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+        let authority = bearer.and_then(|t| idp.authenticate(t));
+        let provisioned = org
+            .members
+            .values()
+            .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned {
+            // bootstrap: directory not yet provisioned — actor resolved best-effort.
+            return Ok(authority
+                .map(|a| a.as_str().to_string())
+                .unwrap_or_else(|| "anonymous".to_string()));
+        }
+        let Some(authority) = authority else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "authenticate to access this workspace",
+            ));
+        };
+        if org.role_of(authority.as_str()).is_none() {
+            return Err((StatusCode::FORBIDDEN, "not an active member"));
+        }
+        // SEC-2: enforce the org session lifetime / idle-timeout policy, keyed by a hash of
+        // the bearer (never the raw token). A no-op when both bounds are unset, so a workspace
+        // with no session policy is unaffected. A violation forces re-authentication (401).
+        // SEC-2 + ITGOV-2/ITGOV-3(d): record the session's activity on every authenticated
+        // data request — this populates the IT session roster (`GET /admin/sessions`) *and*
+        // enforces the org lifetime/idle bounds. Unset bounds (`0`) record without refusing,
+        // so the roster is populated even with no timeout policy; a violated bound is a `401`.
+        let (lifetime_ms, idle_ms) = org.session_bounds_ms();
+        let key = org::sha256_hex(bearer.unwrap_or_default());
+        let now = self.session_activity.now_ms();
+        if let Err(expiry) = self.session_activity.check_and_touch(
+            &key,
+            authority.as_str(),
+            now,
+            lifetime_ms,
+            idle_ms,
+        ) {
+            return Err((StatusCode::UNAUTHORIZED, expiry.reason()));
+        }
+        if let Some(project) = project {
+            if !org.can_access_project(authority.as_str(), project) {
+                return Err((StatusCode::FORBIDDEN, "not in scope for this project"));
+            }
+        }
+        Ok(authority.as_str().to_string())
+    }
+
+    /// **ENTSEC-2** ([ADR 0065]): the set of projects a request's caller may **see** in the
+    /// nav / list projections — the visibility complement to [`authorize_scope`](Self::authorize_scope).
+    /// Mirrors [`admit_data_request`](Self::admit_data_request)'s membership logic: solo (no IdP),
+    /// bootstrap (unprovisioned), and `owner`/`admin` are unrestricted ([`ProjectVisibility::All`]);
+    /// any other active member is restricted to their explicitly-granted projects. An
+    /// unauthenticated / non-member caller in enterprise mode (which the ENTSEC-1 data-route gate
+    /// would already have refused with `401`/`403`) resolves fail-closed to an empty set, so a
+    /// projection can never leak project existence to someone the gate would reject.
+    pub fn project_visibility(&self, bearer: Option<&str>) -> ProjectVisibility {
+        let Some(idp) = &self.idp else {
+            return ProjectVisibility::All; // solo / loopback: the operator's own channel
+        };
+        let Ok(org) = org::Org::rebuild(self.store_ref()) else {
+            return ProjectVisibility::Only(BTreeSet::new()); // directory unreadable: leak nothing
+        };
+        let provisioned = org
+            .members
+            .values()
+            .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned {
+            return ProjectVisibility::All; // bootstrap: nothing to scope against yet
+        }
+        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+            return ProjectVisibility::Only(BTreeSet::new()); // unauthenticated: leak nothing
+        };
+        match org.role_of(authority.as_str()) {
+            Some(role)
+                if role == gaugewright_core::abac::Role::owner()
+                    || role == gaugewright_core::abac::Role::admin() =>
+            {
+                ProjectVisibility::All // the client org's own people see every project
+            }
+            Some(_) => ProjectVisibility::Only(org.granted_project_ids(authority.as_str())),
+            None => ProjectVisibility::Only(BTreeSet::new()), // not a member: leak nothing
+        }
+    }
+
+    /// Whether a **chat** is visible to a caller under `vis` (`ENTSEC-2`): its project must be
+    /// visible. A chat with no resolvable project (an edit/authoring chat — not a client
+    /// member's surface) is visible only under [`ProjectVisibility::All`].
+    pub fn chat_visible(&self, chat_id: &str, vis: &ProjectVisibility) -> bool {
+        match vis {
+            ProjectVisibility::All => true,
+            ProjectVisibility::Only(_) => self
+                .library
+                .project_of_chat(chat_id)
+                .map(|p| vis.allows(p))
+                .unwrap_or(false),
+        }
+    }
+
+    /// **ENTSEC-2**: resolve the **project** a request path is scoped to, if any — the chat /
+    /// placement / project the URL addresses. `None` for the non-project-scoped routes (the
+    /// workspace nav, archetype editing, `POST /projects` / `POST /chats`, `/admin/*`), which the
+    /// per-project gate does not apply to (membership alone governs them). Chat & scope ids
+    /// resolve through the library (`chat → instance → project`); a `/projects/{id}` or
+    /// `/placements/{id}` path carries / resolves the id directly. An unknown id resolving to
+    /// `None` is safe: the handler itself 404s, leaking nothing. `pub` so the extracted
+    /// enterprise band's ENTSEC-1 middleware (`gaugewright-ee`) resolves the same scope.
+    pub fn scope_project_of_path(&self, path: &str) -> Option<String> {
+        let mut segs = path.trim_start_matches('/').split('/');
+        match segs.next()? {
+            "chats" | "scopes" => self
+                .library
+                .project_of_chat(segs.next()?)
+                .map(str::to_string),
+            "placements" => self
+                .library
+                .project_of_instance(segs.next()?)
+                .map(str::to_string),
+            "projects" => {
+                let id = segs.next()?;
+                (!id.is_empty()).then(|| id.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the bearer may administer a member in `target_team` (`RBAC-4`).
+    /// Single-user (no IdP) ⇒ always (ungated). Enterprise: an `owner` is org-wide; an
+    /// `admin` with no team is org-wide; an `admin` scoped to a team may administer
+    /// only that team — so a team-scoped admin cannot touch another team (fail-closed).
+    /// Called *after* the capability gate, which already established the actor is an
+    /// owner/admin.
+    pub fn team_scope_ok(&self, bearer: Option<&str>, target_team: Option<&str>) -> bool {
+        let Some(idp) = &self.idp else {
+            return true; // single-user local: ungated
+        };
+        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+            return false;
+        };
+        let Ok(org) = org::Org::rebuild(self.store_ref()) else {
+            return false;
+        };
+        match org.role_of(authority.as_str()) {
+            Some(r) if r == gaugewright_core::abac::Role::owner() => true,
+            Some(r) if r == gaugewright_core::abac::Role::admin() => {
+                match org.team_of(authority.as_str()) {
+                    None => true, // org-wide admin
+                    Some(actor_team) => target_team == Some(actor_team.as_str()),
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The label for the authority acting on a request (`AUD-1`): in enterprise mode
+    /// the bearer's authenticated authority (or `"anonymous"` if it does not
+    /// authenticate); in single-user local mode this control plane's own authority.
+    /// Used to attribute audit entries to their actor (`INV-21`).
+    pub fn actor(&self, bearer: Option<&str>) -> String {
+        match &self.idp {
+            Some(idp) => bearer
+                .and_then(|t| idp.authenticate(t))
+                .map(|a| a.as_str().to_string())
+                .unwrap_or_else(|| "anonymous".to_string()),
+            None => self.authority().as_str().to_string(),
+        }
+    }
+
+    /// Gate an export by the org's resource-floor policy (`RBAC-6`; the export half
+    /// of `RBAC-5`). Single-user (no IdP) ⇒ open. Enterprise + provisioned ⇒ the
+    /// actor authenticates and the org [`Policy`](gaugewright_core::abac::Policy) must
+    /// permit `Export` for its role — restrict-only, so e.g. a `viewer` is denied
+    /// (`viewer ⇒ no export`), fail-closed (`INV-20`). Resource-attribute-specific
+    /// rules (pii/region) are enforced by the resource-export protection path; this
+    /// is the role-level gate the org policy adds on top.
+    pub fn authorize_export(&self, bearer: Option<&str>) -> Result<(), (StatusCode, &'static str)> {
+        let Some(idp) = &self.idp else {
+            return Ok(()); // single-user local: ungated
+        };
+        let org = org::Org::rebuild(self.store_ref())
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+        let provisioned = org
+            .members
+            .values()
+            .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned {
+            return Ok(());
+        }
+        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+            return Err((StatusCode::UNAUTHORIZED, "authenticate to export"));
+        };
+        let Some(role) = org.role_of(authority.as_str()) else {
+            return Err((StatusCode::FORBIDDEN, "not an active member"));
+        };
+        let actor = gaugewright_core::abac::AuthorityAttributes {
+            roles: std::iter::once(role).collect(),
+            ..Default::default()
+        };
+        let decision = gaugewright_core::abac::Decision {
+            actor,
+            resource: gaugewright_core::abac::ResourceAttributes::default(),
+            action: gaugewright_core::abac::Action::Export,
+            context: gaugewright_core::abac::Context {
+                ceiling_attested: false,
+            },
+        };
+        if gaugewright_core::abac::permitted_with_policy(true, &org.policy(), &decision) {
+            Ok(())
+        } else {
+            Err((StatusCode::FORBIDDEN, "role is not permitted to export"))
+        }
+    }
+
+    /// **SECAUD-5 / CORE-6**: enforce the **resource-attribute** ABAC floor on a specific
+    /// resource's export — the live-route half of [ADR 0032] step 4. Composes the actor's
+    /// IdP claims with the resource's persisted classification/region (captured at ingest)
+    /// and the org [`Policy`](gaugewright_core::abac::Policy): restrict-only, so e.g. a `Pii`
+    /// resource at an **unattested** ceiling is denied egress even when the role-level gate
+    /// and the consent floor would allow it. Solo (no IdP) / not-provisioned ⇒ open
+    /// (unchanged); unlabeled (`Regulated`/default) resources are unconstrained by the
+    /// example policy, so existing exports are unaffected. Fail-closed (`INV-20`).
+    pub fn authorize_resource_export(
+        &self,
+        bearer: Option<&str>,
+        engagement: &str,
+        res_id: &gaugewright_core::resource::ResourceId,
+    ) -> Result<(), (StatusCode, &'static str)> {
+        let Some(idp) = &self.idp else {
+            return Ok(()); // single-user local / loopback: ungated
+        };
+        let org = org::Org::rebuild(self.store_ref())
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+        let provisioned = org
+            .members
+            .values()
+            .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned {
+            return Ok(());
+        }
+        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+            return Err((StatusCode::UNAUTHORIZED, "authenticate to export"));
+        };
+        let actor = idp.claims(&authority);
+        // A local/unattested egress edge: a `Pii` resource requires an attested ceiling,
+        // so it is denied here (an attested boundary integration would pass `true`).
+        let context = gaugewright_core::abac::Context {
+            ceiling_attested: false,
+        };
+        match resource_store::abac_permits(
+            self.store_ref(),
+            engagement,
+            res_id,
+            &actor,
+            gaugewright_core::abac::Action::Export,
+            context,
+            &org.policy(),
+            true,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err((
+                StatusCode::FORBIDDEN,
+                "resource policy forbids export (data classification / residency)",
+            )),
+            Err(_) => Err((
+                StatusCode::FORBIDDEN,
+                "resource export policy could not be evaluated",
+            )),
+        }
+    }
+
+    /// **CORE-6** ([ADR 0032] step 4): enforce the **resource-attribute** ABAC floor when a
+    /// resource's access is *granted* — the access counterpart of
+    /// [`authorize_resource_export`](Self::authorize_resource_export). Composes the approving
+    /// actor's IdP claims with the resource's persisted classification/region and the org
+    /// [`Policy`](gaugewright_core::abac::Policy): restrict-only, so e.g. a `Pii` resource at an
+    /// **unattested** ceiling is denied a grant even when the consent reducer would allow it.
+    /// Solo (no IdP) / not-provisioned ⇒ open (unchanged); unlabeled resources are
+    /// unconstrained. Fail-closed (`INV-20`).
+    pub fn authorize_resource_access(
+        &self,
+        bearer: Option<&str>,
+        engagement: &str,
+        res_id: &gaugewright_core::resource::ResourceId,
+    ) -> Result<(), (StatusCode, &'static str)> {
+        let Some(idp) = &self.idp else {
+            return Ok(()); // single-user local / loopback: ungated
+        };
+        let org = org::Org::rebuild(self.store_ref())
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+        let provisioned = org
+            .members
+            .values()
+            .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned {
+            return Ok(());
+        }
+        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+            return Err((StatusCode::UNAUTHORIZED, "authenticate to grant access"));
+        };
+        let actor = idp.claims(&authority);
+        let context = gaugewright_core::abac::Context {
+            ceiling_attested: false,
+        };
+        match resource_store::abac_permits(
+            self.store_ref(),
+            engagement,
+            res_id,
+            &actor,
+            gaugewright_core::abac::Action::Access,
+            context,
+            &org.policy(),
+            true,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err((
+                StatusCode::FORBIDDEN,
+                "resource policy forbids access (data classification / residency)",
+            )),
+            Err(_) => Err((
+                StatusCode::FORBIDDEN,
+                "resource access policy could not be evaluated",
+            )),
+        }
+    }
+}

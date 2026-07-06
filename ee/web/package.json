@@ -1,0 +1,28 @@
+{
+  "name": "gaugewright-ee-web",
+  "version": "0.0.0",
+  "private": true,
+  "license": "BUSL-1.1",
+  "type": "module",
+  "description": "GaugeWright enterprise web surface (BUSL-1.1 ee/ subtree) \u2014 admin console app + enterprise route client.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "vite build --config vite.apps.enterprise.config.ts",
+    "typecheck": "npm run typecheck:enterprise-client && npm run typecheck:enterprise-ui",
+    "typecheck:enterprise-client": "tsc --noEmit -p tsconfig.enterprise-client.json",
+    "typecheck:enterprise-ui": "tsc --noEmit -p tsconfig.enterprise-ui.json"
+  },
+  "dependencies": {
+    "@gaugewright/control-plane-client": "file:../../web/packages/control-plane-client",
+    "@gaugewright/workbench-ui": "file:../../web/packages/workbench-ui",
+    "solid-js": "^1.9.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^8.1.2",
+    "vite-plugin-solid": "^2.11.12"
+  }
+}

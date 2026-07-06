@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [],
+  "files": [
+    "packages/gw-embed/src/css-inline.d.ts",
+    "packages/gw-embed/src/embed-control-plane.ts",
+    "packages/gw-embed/src/elements.tsx",
+    "packages/gw-embed/src/index.ts",
+    "packages/gw-embed/src/remote-session.ts",
+    "packages/workbench-ui/src/session-context.ts"
+  ]
+}

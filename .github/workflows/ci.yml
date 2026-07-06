@@ -1,0 +1,74 @@
+# Public CI for the gaugebench open-source mirror. Published AS ci.yml by
+# scripts/publish-public-mirror.sh. It runs only the lanes that need nothing but
+# public source: Rust fmt/clippy/test and the web/ee typecheck+build+unit tests.
+# The private repo's ci.yml additionally runs the Quint model checks, the
+# spec-audit tracker gate, and coverage — all of which need the private specs/.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (fmt · clippy · test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: app no-default feature gate
+        run: cargo check -p gaugewright-app --no-default-features --all-targets
+
+  web:
+    name: web (typecheck · vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            ee/web/package-lock.json
+      - run: npm ci
+      - name: typecheck
+        run: npm run typecheck
+      - name: split target typecheck
+        run: npm run typecheck:split
+      - name: vitest
+        run: npm run test
+      - name: open-source workbench build
+        run: npm run build:open
+      - name: public embed bundle build
+        run: npm run build:embed
+      - name: staged open app entries build
+        run: npm run build:apps:open
+      - name: enterprise web install (ee/web)
+        working-directory: ee/web
+        run: npm ci
+      - name: enterprise web typecheck (ee/web)
+        working-directory: ee/web
+        run: npm run typecheck
+      - name: enterprise web build (ee/web)
+        working-directory: ee/web
+        run: npm run build
+      - name: saml verify sidecar (install + crypto tests)
+        working-directory: ee/sidecar/saml-verify
+        run: npm ci && npm test

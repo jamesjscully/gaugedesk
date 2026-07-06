@@ -1,0 +1,30 @@
+# cargo-audit configuration — SOC 2 vulnerability-management triage record.
+#
+# Advisories listed under `ignore` have been reviewed and formally risk-accepted
+# with a rationale below. This file is the audit trail: the scan stays green, but
+# nothing is suppressed silently — every entry names the advisory, the date it was
+# triaged, and why it is not exploitable in this codebase's usage.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 — "Marvin Attack: key recovery through timing sidechannels"
+  # in `rsa` 0.9.x (no fixed upgrade available upstream).
+  #
+  # Reachability: `rsa` is a transitive dependency of `sev` (SEV-SNP attestation),
+  # used ONLY for public-key VERIFICATION of AMD's built-in ARK/ASK certificate
+  # chain and the attestation report signature
+  # (`crates/app/src/sev_snp_verifier.rs` — `(&chain, &report).verify()`).
+  #
+  # The Marvin attack recovers an RSA *private* key via a timing oracle on RSA
+  # *decryption / private-key* operations. This codebase performs NO RSA
+  # private-key operation: it only verifies signatures over AMD-controlled
+  # certificates with public keys. The attack is therefore not applicable.
+  #
+  # Defense in depth: the SEV-SNP verifier path is only active under real
+  # attestation (`AttestationMode::RealRequired` against a confidential VM,
+  # D-ATTEST — deferred), not in the default product surface.
+  #
+  # Triaged 2026-06-26. Re-evaluate if `rsa` ever lands on a private-key path or
+  # a fixed release ships.
+  "RUSTSEC-2023-0071",
+]

@@ -1,0 +1,98 @@
+import type { JSX } from "solid-js";
+
+/**
+ * Inline, dependency-free icon set for the workbench's icon-driven controls.
+ * Stroke-based on a 24px grid, drawn in `currentColor` so they inherit the
+ * button's text colour (incl. hover/active). Each icon is decorative — the
+ * button it sits in carries the real label via `aria-label`/`title` — so the
+ * <svg> is `aria-hidden` and not focusable. Size comes from CSS (`.icon`).
+ */
+export type IconName =
+    | "add-files"
+    | "paperclip"
+    | "sources"
+    | "history"
+    | "pull-latest"
+    | "send"
+    | "queue"
+    | "filter";
+
+const PATHS: Record<IconName, JSX.Element> = {
+    // A document with a plus — add files/folder to the chat's workspace.
+    "add-files": (
+        <>
+            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+            <path d="M14 3v5h5" />
+            <line x1="12" y1="12" x2="12" y2="17" />
+            <line x1="9.5" y1="14.5" x2="14.5" y2="14.5" />
+        </>
+    ),
+    // A paperclip — attach file(s) to the message being composed (their text is
+    // inlined into the turn; message-scoped, not workspace context).
+    paperclip: (
+        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    ),
+    // Stacked layers — the context/sources the chat is working with.
+    sources: (
+        <>
+            <path d="M12 2 2 7l10 5 10-5-10-5Z" />
+            <path d="m2 12 10 5 10-5" />
+            <path d="m2 17 10 5 10-5" />
+        </>
+    ),
+    // A clock with a counter-clockwise arrow — the chat's timeline/history.
+    history: (
+        <>
+            <path d="M3 3v5h5" />
+            <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8" />
+            <path d="M12 7v5l4 2" />
+        </>
+    ),
+    // Circular refresh arrows — pull in / sync the latest shared changes. (A
+    // down-into-tray arrow read as "download/export", the wrong affordance for
+    // "update from the shared copy" — round-11 #5.)
+    "pull-latest": (
+        <>
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <path d="M21 3v6h-6" />
+        </>
+    ),
+    // A paper plane — dispatch the composed message now.
+    send: (
+        <>
+            <path d="m22 2-7 20-4-9-9-4Z" />
+            <path d="M22 2 11 13" />
+        </>
+    ),
+    // A funnel — filter which event types the chat log shows.
+    filter: (
+        <path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3Z" />
+    ),
+    // A list with a plus — add the message to the run queue.
+    queue: (
+        <>
+            <path d="M11 12H3" />
+            <path d="M16 6H3" />
+            <path d="M16 18H3" />
+            <path d="M18 9v6" />
+            <path d="M21 12h-6" />
+        </>
+    ),
+};
+
+export function Icon(props: { name: IconName; class?: string }): JSX.Element {
+    return (
+        <svg
+            class={`icon ${props.class ?? ""}`}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+        >
+            {PATHS[props.name]}
+        </svg>
+    );
+}

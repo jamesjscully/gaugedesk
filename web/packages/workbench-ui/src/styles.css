@@ -1,0 +1,1144 @@
+/* Figtree (Erik Kennedy) — self-hosted variable font, OFL. Bundled woff2 so the
+   desktop app needs no Google Fonts CDN (works offline, respects Tauri's CSP). */
+@font-face {
+    font-family: "Figtree";
+    font-style: normal;
+    font-weight: 300 900;
+    font-display: swap;
+    src: url("./assets/fonts/figtree-latin.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+        U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+        U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: "Figtree";
+    font-style: normal;
+    font-weight: 300 900;
+    font-display: swap;
+    src: url("./assets/fonts/figtree-latin-ext.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+        U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+        U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* Inconsolata (Raph Levien) — self-hosted variable monospace, OFL. Used for the
+   code surfaces (file view, editor, diff) via --mono. */
+@font-face {
+    font-family: "Inconsolata";
+    font-style: normal;
+    font-weight: 400 700;
+    font-stretch: 100%;
+    font-display: swap;
+    src: url("./assets/fonts/inconsolata-latin.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+        U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+        U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: "Inconsolata";
+    font-style: normal;
+    font-weight: 400 700;
+    font-stretch: 100%;
+    font-display: swap;
+    src: url("./assets/fonts/inconsolata-latin-ext.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+        U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+        U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+:root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --edge: #262b36;
+    --ink: #d8dee9;
+    --muted: #7d869c;
+    --accent: #6aa3ff;
+    --warn: #e0a35a;
+    --bad: #e06a6a;
+    /* UI chrome + chat in Figtree; code surfaces (file view, editor, diff) stay
+       monospace via --mono so alignment holds. */
+    --ui: "Figtree", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "Inconsolata", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--ui);
+    font-size: 13px;
+    color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); }
+
+.workbench {
+    display: grid;
+    /* columns set inline (App.tsx) from the resizable widths: nav | ↔ | run | ↔ |
+       content | ↔ | workspace. Sidebars are px, the middle two share fr, each
+       with a hard min so the chat/content panels stay usable (round-7 #1). */
+    grid-template-rows: auto 1fr;
+    height: 100vh;
+    gap: 0;
+    background: var(--edge);
+    /* If the window is too narrow to honour every column's minimum, scroll the
+       whole shell sideways instead of clipping the primary `send` control. */
+    overflow-x: auto;
+}
+
+.panel { background: var(--panel); overflow: auto; padding: 10px 12px; min-height: 0; min-width: 0; }
+/* The chat panel is a flex column whose transcript scrolls and whose composer
+   dock pins to the bottom (round-7 #2). It must never overflow horizontally and
+   clip the primary `send` control (round-7 #1): the panel itself never scrolls
+   sideways, and its children are free to shrink (min-width:0). */
+.run { display: flex; flex-direction: column; overflow: hidden; position: relative; }
+.run > * { min-width: 0; }
+/* The chat header is one centred row. The pieces are deliberately different sizes —
+   a 13px mixed-case title, an 11px uppercase lineage, a padded status-badge pill —
+   so inline flow + per-item `vertical-align` left them on three different axes (the
+   tall badge stretched the line box and the lineage's `vertical-align:bottom` sank
+   to the bottom of it). Flex with `align-items:center` puts them all on one axis and
+   `gap` spaces them evenly; the action cluster is pushed to the right edge, and the
+   header's right padding keeps it clear of the absolutely-positioned collapse chevron. */
+.run > h2 { display: flex; align-items: center; gap: 8px; padding-right: 24px; }
+.run > h2 .chat-lineage { margin-left: 0; }
+.run > h2 .status-badge { margin-left: 0; }
+.run > h2 .header-actions { float: none; margin-left: auto; margin-right: 0; }
+.tasks { grid-column: 1 / -1; background: var(--panel); border-bottom: 1px solid var(--edge);
+    padding: 6px 12px; display: flex; align-items: center; gap: 10px; }
+.tasks > .taskbar { flex: 1; min-width: 0; }
+/* Owner-side "pair a device" affordance (MOB-F5): a quiet right-aligned action. */
+.pair-device-btn { margin-left: auto; flex: 0 0 auto; font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted); background: transparent; border: 1px solid var(--edge);
+    border-radius: 4px; padding: 3px 8px; cursor: pointer; }
+.pair-device-btn:hover { color: var(--accent); border-color: var(--accent); }
+.pair-device-panel, .settings-panel { min-width: 320px; }
+.pair-ticket { display: block; font-family: var(--mono); font-size: 13px; background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 4px; padding: 8px 10px; margin-bottom: 10px;
+    user-select: all; word-break: break-all; }
+.pair-device-actions { display: flex; gap: 8px; }
+.pair-device-actions .tree-action { width: auto; }
+
+/* Pairing/invite QR (FED-7): library-rendered SVG, capped to a scannable square. */
+.pd-qr { width: 180px; height: 180px; margin: 0 auto 10px; background: #fff; padding: 8px;
+    border-radius: 6px; box-sizing: border-box; }
+.pd-qr svg { display: block; width: 100%; height: 100%; }
+
+/* Cross-machine federation panel (D-REMOTE/SERVE-1) + FED-7 surfaces. */
+.federation-panel, .paired-devices-panel, .engagement-pane { min-width: 420px; max-width: 560px; }
+.fed-paste { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 12px;
+    background: var(--bg); color: inherit; border: 1px solid var(--edge); border-radius: 4px;
+    padding: 6px 8px; margin-bottom: 6px; resize: vertical; }
+.fed-peers, .fed-inbox { list-style: none; margin: 0; padding: 0; }
+.fed-peer { display: flex; align-items: center; gap: 8px; padding: 4px 0;
+    border-bottom: 1px solid var(--edge); }
+.fed-peer-name { font-weight: 600; }
+.fed-peer-grant { color: var(--muted); font-size: 12px; }
+.fed-peer .tree-action { width: auto; margin-left: auto; }
+.fed-peer .tree-action + .tree-action { margin-left: 0; }
+.fed-inbox li { font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 2px 0; }
+
+/* The human task queue (top bar). */
+.taskbar { display: flex; align-items: center; gap: 10px; min-height: 24px; }
+.taskbar-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); }
+.task-tabs { display: flex; gap: 6px; flex: 1; overflow-x: auto; align-items: center; }
+.task-tab { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px;
+    border: 1px solid var(--edge); border-radius: 5px; cursor: pointer; font-size: 12px;
+    white-space: nowrap; }
+.task-tab:hover { border-color: var(--muted); }
+.task-tab.active { border-color: var(--accent); background: var(--edge); }
+/* The kind is a quiet status dot + label, NOT a bordered pill nested inside the
+   task chip (round-11 #4): a pill-in-pill with two competing border colors read
+   as visual noise. One chip, one border; the dot carries the status colour. */
+.task-tab .task-kind { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto;
+    font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--warn); }
+.task-tab .task-kind::before { content: ""; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--warn); flex: 0 0 auto; }
+/* Cap the title: a chat auto-titled from its first message is a whole sentence;
+   the queue must stay scannable, so each title is one ellipsised line. */
+.task-tab .task-title { max-width: 200px; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+.task-tab .task-agent { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
+.task-keep { font-size: 11px; padding: 1px 7px; margin-left: 2px; }
+/* A permission-loosening change can't be one-click-kept from the bar (#5): the
+   pill turns into a warn-toned "review →" that opens the in-panel review instead. */
+.task-keep.warn { color: var(--warn); border-color: var(--warn); }
+/* The two-click keep guard (round-6 #2): the armed state reads "confirm keep" in
+   a warn tone so a permanent merge from the top bar is never a single blind click. */
+.task-keep.confirming { color: var(--warn); border-color: var(--warn); font-weight: 600; }
+
+/* Drag handles between panels (a thin grid column each). */
+.resizer { background: var(--edge); cursor: col-resize; }
+.resizer:hover, .resizer.dragging { background: var(--accent); }
+.run .transcript { flex: 1; overflow: auto; min-height: 0; }
+
+.filetree { display: flex; flex-direction: column; gap: 1px; font-size: 12px; }
+.file { padding: 2px 4px; border-radius: 3px; cursor: pointer; color: var(--ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file:hover { background: var(--edge); }
+.file.active { background: var(--edge); color: var(--accent); }
+.file.locked { color: var(--warn); }
+.show-internal { font-size: 10px; color: var(--muted); background: transparent;
+    border: none; cursor: pointer; padding: 4px 4px 0; text-align: left; }
+.show-internal:hover { color: var(--accent); background: transparent; border: none; }
+
+.filebody { white-space: pre-wrap; font-family: var(--mono); font-size: 12px;
+    line-height: 1.45; margin: 0; color: var(--ink); }
+
+/* --- Collapsible panels (legacy 13-chrome-ui.md §6) ---------------------------
+   A collapsible panel is a flex column: just the scrollable body, with the collapse
+   chevron floated into the top inner corner over the body's heading (no row of its
+   own — that row was pure wasted height stacked above each panel's title). */
+.panel.collapsible { display: flex; flex-direction: column; padding: 0; overflow: hidden; position: relative; }
+.panel-body { flex: 1 1 auto; min-height: 0; min-width: 0; overflow: auto; padding: 4px 12px 10px; }
+/* The heading shares the corner with the floated chevron — leave it room to clear. */
+.panel.collapsible .panel-body > h2 { padding-left: 22px; }       /* content/files: chevron on the left */
+.panel.nav .panel-body .facets { padding-right: 22px; }          /* nav: chevron on the right */
+/* The nav column owns a pinned footer (the network bar), so scrolling moves to the
+   inner .nav-scroll and the bar always stays in view at the bottom-left. */
+.panel.nav .panel-body { overflow: hidden; }
+.nav-stack { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.nav-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
+/* Network-egress bar (RF-B3): a quiet status strip flush to the bottom of the nav
+   column. Negative margins cancel the panel-body padding so its top rule spans the
+   full width and it sits at the very bottom-left corner. */
+.network-bar { flex: 0 0 auto; display: flex; align-items: center;
+    border-top: 1px solid var(--edge); padding: 6px 12px; margin: 0 -12px -10px;
+    font-size: 11px; }
+/* Settings gear (right of the network toggle) + its LOCAL popover menu — anchored to
+   the gear and opening upward, like any normal app menu (not a centered modal). */
+.settings-anchor { position: relative; margin-left: auto; flex: 0 0 auto; display: inline-flex; }
+.settings-gear { background: transparent; border: 1px solid var(--edge); border-radius: 4px;
+    color: var(--muted); font-size: 13px; line-height: 1; padding: 3px 7px; cursor: pointer; }
+.settings-gear:hover, .settings-gear.active { color: var(--accent); border-color: var(--accent); }
+/* Transparent full-screen catcher: a click off the popover dismisses it. */
+.popover-catcher { position: fixed; inset: 0; z-index: 60; }
+.settings-popover { position: absolute; bottom: calc(100% + 6px); right: 0; z-index: 61;
+    min-width: 180px; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 4px; box-shadow: 0 8px 24px rgba(0,0,0,0.45); }
+.settings-option { width: 100%; text-align: left; background: transparent; border: none;
+    border-radius: 4px; padding: 7px 10px; cursor: pointer; color: var(--ink); font-size: 12px; }
+.settings-option:hover { background: var(--edge); color: var(--ink); }
+/* The single Devices modal. */
+.devices-modal { min-width: 420px; max-width: 560px; max-height: 85vh; overflow-y: auto; }
+.devices-sep { border: none; border-top: 1px solid var(--edge); margin: 14px 0; }
+.devices-modal h4 { margin: 0 0 4px; font-size: 12px; }
+/* The raw pairing code is a long opaque blob; show one muted, ellipsised line — the
+   "copy your code" button is the real affordance (the full code stays in the DOM). */
+.pair-by-code .pair-ticket { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    word-break: normal; font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+.network-bar-toggle, .network-bar-label { display: inline-flex; align-items: center; gap: 7px;
+    background: transparent; border: none; color: var(--muted); font: inherit;
+    padding: 2px 4px; border-radius: 4px; }
+.network-bar-toggle { cursor: pointer; }
+.network-bar-toggle:hover:not(:disabled) { color: var(--ink); background: var(--edge); }
+.network-bar-toggle:disabled { opacity: 0.6; cursor: progress; }
+.network-bar-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.network-bar.isolated .network-bar-dot { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
+/* Freshness caveat on the nav (ADR 0037): a stale tree is flagged, never silent. */
+.facet-stale { margin-left: auto; background: transparent; border: 1px solid var(--warn, #b58900);
+    color: var(--warn, #b58900); border-radius: 4px; font-size: 11px; padding: 1px 6px; cursor: pointer; }
+.panel-collapse { position: absolute; top: 5px; z-index: 3; background: var(--panel);
+    border: none; color: var(--muted); cursor: pointer;
+    font-size: 15px; font-weight: 400; line-height: 1; letter-spacing: 0; padding: 0 5px; border-radius: 4px; }
+.panel-collapse.left { right: 6px; }   /* nav folds left → chevron on its inner (right) edge */
+.panel-collapse.right { left: 6px; }   /* content/files fold right → chevron on their inner (left) edge */
+.panel-collapse:hover { color: var(--accent); background: var(--edge); }
+/* The chat lane folds like the others; its collapse chevron lives in its own header
+   (.run is position:relative) and reuses .panel-collapse so it sits at the same top
+   inner-edge height as the nav / content / files chevrons. */
+
+/* The folded rail: a thin, full-height click target with an outward chevron and a
+   vertical label. The whole rail expands the panel — a generous affordance. */
+.panel.rail { padding: 0; cursor: pointer; display: flex; flex-direction: column; align-items: center;
+    gap: 8px; padding-top: 8px; color: var(--muted); overflow: hidden; }
+.panel.rail:hover { background: var(--edge); color: var(--accent); }
+.rail-chevron { font-size: 15px; line-height: 1; }
+.rail-label { writing-mode: vertical-rl; text-orientation: mixed; text-transform: uppercase;
+    font-size: 10px; letter-spacing: 0.08em; white-space: nowrap; }
+
+/* The content panel is a column so the editor can fill it (full-panel edit). When
+   collapsible it's wrapped, so the flex column lives on `.panel-body`. */
+.panel.content { display: flex; flex-direction: column; }
+.panel.content > h2 { flex: 0 0 auto; }
+.panel.content .panel-body { display: flex; flex-direction: column; }
+.panel.content .panel-body > h2 { flex: 0 0 auto; }
+.viewer { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.viewer > .tabs { flex: 0 0 auto; align-items: center; }
+/* The current filename sits at the end of the tab strip; keep it from crowding
+   the tabs (round-7 note) — push it right, give it room, and ellipsize. */
+.viewer-filename { margin-left: auto; padding-left: 10px; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The active mode body grows to fill and scrolls within. View/Diff benefit too. */
+.viewer > .filebody, .viewer > .editor { flex: 1; min-height: 0; }
+.viewer > .filebody { overflow: auto; }
+
+/* Full-panel file editor: a header row over a textarea that fills the rest. */
+.editor { display: flex; flex-direction: column; }
+.editor-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.editor-head .editor-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+.editor-head button.save { font-size: 11px; padding: 3px 9px;
+    border-color: var(--accent); color: var(--accent); }
+.editor-text { flex: 1; width: 100%; min-height: 0; resize: none; background: var(--bg);
+    color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; padding: 8px;
+    font-family: var(--mono); font-size: 13px; line-height: 1.5; }
+.merge-review { gap: 8px; align-items: center; }
+.merge-review button { font-size: 11px; padding: 3px 8px; }
+/* "keep this work" is the primary review action — clearly accented, but a calm
+   tinted/outlined primary rather than a saturated solid fill shouting next to the
+   neutral "discard" (round-12: rebalanced the pair). */
+.merge-review .keep-btn { color: var(--accent); font-weight: 600;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.merge-review .keep-btn:hover { color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 28%, transparent); border-color: var(--accent); }
+
+h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 8px; }
+
+.item { padding: 4px 6px; border-radius: 4px; cursor: pointer; }
+.item:hover { background: var(--edge); }
+.item.active { background: var(--edge); color: var(--accent); }
+
+/* Transcript rows. Comfortable vertical rhythm + clear role hierarchy so turns
+   read as distinct messages, not a packed developer log (round-11 #7). */
+.line { white-space: pre-wrap; padding: 3px 0; line-height: 1.5; }
+.line.operational { color: var(--muted); }
+.line.admitted { color: var(--ink); border-left: 2px solid var(--accent); padding-left: 8px; }
+
+/* A message turn: the author on its own small uppercased label line above the
+   text, a role-coloured rail, and a gap above so consecutive turns separate. */
+.line.user, .line.assistant { color: var(--ink); margin-top: 9px;
+    padding: 4px 0 4px 10px; border-left: 2px solid var(--edge); }
+.line.user { border-left-color: var(--muted); }
+.line.assistant { border-left-color: var(--accent); }
+.line.user::before, .line.assistant::before { display: block; margin-bottom: 2px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; }
+.line.user::before { content: "you"; color: var(--muted); }
+.line.assistant::before { content: "agent"; color: var(--accent); }
+
+/* System / lifecycle notes (turn finished, kept into the shared copy, pulled in
+   latest): quiet status lines, not first-class messages — demote them so the
+   conversation reads above the plumbing (round-11 #7). Placed after the role
+   rules so they win for a lifecycle line that is also `admitted`. */
+.line.run, .line.merge, .line.sync, .line.clean { color: var(--muted); font-size: 11px;
+    font-style: italic; border-left: none; padding: 1px 0 1px 10px; margin: 0; }
+
+/* A model-credential refusal (LLM-1): the reason plus an inline action into settings,
+   so a "no model attached" turn is fixable from the chat log itself. --warn reads as an
+   actionable notice, not a dead hard-error line. */
+.line.credential-error { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    border-left-color: var(--warn); }
+.line-action { font: inherit; font-size: 11px; cursor: pointer; color: var(--accent);
+    background: transparent; border: 1px solid var(--accent); border-radius: 4px; padding: 2px 8px; }
+.line-action:hover { background: var(--edge); }
+
+.line.tool { color: var(--accent); padding: 1px 0; }
+/* A tool line is only clickable when it has additive detail to reveal; a file
+   write ("Wrote X ✓") is a tight, non-expandable one-liner. */
+.tool-head { display: flex; align-items: center; gap: 6px; cursor: default; }
+.tool-head.expandable { cursor: pointer; }
+.tool-caret { opacity: 0.6; width: 0.9em; flex: 0 0 auto; }
+.tool-name { font-weight: 600; flex: 0 0 auto; }
+.tool-target {
+    background: none; border: none; padding: 0; margin: 0; cursor: pointer;
+    color: var(--accent); font: inherit; text-decoration: underline; text-underline-offset: 2px;
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    text-align: left;
+}
+.tool-target:hover { color: var(--ink); }
+/* A command / query is code, not a link: monospace chip, one line, ellipsised.
+   The full text is revealed in the expanded detail (round-11 #1). */
+.tool-cmd {
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono); font-size: 12px; color: var(--ink);
+    background: rgba(255, 255, 255, 0.05); border-radius: 4px; padding: 1px 6px;
+}
+.tool-mark { margin-left: auto; flex: 0 0 auto; }
+.tool-mark.bad { color: var(--bad); }
+.tool-detail { margin: 4px 0 4px 1.4em; }
+/* Plain-language expanded detail (#4): a readable sentence, not a raw JSON blob. */
+.tool-detail-line {
+    margin: 2px 0; padding: 5px 8px; background: rgba(255, 255, 255, 0.04);
+    border-radius: 4px; font-size: 11px; color: var(--text);
+    white-space: pre-wrap; word-break: break-word;
+}
+.tool-detail-line.tool-result-line { color: var(--muted); font-family: var(--mono);
+    max-height: 220px; overflow: auto; }
+.tool-args, .tool-result {
+    margin: 2px 0; padding: 6px 8px; background: rgba(255, 255, 255, 0.04);
+    border-radius: 4px; white-space: pre-wrap; word-break: break-word; font-size: 11px;
+    max-height: 220px; overflow: auto;
+}
+.line.blocked { color: var(--bad); }
+/* A failed-turn reason (UX-14): admitted-tier, but red-railed so it reads as the
+   thing that went wrong, not ordinary run truth. Overrides the .admitted accent. */
+.line.error { color: var(--bad); border-left-color: var(--bad); }
+
+/* An agent turn: the agent's prose + the tool calls it made, bracketed by one
+   continuous accent rail and a header that folds the whole turn to its gist. The
+   rail lives on the turn, so the inner lines drop their own rail/label (below) —
+   the turn reads as one unit, not a stack of separately-railed fragments. */
+.turn { margin-top: 9px; border-left: 2px solid var(--accent); padding-left: 8px; }
+.turn-head { display: flex; align-items: baseline; gap: 6px; cursor: pointer; user-select: none; }
+.turn-caret { color: var(--muted); width: 0.9em; flex: 0 0 auto; }
+.turn-label { font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--accent); flex: 0 0 auto; }
+.turn-summary { color: var(--muted); font-size: 12px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.turn-head:hover .turn-caret, .turn-head:hover .turn-summary { color: var(--ink); }
+.turn-body { margin-top: 2px; }
+/* Inner lines defer to the turn's rail/label: no second rail, no repeated "agent"
+   tag, tighter top margin so the turn body is one block. */
+.turn-body .line.assistant, .turn-body .line.user { border-left: none; padding-left: 0; margin-top: 2px; }
+.turn-body .line.assistant::before { content: none; }
+
+/* The diff projection is rendered by @git-diff-view/solid; we own the chrome
+   (toolbar, per-file headers) and align its dark theme to the app palette. */
+.diff { display: flex; flex-direction: column; gap: 10px; font-family: var(--mono); }
+.diff-toolbar { display: flex; align-items: center; justify-content: space-between; }
+.diff-mode { display: flex; gap: 2px; }
+.diff-mode .tab { padding: 2px 8px; font-size: 11px; border-bottom: none; border-radius: 3px; }
+.diff-mode .tab.active { background: var(--edge); }
+/* When the diff isn't wrapping (narrow panel, round-7 #4) let it scroll sideways
+   rather than clipping — a horizontal scrollbar beats shattered mid-word breaks. */
+.diff-file { border: 1px solid var(--edge); border-radius: 6px; overflow: auto; }
+.diff-file-head { background: var(--panel); border-bottom: 1px solid var(--edge);
+    padding: 5px 10px; font-size: 11px; color: var(--ink); }
+/* Re-skin git-diff-view's GitHub-dark variables to the workbench tokens. The
+   library scopes them on `[data-theme="dark"] .diff-style-root`, so we match
+   that specificity (+ our `.diff` ancestor) to win. */
+.diff .diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
+    --diff-plain-content--: var(--panel);
+    --diff-plain-lineNumber--: var(--panel);
+    --diff-border--: var(--edge);
+    --diff-expand-content--: var(--bg);
+    --diff-expand-lineNumber--: var(--bg);
+    --diff-empty-content--: var(--bg);
+}
+
+.bar { display: flex; gap: 8px; align-items: center; }
+.task { background: var(--edge); border-radius: 4px; padding: 4px 8px; color: var(--ink); }
+.task.current { background: var(--accent); color: #0f1115; font-weight: 600; }
+
+button {
+    background: var(--edge); color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 4px; padding: 4px 10px; cursor: pointer; font: inherit;
+}
+button:hover { border-color: var(--accent); }
+input {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 4px; padding: 4px 8px; font: inherit;
+}
+.status { color: var(--muted); font-size: 11px; }
+.phase { color: var(--accent); }
+
+/* The chat-status badge (#4): a real coloured pill, separated from the title, so
+   a state change actually registers. working = animated accent; review = warn
+   accent that shouts "there's a decision to make"; ready = quiet. */
+/* Round-10 #4 — the per-chat status is the one signal that answers "is the agent
+   done? do I need to do something?", so it must be legible, not a 10px grey
+   whisper. Bumped to 12px with real contrast; the "Needs review" state carries
+   the most weight (a solid warn fill + subtle ring) because it is a call to
+   action, while "Ready" recedes to a quiet outline. */
+.status-badge { display: inline-flex; align-items: center; gap: 5px; margin-left: 10px;
+    font-size: 12px; letter-spacing: 0.02em; font-weight: 600;
+    border-radius: 999px; padding: 3px 11px; border: 1px solid var(--edge); vertical-align: middle; }
+.status-badge[data-status="ready"] { color: var(--muted); }
+.status-badge[data-status="working"] { color: var(--accent); border-color: var(--accent);
+    background: rgba(106, 163, 255, 0.16); }
+.status-badge[data-status="review"] { color: #1b1205; border-color: var(--warn);
+    background: var(--warn); font-weight: 700;
+    box-shadow: 0 0 0 3px rgba(224, 163, 90, 0.18); }
+/* Conflict (WS-H c): the most urgent badge — a turn's auto-sync hit a conflict the
+   human must resolve in the Changes view. */
+.status-badge[data-status="conflict"] { color: #fff; border-color: var(--bad);
+    background: var(--bad); font-weight: 700;
+    box-shadow: 0 0 0 3px rgba(229, 115, 115, 0.22); }
+.status-badge .status-dot { width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+
+/* The composer must fit any panel width — the input shrinks (min-width:0 defeats
+   the default intrinsic minimum) so `send` is never clipped off-panel (round-7 #1). */
+.composer { display: flex; gap: 6px; align-items: stretch; }
+.composer input { flex: 1 1 0; min-width: 0; }
+/* The per-chat model picker toolbar (LLM-1): a quiet row above the input. */
+.composer-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.model-picker { display: inline-flex; align-items: center; gap: 5px; font-size: 11px;
+    color: var(--muted); cursor: pointer; }
+.model-picker-tag { text-transform: uppercase; letter-spacing: 0.06em; font-size: 9px;
+    opacity: 0.7; }
+/* `color-scheme: dark` makes the browser render the native control AND its option
+   popup in dark mode (otherwise the popup defaults to a white sheet, leaving the
+   light `--ink` option text unreadable); the explicit option colours are a fallback
+   for engines that don't honour it on the popup. */
+.model-picker select { font-size: 11px; color: var(--ink); background: transparent;
+    color-scheme: dark;
+    border: 1px solid var(--edge); border-radius: 5px; padding: 2px 5px; cursor: pointer; }
+.model-picker select option { background: var(--panel); color: var(--ink); }
+.model-picker select:hover { border-color: var(--accent); }
+/* The effort toggle sits beside the model picker; a thin divider keeps the two legible. */
+.effort-picker { padding-left: 8px; border-left: 1px solid var(--edge); }
+
+/* Account panel: the "models in the picker" checklist — a scrollable list of toggles. */
+.model-checklist { max-height: 280px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+.model-check-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--edge); }
+.model-check { display: flex; align-items: center; gap: 8px; cursor: pointer; flex: 1; min-width: 0; }
+.model-check span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-check input { accent-color: var(--accent); flex: 0 0 auto; }
+.composer .send-btn { flex: 0 0 auto; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 5px; }
+.composer .steer-btn, .composer .queue-btn { flex: 0 0 auto; white-space: nowrap; }
+.composer .queue-btn { display: inline-flex; align-items: center; gap: 5px; }
+/* Paperclip attach (UX-14): a compact icon target left of the stage-gate. */
+.composer .attach-btn { flex: 0 0 auto; }
+
+/* Pending message attachments: removable chips above the composer box. */
+.composer-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.attachment-chip { display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 4px 2px 6px; font-size: 12px; border: 1px solid var(--edge);
+    border-radius: 12px; color: var(--ink); background: var(--edge); }
+.attachment-chip .icon { width: 12px; height: 12px; }
+.attachment-chip .chip-thumb { width: 16px; height: 16px; object-fit: cover; border-radius: 3px; }
+.attachment-chip .chip-x { padding: 0 4px; color: var(--muted); line-height: 1;
+    font-size: 14px; background: none; border: none; cursor: pointer; }
+.attachment-chip .chip-x:hover { color: var(--warn); }
+
+.working { display: flex; align-items: center; gap: 8px; padding: 6px 2px;
+    color: var(--accent); font-size: 12px; }
+.working .stop-btn { margin-left: auto; font-size: 11px; padding: 1px 8px; }
+.working .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.1s ease-in-out infinite; }
+@keyframes pulse {
+    0%, 100% { opacity: 0.3; transform: scale(0.8); }
+    50% { opacity: 1; transform: scale(1.15); }
+}
+/* Calm/restraint (#11) + battery: the only continuously-running animations in the
+   app are these two "working" pulse dots. Honour prefers-reduced-motion so they
+   don't keep the compositor busy (or jank scrolling) for users/environments that
+   ask for stillness — they fall back to a static, still-legible "working" dot. */
+@media (prefers-reduced-motion: reduce) {
+    .status-badge .status-dot,
+    .tree-leaf .status-gem[data-state="working"],
+    .working .pulse { animation: none; opacity: 0.85; }
+}
+
+.facets { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.facet-search-row { position: relative; margin-bottom: 10px; }
+.facet-search { width: 100%; box-sizing: border-box; font-size: 11px; padding: 3px 7px;
+    padding-right: 22px; }
+.facet-search-clear { position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+    background: transparent; border: none; color: var(--muted); cursor: pointer;
+    font-size: 11px; line-height: 1; padding: 2px 4px; }
+.facet-search-clear:hover { color: var(--fg); background: transparent; border: none; }
+.facet { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); padding: 2px 6px; border-radius: 3px; cursor: pointer; }
+.facet.active { color: var(--accent); background: var(--edge); }
+.facet.disabled { opacity: 0.4; cursor: default; }
+
+.header-actions { float: right; display: inline-flex; gap: 4px; }
+
+/* Inline SVG icon (components/icons.tsx): inherits the button's currentColor and
+   sits on the text baseline; size is fixed here so every icon button matches. */
+.icon { width: 15px; height: 15px; flex: 0 0 auto; display: block; }
+/* An icon-only button: a compact square target. The label rides on aria-label +
+   title (tooltip); the muted icon brightens to the accent on hover. */
+.icon-btn { display: inline-flex; align-items: center; justify-content: center;
+    padding: 4px; color: var(--muted); }
+.icon-btn:hover, .icon-btn.active { color: var(--accent); }
+/* When the log is being filtered, the funnel reads as "on" (accent) so a
+   near-empty log is legibly "you hid things", not "nothing happened". */
+.icon-btn.filter-on { color: var(--accent); border-color: var(--accent); }
+
+/* The transcript filter popover (mirrors the settings menu): a local panel that
+   pops below the funnel. A row per message type and per tool — a show toggle, the
+   label, and (for a tool with detail) an "open expanded by default" toggle. Tools
+   sit under group headers (Commands / File writes / File reads / Other); the
+   header toggles its whole group. The list is taller than the settings menu, so
+   it caps its height and scrolls. */
+.filter-anchor { position: relative; display: inline-flex; }
+.filter-popover { position: absolute; top: calc(100% + 6px); right: 0; z-index: 61;
+    min-width: 230px; max-height: 70vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); }
+.filter-head { display: flex; align-items: center; gap: 8px; padding: 2px 6px 4px;
+    font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.filter-col-show { flex: 0 0 auto; }
+.filter-col-name { flex: 1 1 auto; }
+.filter-col-exp { flex: 0 0 auto; }
+.filter-row { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 4px; }
+.filter-row:hover { background: var(--edge); }
+.filter-show, .filter-exp { flex: 0 0 auto; margin: 0; cursor: pointer; accent-color: var(--accent); }
+.filter-exp-gap { width: 13px; flex: 0 0 auto; }
+.filter-name { flex: 1 1 auto; color: var(--ink); }
+/* A tool group header: the group label in the muted uppercase of a section head,
+   its checkbox toggling every tool under it. */
+.filter-row.group { margin-top: 2px; }
+.filter-group-name { flex: 1 1 auto; font-size: 9px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted); }
+/* Individual tool rows indent under their group header. */
+.filter-row.tool { padding-left: 18px; }
+/* Footer actions: persist the current filter as the user's default, or reset to
+   showing everything (this session). Separated from the rows by a hairline. */
+.filter-actions { display: flex; gap: 6px; margin-top: 6px; padding-top: 6px;
+    border-top: 1px solid var(--edge); }
+.filter-save { flex: 1 1 auto; text-align: center; font-size: 11px;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); color: var(--ink); }
+.filter-save:hover { border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 28%, transparent); }
+.filter-save.saved { color: var(--accent); }
+.filter-reset { flex: 0 0 auto; text-align: center; font-size: 11px;
+    background: transparent; border: 1px solid var(--edge); color: var(--muted); }
+.filter-reset:hover { color: var(--ink); background: var(--edge); }
+
+
+.tabs { display: flex; gap: 4px; margin-bottom: 10px; border-bottom: 1px solid var(--edge); }
+.tab { padding: 4px 10px; cursor: pointer; color: var(--muted); text-transform: capitalize;
+    border-bottom: 2px solid transparent; }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.shelf h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 6px; }
+.shelf .bar { flex-wrap: wrap; gap: 6px; }
+.shelf button { font-size: 11px; padding: 3px 7px; }
+
+.timeline { display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
+.event { display: grid; grid-template-columns: 22px 110px 1fr; gap: 6px; padding: 2px 0;
+    border-bottom: 1px solid var(--bg); }
+.event .pos { color: var(--muted); text-align: right; }
+.event .kind { color: var(--accent); }
+.event .payload { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Plain-language activity list (round-6 #1): the user-facing "history", folded
+   from the raw event log. Newest at the bottom; one calm line per item. */
+.activity { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.activity-item { display: flex; align-items: baseline; gap: 8px; color: var(--ink);
+    line-height: 1.4; }
+.activity-dot { width: 6px; height: 6px; border-radius: 50%; flex: none;
+    background: var(--muted); transform: translateY(-1px); }
+.activity-dot.you { background: var(--accent); }
+.activity-dot.kept { background: var(--accent); }
+.activity-dot.discarded { background: var(--warn); }
+.activity-item[data-activity-tone="you"] .activity-text { color: var(--muted); }
+/* The developer "raw event log" escape hatch — quiet, off by default. */
+.raw-log-toggle { margin-top: 12px; align-self: flex-start; }
+.raw-log { margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--edge); }
+/* A plain text-link button (round-6 #1/#4): a quiet disclosure, not a chrome button. */
+.link-button { background: none; border: none; padding: 0; font: inherit; font-size: 11px;
+    color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.link-button:hover { color: #87b6ff; background: none; border: none; }
+
+/* The chat's own name leads the header (round-6 #6) — readable, not the muted
+   uppercase the surrounding h2 uses, so it's clearly the chat's title. */
+.chat-title { text-transform: none; letter-spacing: normal; font-size: 13px;
+    font-weight: 600; color: var(--ink); }
+
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center; z-index: 10; }
+
+/* The history drawer (#6): anchored to the right edge against the chat lane, not a
+   thin bar dropped in the middle. A lighter scrim — it's a side panel, not a modal. */
+/* A side panel, not a modal: don't black out the workbench behind it (round-12).
+   A faint scrim keeps "click outside to close" discoverable without hiding the
+   work the panel is *about* (the chat / files stay visible beside it). */
+.drawer-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.08);
+    display: flex; justify-content: flex-end; z-index: 10; }
+.drawer { background: var(--panel); border-left: 1px solid var(--edge);
+    height: 100vh; width: 420px; max-width: 92vw; padding: 14px; overflow: auto;
+    box-shadow: -8px 0 28px rgba(0,0,0,0.45); display: flex; flex-direction: column; }
+.shelf-drawer .modal-head { margin-bottom: 10px; }
+.modal { background: var(--panel); border: 1px solid var(--edge); border-radius: 6px;
+    padding: 14px; width: 560px; max-width: 90vw; }
+/* The deployment Monitor stacks several sections (config + embed snippet + insight +
+   directory) and can exceed the viewport; cap it and scroll internally so the head (with
+   the close button) stays reachable — same shape as `.devices-modal`. */
+.embed-monitor { max-height: 85vh; overflow-y: auto; }
+.embed-snippet { background: var(--bg); border: 1px solid var(--edge); border-radius: 4px;
+    padding: 8px; overflow-x: auto; white-space: pre; font-size: 11px; }
+.modal-head { display: flex; justify-content: space-between; align-items: center; }
+.modal-head h3 { margin: 0; font-size: 13px; }
+.config-text { width: 100%; height: 200px; background: var(--bg); color: var(--ink);
+    border: 1px solid var(--edge); border-radius: 4px; padding: 8px;
+    font-family: var(--mono); font-size: 12px; margin: 6px 0; resize: vertical; }
+
+/* The plain-language settings form (#5 round-5): leads the modal so the beginner
+   instruction "set what this method does" lands on real, plain controls — not the
+   raw {} JSON, which is now a collapsed Advanced surface. */
+.settings-form { display: flex; flex-direction: column; gap: 12px; margin: 4px 0 12px; }
+.settings-field { display: flex; flex-direction: column; gap: 4px; border: none; padding: 0;
+    margin: 0; }
+.settings-label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.05em; }
+.settings-input { font-size: 12px; padding: 4px 7px; }
+.settings-radio, .settings-checkbox { display: flex; align-items: center; gap: 7px;
+    font-size: 12px; cursor: pointer; }
+.settings-radio input, .settings-checkbox input { cursor: pointer; }
+.settings-checkbox { margin: 2px 0; }
+.settings-advanced-toggle { background: transparent; border: none; color: var(--muted);
+    font-size: 11px; padding: 2px 0; cursor: pointer; text-align: left; }
+.settings-advanced-toggle:hover { color: var(--fg); background: transparent; border: none; }
+
+/* Keyboard-focus ring on the tree rows + task pills (#4 round-5) now that they're
+   real treeitem/button roles — keyboard users can see where they are. */
+.tree-node:focus-visible, .tree-leaf:focus-visible, .task-tab:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: -1px; }
+.tree-node, .tree-leaf { outline: none; }
+
+/* A one-line explanation under a menu item (#2 round-5): tells the two chat types
+   apart in plain words instead of leaving the user to guess. */
+.menu-item.has-hint { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
+.menu-item-label { display: block; }
+.menu-item-hint { display: block; font-size: 10px; color: var(--muted);
+    text-transform: none; letter-spacing: normal; }
+/* Blast-radius warning under an armed destructive item (round-6 #6): visible on
+   the red confirming background. */
+.menu-item.confirming .menu-item-hint.warn { color: #0f1115; opacity: 0.85; }
+
+/* The place picker (#1): one screen to choose the other end of a placement. */
+.place-picker { width: 420px; }
+.place-picker .picker-search { width: 100%; margin-bottom: 8px; }
+.picker-list { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow: auto; }
+.picker-row { text-align: left; background: transparent; border: 1px solid transparent;
+    color: var(--ink); padding: 6px 9px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.picker-row:hover { background: var(--edge); }
+.picker-row.picker-create { color: var(--accent); margin-top: 4px; }
+
+/* --- facet browser (the nav tree) --- */
+.facet-browser { display: flex; flex-direction: column; gap: 1px; }
+.tree-action { display: block; width: 100%; text-align: left; font-size: 11px;
+    color: var(--accent); cursor: pointer; padding: 3px 6px; border-radius: 4px;
+    background: transparent; border: 1px solid transparent; }
+.tree-action:hover { background: var(--edge); border-color: transparent; }
+
+/* Shared create affordances (WS-H): ONE look for every "+ create" action across all
+   facets — a small button-like control, grouped on a single `.action-row` at the top of
+   a facet or right under a container's title. Quiet by default (thin border, accent
+   text), fills on hover. Small padding — button-like without shouting. */
+.action-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 2px 6px 3px; }
+/* Fork lineage (ADR 0038): a quiet "forked from …" line under a forked archetype. */
+.fork-lineage { font-size: 10px; padding: 1px 6px 2px 18px; }
+
+/* A placement carrying client-specific config/notes (config-only customization, no
+   fork) — a quiet badge so a customized client placement reads at a glance. */
+.cfg-badge { margin-left: 6px; font-size: 9px; padding: 1px 6px; border-radius: 8px;
+    border: 1px solid var(--muted); color: var(--muted); background: transparent;
+    text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+/* The placement-customization editor fields (config overlay + notes). */
+.cfg-field { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; font-size: 12px; }
+.cfg-field > span { color: var(--muted); font-size: 11px; }
+.cfg-field textarea { font-family: var(--mono, monospace); font-size: 12px; resize: vertical;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--edge); border-radius: 4px; padding: 6px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
+.create-btn { font-size: 11px; line-height: 1.4; color: var(--accent); cursor: pointer;
+    padding: 2px 8px; border-radius: 4px; background: transparent; border: 1px solid var(--edge);
+    white-space: nowrap; transition: background 0.1s, border-color 0.1s, color 0.1s; }
+.create-btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.create-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* The "no method here yet" on-ramp (#1): the empty placement state must shout the
+   one obvious next step, not dead-end. A short line + a primary-tinted button. */
+.placement-empty { display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
+    padding: 6px 6px 6px 18px; }
+.place-cta { font-size: 11px; color: var(--accent); border-color: var(--accent);
+    padding: 3px 10px; }
+.place-cta:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.tree-group { margin-bottom: 4px; }
+.tree-subgroup { margin-left: 12px; }
+.tree-node { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 4px;
+    cursor: default; }
+.tree-node:hover { background: var(--edge); }
+.tree-node .node-icon { color: var(--muted); font-size: 9px; cursor: pointer; width: 12px; display: inline-block; text-align: center; }
+.tree-node .node-icon:hover { color: var(--fg); }
+/* A leaf with no children gets a width-matched spacer instead of a caret, so the
+   ▾/▸ no longer promises a fold that expands to nothing (#2 round-9). */
+.tree-node .node-icon-empty { cursor: default; }
+.tree-node .node-icon-empty:hover { color: var(--muted); }
+/* Search match highlight (#6 round-9): mark the literal matched substring so a
+   filtered list shows why each surviving row stayed. */
+mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); color: inherit;
+    border-radius: 2px; padding: 0 1px; }
+.tree-node .node-label { font-weight: 600; font-size: 12px;
+    /* One line, ellipsized (round-6 #6): a long method name used to wrap onto two
+       lines and make rows uneven. Let it shrink and truncate instead. */
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.tree-node.binding .node-label { font-weight: 400; color: var(--ink); }
+/* "+ chat" stays faintly visible so it's discoverable (not hover-only), and goes
+   full-strength on hover or keyboard focus. */
+.new-chat { margin-left: auto; font-size: 10px; padding: 1px 6px; opacity: 0.5; transition: opacity 0.1s; }
+.tree-node:hover .new-chat, .new-chat:focus-visible { opacity: 1; }
+/* UX-9: a placement whose archetype has a newer published version. A quiet,
+   clickable notice (manual upgrade by default) — pushed to the right, before the
+   `+ chat` affordance, so it reads as status not a primary action. */
+.upgrade-badge { margin-left: auto; font-size: 9px; padding: 1px 6px; border-radius: 8px;
+    border: 1px solid var(--accent, #6a8); color: var(--accent, #6a8); background: transparent;
+    text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+.upgrade-badge + .new-chat { margin-left: 6px; }
+/* APPROVE-1: a placement pending approval — a warn-toned clickable badge (accept). */
+.pending-badge { margin-left: auto; font-size: 9px; padding: 1px 6px; border-radius: 8px;
+    border: 1px solid var(--warn, #c94); color: var(--warn, #c94); background: transparent;
+    text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; cursor: pointer; }
+.pending-badge + .new-chat { margin-left: 6px; }
+.tree-leaf { padding: 2px 6px 2px 18px; border-radius: 4px; cursor: pointer; font-size: 12px;
+    display: flex; align-items: center; gap: 6px; }
+.tree-leaf:hover { background: var(--edge); }
+.tree-leaf.active { background: var(--edge); color: var(--accent); }
+.tree-leaf .leaf-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    min-width: 0; flex: 1 1 auto; }
+/* A chat row that carries a fork sublabel stacks title + "copy of …" (#3). */
+.tree-leaf .leaf-label.leaf-label-stack { display: flex; flex-direction: column; min-width: 0; }
+/* The title is its own line so it ellipsises inside the flex column (round-11 #6):
+   text-overflow can't reach a bare text child of a flex container. */
+.tree-leaf .leaf-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 100%; min-width: 0; }
+.tree-leaf .leaf-sub { color: var(--muted); font-size: 9px; line-height: 1.2;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Chat-log search snippet (SEARCH-1): a faint italic context line under the title
+   showing why a content-only hit stayed; the matched term keeps the search-hit mark. */
+.tree-leaf .leaf-snippet { font-style: italic; opacity: 0.85; }
+/* Per-row status gem (WS-H): the leftmost kind glyph that doubles as the row's
+   status light. The glyph shape carries the kind (◧ work · ✎ edit); its colour
+   carries the single most important state — quiet/muted when idle, working pulses
+   (accent), needs-review is steady amber, a failed turn is red. An optional count
+   badge rides its corner (pending changes; wired in phase 2). */
+.tree-leaf .status-gem { flex: 0 0 auto; position: relative; display: inline-flex;
+    align-items: center; justify-content: center; width: 14px; height: 14px;
+    font-size: 11px; line-height: 1; color: var(--muted); }
+.tree-leaf .status-gem-glyph { display: block; }
+.tree-leaf .status-gem[data-state="working"] { color: var(--accent);
+    animation: pulse 1.1s ease-in-out infinite; }
+.tree-leaf .status-gem[data-state="review"] { color: var(--warn); }
+.tree-leaf .status-gem[data-state="error"] { color: var(--bad); }
+/* Conflict (WS-H c): red like an error, but carries a `!` mark so it reads as
+   "needs resolving", distinct from a plain failed turn. */
+.tree-leaf .status-gem[data-state="conflict"] { color: var(--bad); }
+.tree-leaf .status-gem-count, .tree-leaf .status-gem-mark { position: absolute;
+    top: -3px; right: -4px; font-size: 8px; line-height: 1; padding: 0 2px;
+    border-radius: 6px; color: #0f1115; font-variant-numeric: tabular-nums; }
+.tree-leaf .status-gem-count { background: var(--warn); }
+.tree-leaf .status-gem-mark { background: var(--bad); font-weight: 700; padding: 0 3px; }
+.tree-leaf .leaf-meta { margin-left: auto; color: var(--muted); font-size: 10px; }
+/* Workstreams (WS-F): the shared-line indicator, the workstream row, and its
+   explicit promote/archive actions. Member chats auto-sync — no per-sync buttons. */
+.ws-badge { color: var(--accent, #6ab0f3); font-size: 11px; flex: 0 0 auto;
+    margin-right: 2px; }
+.tree-action.ws-new { font-size: 11px; color: var(--muted); }
+/* A workstream group (WS-H d): a lightweight label over the chats on a shared line —
+   NOT a node peer of placements. The label is a quiet divider (the ⇄ mark, the line
+   name, a member count); its lifecycle actions (promote / archive) live in its
+   right-click menu, surfaced when acted on, not as standing buttons. Members are
+   indented under a quiet rail. */
+.ws-group { margin: 2px 0 3px; }
+.ws-label { display: flex; align-items: center; gap: 6px; padding: 1px 0 2px 2px;
+    font-size: 11px; color: var(--muted); cursor: default; }
+.ws-label-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    letter-spacing: 0.02em; }
+.ws-label-count { margin-left: auto; font-size: 10px; opacity: 0.75;
+    font-variant-numeric: tabular-nums; }
+.ws-group .ws-members { margin-left: 9px; padding-left: 5px; border-left: 1px solid var(--edge); }
+/* Fork first-view note above the empty transcript (#3). */
+.fork-note { margin: 4px 0 8px; padding: 7px 10px; font-size: 12px; color: var(--muted);
+    background: rgba(255, 255, 255, 0.03); border: 1px solid var(--edge); border-radius: 6px;
+    line-height: 1.4; }
+.fork-note strong { color: var(--text); font-weight: 600; }
+.inline-edit { font: inherit; font-size: 12px; padding: 1px 4px; background: var(--bg);
+    color: var(--ink); border: 1px solid var(--accent); border-radius: 3px; }
+/* Placement lineage + pinned method version (ADR 0035 C1 pivot). */
+.tree-node.placement .lineage { color: var(--muted); font-size: 10px; margin-left: 6px; }
+.tree-node.placement .pinned-version { color: var(--muted); font-size: 9px; margin-left: 6px;
+    border: 1px solid var(--edge); border-radius: 3px; padding: 0 4px; }
+.archetype-hint { display: flex; flex-direction: column; gap: 5px; align-items: flex-start;
+    padding: 4px 6px 6px 18px; }
+/* All-chats grouped by archetype (#5): one header per group, not a label per row. */
+.chat-group + .chat-group { margin-top: 8px; }
+.chat-group-head { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); padding: 2px 0 3px 2px; border-bottom: 1px solid var(--edge);
+    margin-bottom: 2px; }
+/* Plain-language safety summary for a permission/policy change (#3). */
+.policy-callout { border: 1px solid var(--edge); border-left: 3px solid var(--muted);
+    border-radius: 4px; padding: 8px 10px; margin-bottom: 10px; background: var(--panel); }
+.policy-callout.loosen { border-left-color: var(--warn); }
+.policy-callout-head { font-size: 12px; font-weight: 600; color: var(--ink); margin-bottom: 4px; }
+.policy-callout-list { margin: 0 0 4px; padding-left: 18px; font-size: 12px; color: var(--ink); }
+.policy-callout-list li.loosen { color: var(--warn); }
+.merge-review .keep-btn.warn { background: var(--warn); border-color: var(--warn); color: var(--bg); }
+.merge-review .keep-btn.warn:hover { background: #e9b878; border-color: #e9b878; }
+.discarded-note { padding: 10px 2px; }
+/* The lineage is secondary metadata — keep it to one ellipsised line so a long
+   project name doesn't wrap the chat header onto two rows (round-12 minor). The
+   full value is on its title tooltip. */
+.chat-lineage { font-size: 11px; color: var(--muted); margin-left: 8px;
+    display: inline-block; max-width: 240px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; vertical-align: bottom; }
+.stop-btn { color: var(--bad); border-color: var(--bad); }
+.stop-btn:hover { border-color: var(--bad); background: var(--bad); color: #0f1115; }
+
+/* --- the composer dock: mode picker · queued-message stack · input ------- */
+/* One sticky bottom unit. The panel-coloured background lets the transcript
+   scroll cleanly behind it; the top border separates it from the transcript. */
+/* The composer dock is pinned to the bottom of the chat panel (round-7 #2): the
+   transcript (flex:1) absorbs all slack, so the dock never scrolls out of view
+   regardless of transcript length or window height. It's the bottom flex item
+   and refuses to shrink, so the input is always reachable. */
+.composer-dock { flex: 0 0 auto; margin-top: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+    background: var(--panel); border-top: 1px solid var(--edge);
+    padding: 10px 0 2px; }
+
+/* The queue stage-gate (#24): a single inline chip in the composer, left of the
+   primary action — `⏸ hold` lines messages up without running them; `▶ release·N`
+   drains them in order. Quiet (muted) when idle; warn-toned while actively holding
+   so the held state is never silent. */
+.composer .queue-gate { flex: 0 0 auto; white-space: nowrap; }
+/* Armed (held) state: a border cue only — font/size/colour stay identical to
+   send/queue/hold so the four composer buttons read as one uniform cluster. */
+.composer .queue-gate.gated { border-color: var(--warn); }
+
+
+/* Queued messages stack on top of the box — next-to-run first. */
+.queue-stack { display: flex; flex-direction: column; gap: 4px; }
+.queue-cap { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); padding-left: 2px; }
+.queue-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+    background: var(--bg); border: 1px solid var(--edge); border-radius: 5px;
+    font-size: 12px; }
+.queue-item.dragging { opacity: 0.4; }
+.queue-item.over { border-color: var(--accent); box-shadow: 0 -2px 0 var(--accent) inset; }
+.queue-grip { cursor: grab; color: var(--muted); user-select: none; line-height: 1; }
+.queue-grip:active { cursor: grabbing; }
+.queue-pos { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 1ch;
+    text-align: right; }
+.queue-text { flex: 1; cursor: text; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+.queue-edit { flex: 1; font-size: 12px; padding: 2px 6px; }
+.queue-send-now { color: var(--muted); border-color: transparent; background: transparent;
+    padding: 0 6px; line-height: 1.4; font-size: 10px; }
+.queue-send-now:hover { color: var(--accent); border-color: var(--accent); }
+.queue-remove { color: var(--muted); border-color: transparent; background: transparent;
+    padding: 0 6px; line-height: 1.4; }
+.queue-remove:hover { color: var(--bad); border-color: var(--bad); }
+
+/* Steer is the assertive action (it interrupts) — tint it like stop. */
+.steer-btn { color: var(--warn); border-color: var(--warn); }
+.steer-btn:hover:not(:disabled) { background: var(--warn); color: #0f1115; border-color: var(--warn); }
+.steer-btn:disabled, .queue-btn:disabled { opacity: 0.45; cursor: default; }
+
+/* --- right-click context menu --- */
+.context-menu { position: fixed; z-index: 50; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 4px; min-width: 130px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+    display: flex; flex-direction: column; gap: 1px; }
+.menu-item { text-align: left; background: transparent; border: none; color: var(--ink);
+    padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.menu-item:hover { background: var(--edge); border: none; }
+.menu-item.danger { color: var(--bad); }
+.menu-item.confirming { background: var(--bad); color: #0f1115; }
+
+/* The mobile shell variant (MOB-021): on a narrow viewport the four-panel grid
+   collapses to the full-height Carousel island — same projections, one pane at a
+   time. The desktop grid columns no longer apply, so it is a plain block. */
+.workbench.mobile { display: block; grid-template-rows: none; height: 100vh; }
+
+/* The mobile carousel island (mobile-client.md, MOB-014): one pane at a time
+   under a labelled pane toggle, flanked by thin edge gutters. */
+.carousel { display: flex; flex-direction: column; height: 100%; min-height: 0;
+    background: var(--bg); }
+.carousel-toggle { display: flex; gap: 1px; background: var(--edge);
+    border-bottom: 1px solid var(--edge); }
+.carousel-seg { flex: 1; background: var(--panel); border: none; color: var(--muted);
+    padding: 8px 6px; font-size: 12px; cursor: pointer; }
+.carousel-seg.current { color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent, #6aa3ff); }
+.carousel-seg.greyed { color: var(--edge); cursor: default; }
+.carousel-stage { display: flex; flex: 1; min-height: 0; }
+.carousel-pane { flex: 1; min-width: 0; overflow: auto; background: var(--panel);
+    padding: 10px 12px; }
+.carousel-gutter { flex: 0 0 18px; background: transparent; border: none; color: var(--muted);
+    cursor: pointer; font-size: 16px; line-height: 1; align-self: stretch; }
+.carousel-gutter.inert { color: transparent; cursor: default; }
+
+/* The mobile top bar (mobile-client.md, MOB-019): context header + freshness dot
+   + next-task badge over the canonical pane toggle. */
+.top-bar { display: flex; flex-direction: column; background: var(--panel);
+    border-bottom: 1px solid var(--edge); }
+.top-bar-status { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    font-size: 12px; }
+.freshness-dot { display: inline-flex; align-items: center; gap: 5px; color: var(--muted);
+    white-space: nowrap; }
+.freshness-dot .dot-mark { font-size: 10px; line-height: 1; }
+.freshness-dot[data-dot="live"] .dot-mark { color: #3fb950; }
+.freshness-dot[data-dot="stale"] .dot-mark { color: #d29922; }
+.freshness-dot[data-dot="caveated"] .dot-mark { color: #d29922; }
+.freshness-dot[data-dot="offline"] .dot-mark { color: var(--muted); }
+.freshness-dot[data-dot="revoked"] .dot-mark,
+.freshness-dot[data-dot="expired"] .dot-mark { color: #f85149; }
+.freshness-dot[data-dot="unpaired"] .dot-mark { color: var(--edge); }
+.context-header { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; text-align: center; background: none; border: none;
+    color: var(--ink); font-size: 12px; cursor: pointer; }
+.context-header:disabled { color: var(--muted); cursor: default; }
+.next-task { display: inline-flex; align-items: center; gap: 2px; white-space: nowrap; }
+.next-task-open, .next-task-jump { display: inline-flex; align-items: center; gap: 4px;
+    background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; }
+.next-task-open { font-size: 14px; padding: 0 2px; }
+.next-task-badge { display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px;
+    background: var(--accent, #6aa3ff); color: var(--bg); font-size: 11px; }
+.top-bar-toggle { display: flex; gap: 1px; background: var(--edge); }
+
+/* The pull-down full task queue (mobile-client.md, "Next ③" → pull-down): a
+   top-anchored sheet listing the queue current-first, over a tap-to-dismiss scrim. */
+.queue-sheet-scrim { position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,0.4);
+    display: flex; flex-direction: column; }
+.queue-sheet { background: var(--panel); border-bottom: 1px solid var(--edge);
+    max-height: 70%; overflow-y: auto; box-shadow: 0 4px 16px rgba(0,0,0,0.3); }
+.queue-sheet-head { display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; border-bottom: 1px solid var(--edge); }
+.queue-sheet-title { font-size: 12px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.05em; }
+.queue-sheet-close { background: none; border: none; color: var(--muted); font-size: 18px;
+    line-height: 1; cursor: pointer; }
+.queue-sheet-list { list-style: none; margin: 0; padding: 0; }
+.queue-sheet-item { display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 10px 12px; background: none; border: none; border-bottom: 1px solid var(--edge);
+    color: var(--ink); font-size: 13px; text-align: left; cursor: pointer; }
+.queue-sheet-item.current { background: color-mix(in srgb, var(--accent, #6aa3ff) 12%, transparent); }
+.queue-item-current { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--accent, #6aa3ff); }
+.queue-item-kind { font-size: 11px; color: var(--muted); }
+.queue-item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+.queue-item-agent { font-size: 11px; color: var(--muted); }
+
+/* --- the connection-state banner (MOB-028): shown only when degraded -------
+   offline / revoked / expired / unpaired. The happy path renders nothing. */
+.connection-banner { display: flex; align-items: center; gap: 6px; padding: 6px 10px;
+    font-size: 12px; border-bottom: 1px solid var(--edge); }
+.connection-banner[data-severity="info"] { background: rgba(110, 163, 255, 0.12);
+    color: var(--ink); }
+.connection-banner[data-severity="warning"] { background: rgba(248, 81, 73, 0.14);
+    color: var(--ink); }
+.connection-banner-mark { font-size: 11px; line-height: 1; }
+.connection-banner[data-severity="info"] .connection-banner-mark { color: var(--muted); }
+.connection-banner[data-severity="warning"] .connection-banner-mark { color: #f85149; }
+.connection-banner-message { flex: 1; min-width: 0; }
+.connection-banner-repair { background: none; border: none; padding: 0;
+    color: var(--accent, #6aa3ff); font-size: 12px; cursor: pointer;
+    white-space: nowrap; text-decoration: underline; }
+
+/* --- desktop projection-freshness banner (RF-E4) ---------------------------
+   the desktop sibling of the connection banner: shown when a projection refresh
+   fails, with a retry that re-runs the failed loads. Chromeless while fresh. */
+.freshness-banner { display: flex; align-items: center; gap: 6px; padding: 6px 10px;
+    margin-bottom: 8px; font-size: 12px; border-radius: 4px; }
+.freshness-banner[data-severity="info"] { background: rgba(110, 163, 255, 0.12); color: var(--ink); }
+.freshness-banner[data-severity="warning"] { background: rgba(248, 81, 73, 0.14); color: var(--ink); }
+.freshness-banner-mark { font-size: 11px; line-height: 1; }
+.freshness-banner[data-severity="warning"] .freshness-banner-mark { color: #f85149; }
+.freshness-banner-message { flex: 1; min-width: 0; }
+.freshness-banner-retry { background: none; border: none; padding: 0;
+    color: var(--accent, #6aa3ff); font-size: 12px; cursor: pointer;
+    white-space: nowrap; text-decoration: underline; }
+
+/* --- durable resource listings (RF-E1: context sources + output catalog) --- */
+.context-drawer .resource-list, .output-catalog .resource-list { display: flex;
+    flex-direction: column; gap: 2px; }
+.resource-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px;
+    font-size: 12px; border-bottom: 1px solid var(--edge); }
+.resource-row.erased { opacity: 0.55; text-decoration: line-through; }
+/* UX-11: the cross-party review surface on a held output — its stakeholder parties
+   (provenance) with per-party consent, then a release affordance once cleared. */
+.output-review-hold, .output-review-cleared { flex-basis: 100%; display: flex; flex-wrap: wrap;
+    align-items: center; gap: 6px 10px; padding: 4px 6px 4px 22px;
+    border-left: 2px solid var(--warn, #c94); background: color-mix(in srgb, var(--warn, #c94) 8%, transparent); }
+.output-review-hold .hold-note, .output-review-cleared .hold-note { font-size: 11px; color: var(--warn, #c94); }
+.review-parties { display: flex; flex-wrap: wrap; gap: 4px 10px; list-style: none; margin: 0; padding: 0; }
+.review-party { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+.review-party.consented .party-id { opacity: 0.6; }
+.review-party .party-id { font-family: var(--mono, monospace); }
+.output-review-cleared { border-left-color: var(--accent, #6a8);
+    background: color-mix(in srgb, var(--accent, #6a8) 8%, transparent); }
+.badge.released { color: var(--accent, #6a8); border-color: var(--accent, #6a8); }
+.resource-kind { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); min-width: 56px; }
+.resource-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+.resource-availability { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.resource-availability[data-availability="available"] { color: var(--accent, #6aa3ff); }
+.resource-availability[data-availability="blocked"] { color: #f85149; }
+.resource-tombstone { font-size: 10px; color: #f85149; text-transform: uppercase; }
+.output-review, .output-export { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* --- the mobile flow harness (MOB-029): pairing → carousel → send ----------
+   the device's real journey composed from the committed islands. The pairing
+   and carousel stages fill the shell; the relay toggle stands in for the
+   platform reachability signal, and the log narrates the flow for the e2e. */
+.mobile-pairing-stage, .mobile-carousel-stage { display: flex; flex-direction: column;
+    height: 100%; min-height: 0; }
+.mobile-relay { display: flex; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--edge); }
+.mobile-relay button { background: var(--panel); border: 1px solid var(--edge);
+    color: var(--ink); font-size: 12px; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
+.mobile-log { margin: 0; padding: 6px 16px; list-style: none; font-size: 11px;
+    color: var(--muted); border-top: 1px solid var(--edge); max-height: 25vh; overflow: auto; }
+.mobile-log li { padding: 1px 0; }
+.mobile-nav, .mobile-files, .mobile-content { padding: 12px; }
+/* The mobile nav chat list (MOB-F1) + the chat-pane transcript (MOB-F2). */
+.mobile-nav-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.mobile-nav-chat { display: block; width: 100%; text-align: left; background: var(--panel);
+    border: 1px solid var(--edge); color: var(--ink); font-size: 13px; padding: 8px 10px;
+    border-radius: 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mobile-nav-chat:hover { border-color: var(--accent); }
+.mobile-nav-chat.current { border-color: var(--accent); color: var(--accent); }
+.mobile-file-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+.mobile-file { font-family: var(--mono); font-size: 13px; padding: 4px 6px; color: var(--ink); }
+.mobile-file.dir { color: var(--muted); }
+.mobile-chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.mobile-transcript { flex: 1; min-height: 0; overflow: auto; margin-bottom: 8px; }
+
+/* Enterprise admin console (M3, ADR 0043; surfaces B10–B16). */
+.admin-console { min-width: 540px; max-width: 720px; max-height: 82vh; overflow: auto; }
+.admin-section { border-top: 1px solid var(--edge); padding: 12px 0; }
+.admin-section:first-of-type { border-top: none; }
+.admin-section h4 { margin: 0 0 8px; font-size: 13px; letter-spacing: 0.04em; color: var(--accent); }
+.admin-section label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.admin-section label.admin-check { display: flex; align-items: center; gap: 8px; }
+.admin-section input, .admin-section select {
+    display: block; width: 100%; margin-top: 3px; padding: 6px 8px;
+    background: var(--bg); color: inherit; border: 1px solid var(--edge); border-radius: 4px;
+}
+.admin-section label.admin-check input { display: inline-block; width: auto; margin-top: 0; }
+.admin-row { display: flex; gap: 8px; }
+.member-list, .audit-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.member-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--edge); }
+.member-row .member-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-row select { width: auto; }
+.member-status, .audit-target { color: var(--muted); font-size: 11px; }
+.badge { font-size: 10px; padding: 1px 5px; border: 1px solid var(--edge); border-radius: 3px; color: var(--muted); }
+.admin-invite { display: flex; gap: 6px; align-items: center; }
+.admin-invite input, .admin-invite select { width: auto; flex: 1; }
+.admin-signin { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.admin-signin .muted { flex: 1; margin: 0; font-size: 12px; }
+.integration-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.integration-row { display: flex; gap: 8px; align-items: center; }
+.integration-label { min-width: 140px; font-size: 12px; color: var(--muted); }
+.integration-value { flex: 1; font-size: 12px; word-break: break-all; background: var(--bg); border: 1px solid var(--edge); border-radius: 3px; padding: 2px 5px; }
+.domain-verify { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.domain-verify input { flex: 1; width: auto; }
+.sso-wizard { max-width: 580px; }
+.wizard-steps { list-style: none; display: flex; gap: 12px; padding: 0; margin: 0 0 14px; font-size: 12px; flex-wrap: wrap; }
+.wizard-steps li { color: var(--muted); }
+.wizard-steps li.active { color: var(--fg); font-weight: 600; }
+.wizard-steps li.done { color: #3a9; }
+.wizard-pane { display: flex; flex-direction: column; gap: 8px; }
+.wizard-nav { display: flex; justify-content: space-between; margin-top: 14px; }
+.scim-token { display: block; word-break: break-all; background: var(--bg); border: 1px solid var(--edge);
+    border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; font-family: var(--mono, monospace); font-size: 11px; }
+.audit-row { display: flex; gap: 10px; padding: 3px 0; font-size: 11px; }
+.audit-actor { color: var(--accent); }
+.audit-action { flex: 1; }
+.admin-section .muted, .muted { color: var(--muted); }
+
+/* Your-account panel (ACCT-1) — reuses the admin-console section/list styles. */
+.account-panel { min-width: 460px; max-width: 600px; max-height: 80vh; overflow: auto; }
+
+/* UX-3: inline notice for the agent's pending approvals (held until you grant). */
+.approval-notice {
+    margin: 6px 0; padding: 8px 10px; border: 1px solid var(--warn);
+    border-radius: 6px; background: var(--edge); font-size: 13px;
+}
+.approval-notice strong { color: var(--warn); }
+.approval-notice ul { margin: 4px 0 2px; padding-left: 18px; }

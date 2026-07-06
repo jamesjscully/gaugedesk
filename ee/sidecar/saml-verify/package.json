@@ -1,0 +1,24 @@
+{
+  "name": "gaugewright-saml-verify",
+  "version": "0.0.0",
+  "private": true,
+  "license": "BUSL-1.1",
+  "type": "module",
+  "description": "SAML SP verify sidecar (M3 ID-2): verify a SAML Response over stdin, emit {ok,subject,attributes} on stdout. Runs on the bundled bun/node runtime; correctness from @node-saml/node-saml (xml-crypto C14N+dsig). Keeps the Rust core OpenSSL-free.",
+  "gaugewright": {
+    "repoTarget": "source-available-enterprise",
+    "sourcePosture": "source-available-enterprise",
+    "licenseTarget": "undecided-source-available",
+    "dependencyPolicy": "May depend on open-source app/identity contracts and SAML verifier libraries; must not depend on private managed-service infra."
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@node-saml/node-saml": "^5.0.1"
+  },
+  "devDependencies": {
+    "xml-crypto": "^6.0.0",
+    "selfsigned": "^2.4.1"
+  }
+}
