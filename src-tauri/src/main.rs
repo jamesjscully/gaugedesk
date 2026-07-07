@@ -15,10 +15,11 @@ fn main() {
         // Native OS folder picker for "add files" (the webview opens a real
         // folder browser; the chosen absolute path is ingested over HTTP).
         .plugin(tauri_plugin_dialog::init())
-        // Self-update (SELFHOST-1 / D-RELEASE-LANES): checks the GitHub Release
-        // `latest.json` against the pubkey in tauri.conf.json (plugins.updater).
-        // Registration only — a check/apply call is a follow-on UX; the release
-        // lane signs update artifacts with the matching TAURI_SIGNING_PRIVATE_KEY.
+        // Self-update (SELFHOST-1 / D-RELEASE-LANES, v0.2.1): checks the GitHub
+        // Release `latest.json` against the pubkey in tauri.conf.json
+        // (plugins.updater); the release lane signs update artifacts with the
+        // matching TAURI_SIGNING_PRIVATE_KEY. The startup check/prompt/apply runs
+        // in `check_for_update`, spawned from the setup hook below.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Self-contained runtime (SELFHOST-1): a packaged bundle vendors Pi +
@@ -99,10 +100,79 @@ fn main() {
                     }
                 }
             }
+
+            // Self-update (v0.2.1): in a packaged release build, check the signed
+            // GitHub Release `latest.json` on startup and, if a newer version is
+            // available, offer to download + install + relaunch. Best-effort — any
+            // failure degrades to a logged no-op, so a broken or unreachable update
+            // never blocks launch. `tauri dev` (debug) skips it; opt out of a real
+            // build with GAUGEWRIGHT_NO_AUTOUPDATE (e.g. centrally-managed installs).
+            #[cfg(not(debug_assertions))]
+            if std::env::var_os("GAUGEWRIGHT_NO_AUTOUPDATE").is_none() {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    check_for_update(handle).await;
+                });
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running gaugewright desktop");
+}
+
+/// Startup self-update (v0.2.1). Compare the running version against the signed
+/// GitHub Release `latest.json` (endpoint + pubkey in `tauri.conf.json`); on a
+/// newer version, prompt, and if accepted, download + install and relaunch into
+/// it. Every failure path is a logged no-op so a broken or unreachable update
+/// never blocks launch. Release-only (`tauri dev` builds are unsigned and skip
+/// this via the `cfg` at the call site).
+#[cfg(not(debug_assertions))]
+async fn check_for_update(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = match app.updater() {
+        Ok(updater) => updater,
+        Err(e) => {
+            eprintln!("[gaugewright] updater unavailable: {e}");
+            return;
+        }
+    };
+    let update = match updater.check().await {
+        Ok(Some(update)) => update,
+        Ok(None) => return, // already on the latest version
+        Err(e) => {
+            eprintln!("[gaugewright] update check failed: {e}");
+            return;
+        }
+    };
+
+    let accepted = app
+        .dialog()
+        .message(format!(
+            "GaugeBench {} is available (you have {}). Download it and restart to update?",
+            update.version, update.current_version
+        ))
+        .title("Update available")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Update".to_string(),
+            "Later".to_string(),
+        ))
+        .blocking_show();
+    if !accepted {
+        return; // "Later" — check again next launch
+    }
+
+    if let Err(e) = update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+    {
+        eprintln!("[gaugewright] update download/install failed: {e}");
+        return;
+    }
+    // Installed — relaunch into the new version.
+    app.restart();
 }
 
 /// The OS-specific executable name (`pi` / `pi.exe`). Tauri can't tell us the

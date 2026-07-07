@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "directories",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-boundary"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gaugewright-core",
  "serde",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ciborium",
  "hex",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gaugewright-app",
  "serde_json",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-harness"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "tracing",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-pi-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gaugewright-core",
  "gaugewright-harness",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gaugewright-core",
  "rusqlite",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-tracker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-workspace"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "gdk"

@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "directories",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-boundary"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gaugewright-core",
  "proptest",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ciborium",
  "hex",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-ee"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-harness"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-pi-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gaugewright-core",
  "gaugewright-harness",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gaugewright-core",
  "rusqlite",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-tracker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-workspace"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tempfile",
 ]
