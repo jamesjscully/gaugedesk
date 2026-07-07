@@ -58,7 +58,28 @@ export function TaskBar(props: {
                     fallback={<span class="status">no reviews pending</span>}
                 >
                     {(t: HumanTask) => {
-                        const active = () => props.selected === t.id;
+                        // Onboarding issue (ADR 0075): its id is a whip work-item
+                        // id (`WS-N`), not an engagement, so it neither jumps to a
+                        // chat nor offers a keep — it's a first-run checklist pill.
+                        if (t.kind === "issue") {
+                            const title = () => displayChatTitle(t.title);
+                            return (
+                                <span
+                                    class="task-tab task-issue"
+                                    data-task={t.id}
+                                    data-task-kind="issue"
+                                    role="listitem"
+                                    aria-label={`onboarding step: ${title()}`}
+                                    title={title()}
+                                >
+                                    <span class="task-kind">onboarding</span>
+                                    <span class="task-title">{title()}</span>
+                                </span>
+                            );
+                        }
+                        // Review task: id is an EngagementId (narrowed by kind).
+                        const engagement = t.id as EngagementId;
+                        const active = () => props.selected === engagement;
                         const color = agentColor(t.agent);
                         // One canonical title everywhere (#4): never leak the raw
                         // "new chat" placeholder — show the same "Untitled" the tree
@@ -80,9 +101,9 @@ export function TaskBar(props: {
                                 title={`Open "${title()}" to review the agent's work — keep it or discard it`}
                                 style={color ? { "border-left": `3px solid ${color}` } : undefined}
                                 onKeyDown={(e) => {
-                                    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setArming(null); props.onSelect(t.id); }
+                                    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setArming(null); props.onSelect(engagement); }
                                 }}
-                                onClick={() => { setArming(null); props.onSelect(t.id); }}
+                                onClick={() => { setArming(null); props.onSelect(engagement); }}
                             >
                                 <span class="task-kind">review</span>
                                 <span class="task-title">{title()}</span>
@@ -99,25 +120,25 @@ export function TaskBar(props: {
                                         fallback={
                                             <button
                                                 class="task-keep"
-                                                classList={{ confirming: arming() === t.id }}
+                                                classList={{ confirming: arming() === engagement }}
                                                 data-task-keep
-                                                data-arming={arming() === t.id ? "1" : undefined}
+                                                data-arming={arming() === engagement ? "1" : undefined}
                                                 title={
-                                                    arming() === t.id
+                                                    arming() === engagement
                                                         ? "Click again to keep this into the shared copy — this can't be undone"
                                                         : "Keep this work into the shared copy"
                                                 }
                                                 onClick={(e) => {
                                                     e.stopPropagation();
-                                                    if (arming() !== t.id) {
-                                                        setArming(t.id);
+                                                    if (arming() !== engagement) {
+                                                        setArming(engagement);
                                                         return;
                                                     }
                                                     setArming(null);
-                                                    props.onComplete(t.id);
+                                                    props.onComplete(engagement);
                                                 }}
                                             >
-                                                {arming() === t.id ? "confirm keep" : "✓ keep"}
+                                                {arming() === engagement ? "confirm keep" : "✓ keep"}
                                             </button>
                                         }
                                     >
@@ -127,7 +148,7 @@ export function TaskBar(props: {
                                             title="This changes the assistant's permissions — open the review to see what changed before keeping"
                                             onClick={(e) => {
                                                 e.stopPropagation();
-                                                props.onSelect(t.id);
+                                                props.onSelect(engagement);
                                             }}
                                         >
                                             review →

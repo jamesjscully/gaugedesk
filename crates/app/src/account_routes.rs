@@ -37,6 +37,10 @@ pub fn routes() -> Router<SharedWorkbench> {
             get(get_credentials).post(post_credential),
         )
         .route("/account/credentials/:provider", delete(delete_credential))
+        // First-run gate signal (ADR 0075 Phase 0): whether the default runtime
+        // actually needs an LLM credential. False under the scripted fake agent
+        // (dev/e2e), so the first-run overlay never blocks a no-credential test.
+        .route("/account/onboarding-status", get(get_onboarding_status))
         // OpenAI codex OAuth link (LLM-1, ADR 0062): status + start-the-flow. The
         // credential lands in Pi's own auth store (read by the engine's default
         // provider), distinct from the BYOK sealed credentials above.
@@ -48,6 +52,20 @@ pub fn routes() -> Router<SharedWorkbench> {
             "/account/oauth/openai-codex/start",
             post(codex_oauth::post_codex_login_start),
         )
+}
+
+/// Whether a first-run user must connect an LLM credential before the runtime
+/// can run a turn (ADR 0075 Phase 0). Mirrors the runtime selection in
+/// `harness_select::factory_for_turn`: the scripted fake agent (selected by
+/// `GAUGEWRIGHT_FAKE_AGENT`, used in dev/e2e) needs no credential, so the gate is
+/// off there; the real Pi runtime needs one, so it's on.
+pub async fn get_onboarding_status() -> impl IntoResponse {
+    let credential_required = std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_err();
+    (
+        StatusCode::OK,
+        Json(json!({ "credential_required": credential_required })),
+    )
+        .into_response()
 }
 
 // ---- devices (the trusted-devices registry) ------------------------------
@@ -182,6 +200,9 @@ pub async fn post_credential(
     if let Err(e) = wb.upsert_account_credential(provider.clone(), sealed) {
         return err_response(e);
     }
+    // Advance the onboarding checklist (ADR 0075 Phase 2). Best-effort — the
+    // credential is already saved; the provider name is not a secret.
+    wb.advance_onboarding("credential", &json!({ "provider": provider }).to_string());
     (
         StatusCode::OK,
         Json(json!({ "provider": provider, "linked": true })),

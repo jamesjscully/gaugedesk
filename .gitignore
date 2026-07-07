@@ -33,6 +33,9 @@ web/blob-report/
 # Local control-plane state (git instance + event store)
 .gaugewright/
 gaugewright.db
+# Per-boundary whip tracker stores (ADR 0075). Real runs write these under the
+# platform data dir; this guards against a relative-root run leaving them in-tree.
+trackers/
 # legacy data dir (pre-rename), kept ignored so orphaned runtime state stays out of git
 .untie/
 untie.db

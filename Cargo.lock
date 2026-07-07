@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "directories",
@@ -502,6 +502,7 @@ dependencies = [
  "gaugewright-harness",
  "gaugewright-pi-bridge",
  "gaugewright-store",
+ "gaugewright-tracker",
  "gaugewright-workspace",
  "getrandom 0.2.17",
  "hex",
@@ -527,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-boundary"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "gaugewright-core",
  "proptest",
@@ -537,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "hex",
@@ -548,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-ee"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -571,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-harness"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -580,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-pi-bridge"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "gaugewright-core",
  "gaugewright-harness",
@@ -592,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-store"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "gaugewright-core",
  "rusqlite",
@@ -601,8 +602,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gaugewright-tracker"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "whipplescript-kernel",
+ "whipplescript-store",
+]
+
+[[package]]
 name = "gaugewright-workspace"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "tempfile",
 ]
@@ -2053,6 +2064,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "whipplescript-core"
+version = "0.2.0"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=737bbc092b9a2cf5bb21d94b53b11c4124645387#737bbc092b9a2cf5bb21d94b53b11c4124645387"
+
+[[package]]
+name = "whipplescript-kernel"
+version = "0.2.0"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=737bbc092b9a2cf5bb21d94b53b11c4124645387#737bbc092b9a2cf5bb21d94b53b11c4124645387"
+dependencies = [
+ "serde",
+ "serde_json",
+ "whipplescript-core",
+ "whipplescript-parser",
+ "whipplescript-store",
+]
+
+[[package]]
+name = "whipplescript-parser"
+version = "0.2.0"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=737bbc092b9a2cf5bb21d94b53b11c4124645387#737bbc092b9a2cf5bb21d94b53b11c4124645387"
+dependencies = [
+ "whipplescript-core",
+]
+
+[[package]]
+name = "whipplescript-store"
+version = "0.2.0"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=737bbc092b9a2cf5bb21d94b53b11c4124645387#737bbc092b9a2cf5bb21d94b53b11c4124645387"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "whipplescript-core",
 ]
 
 [[package]]

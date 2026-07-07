@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use gaugewright_core::ids::AuthorityId;
 use gaugewright_store::Store;
+use gaugewright_tracker::WhipTrackerHandle;
 use gaugewright_workspace::{ChatWorkspace, GitWorkspaceProvider, Workspace, WorkspaceProvider};
 use tokio::sync::broadcast;
 
@@ -27,6 +28,11 @@ pub(crate) type WorkspaceProviders = BTreeMap<&'static str, Arc<dyn WorkspacePro
 
 /// The git substrate's registry key.
 const GIT_SUBSTRATE: &str = "git";
+
+/// The account/global trust boundary — the one scope the v1 onboarding tracker
+/// lives on (ADR 0075 §2): no project, no client-tainted data, bottom taint.
+/// Per-project boundaries (which key by `project::<id>`) are deferred to Phase 4.
+pub(crate) const ACCOUNT_GLOBAL_BOUNDARY: &str = "account::global";
 
 /// The substrate id every instance resolves in SUB-0 — hardcoded, in-memory
 /// only (the durable per-instance substrate stamp + migration of existing
@@ -73,6 +79,11 @@ pub struct Workbench {
     pub(crate) sessions: BTreeMap<String, Box<dyn gaugewright_harness::Harness>>,
     /// One remote harness per remotely placed engagement (ADR 0020/0031).
     pub(crate) remote_sessions: BTreeMap<String, Box<dyn gaugewright_harness::RemoteHarness>>,
+    /// One embedded WhippleScript tracker runtime per trust boundary (ADR 0075),
+    /// keyed by boundary id (`account::global` in v1). Spawned on demand and held
+    /// for the workbench's lifetime, mirroring `sessions`. Structural isolation:
+    /// each boundary gets its own store files under `<root>/trackers/<id>/`.
+    pub(crate) tracker_runtimes: BTreeMap<String, WhipTrackerHandle>,
     /// The trusted reproducible-build measurement allow-list (ATTEST-10).
     pub(crate) measurements: MeasurementStore,
     /// The sealed-key release service (ATTEST-5/-6).
@@ -164,6 +175,10 @@ pub(crate) fn build_workbench_with_content_keywrap(
     wb.restore_startup_local_projections();
     wb.apply_startup_root(root);
     wb.activate_configured_authority();
+    // Stand up + seed the account-global onboarding tracker (ADR 0075). Runs
+    // after the root is applied so the tracker's store files resolve under it;
+    // best-effort, so a tracker failure never aborts workbench startup.
+    wb.ensure_onboarding_seeded();
     federation::activate_configured_federation(&mut wb)?;
     // Enterprise SSO activation (`ID-3`) moved with the ee band (`gaugewright-ee`,
     // SPLIT-1): the ee/hosted compositions call `activate_configured_idp` right
@@ -186,6 +201,7 @@ impl Workbench {
             streams: BTreeMap::new(),
             sessions: BTreeMap::new(),
             remote_sessions: BTreeMap::new(),
+            tracker_runtimes: BTreeMap::new(),
             measurements: MeasurementStore::new(),
             sealed_keys: LoopbackKeyReleaseService::new(),
             attestation_mode: AttestationMode::RealRequired,
@@ -216,5 +232,32 @@ impl Workbench {
     /// The provider that constructs/opens this instance's workspace.
     pub(crate) fn workspace_provider(&self, inst_id: &str) -> Arc<dyn WorkspaceProvider> {
         provider_for(&self.providers, inst_id)
+    }
+
+    /// Get (spawning on first use) the embedded whip tracker for `boundary_id`.
+    /// Lazy, mirroring the `sessions` harness map: the store files under
+    /// `<root>/trackers/<boundary_id>/` are created on first touch and the handle
+    /// is held for the workbench's lifetime. Structural isolation is the only
+    /// isolation (ADR 0075 §1); callers must pass a boundary the acting authority
+    /// owns.
+    pub(crate) fn tracker_for_boundary(
+        &mut self,
+        boundary_id: &str,
+    ) -> gaugewright_tracker::TrackerResult<&mut WhipTrackerHandle> {
+        if !self.tracker_runtimes.contains_key(boundary_id) {
+            let handle = WhipTrackerHandle::open(&self.root, boundary_id)?;
+            self.tracker_runtimes.insert(boundary_id.to_owned(), handle);
+        }
+        Ok(self
+            .tracker_runtimes
+            .get_mut(boundary_id)
+            .expect("tracker just inserted"))
+    }
+
+    /// The v1 account-global onboarding tracker (ADR 0075 §2).
+    pub(crate) fn account_tracker(
+        &mut self,
+    ) -> gaugewright_tracker::TrackerResult<&mut WhipTrackerHandle> {
+        self.tracker_for_boundary(ACCOUNT_GLOBAL_BOUNDARY)
     }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "gaugewright-tracker"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Per-boundary WhippleScript tracker runtime (ADR 0075): a RuntimeKernel + WorkItemStore embedded per trust boundary for the onboarding/issue surface."
+
+[dependencies]
+# WhippleScript is embedded, not shelled out (ADR 0075 §1). Pinned to a commit
+# on the public whipplescript mirror (GaugeWright ADR 0010: whipplescript-src
+# private, whipplescript public/MIT). The Rust API is "internal-stability"
+# (whip docs/rust-api.md), pre-1.0 with no semver contract, so we pin a rev and
+# absorb churn deliberately. A git dep checks the rev out into cargo's cache; the
+# HTTPS URL is public, so the public gaugebench mirror's CI (and any external
+# clone) can fetch it. rev 737bbc09 carries whip-src @ 987cf15 (workspace 0.2.0,
+# tag v0.2.0 on the mirror). codex/claude provider adapters are dropped
+# (default-features = false): the tracker needs only the native rusqlite store +
+# the sans-IO kernel, never an agent turn.
+whipplescript-kernel = { git = "https://github.com/jamesjscully/whipplescript", rev = "737bbc092b9a2cf5bb21d94b53b11c4124645387", default-features = false, features = ["native"] }
+whipplescript-store = { git = "https://github.com/jamesjscully/whipplescript", rev = "737bbc092b9a2cf5bb21d94b53b11c4124645387", default-features = false, features = ["native"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

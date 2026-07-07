@@ -98,6 +98,15 @@ export async function codexStatus(
     return { linked: Boolean(o.linked), expires: o.expires ?? null, expired: Boolean(o.expired) };
 }
 
+/** Whether a first-run user must connect an LLM credential before the runtime can
+ *  run a turn (ADR 0075 Phase 0). False under the scripted fake agent (dev/e2e),
+ *  so the first-run overlay never gates a no-credential test run. Defaults to
+ *  `true` (gate on) if the call fails — fail toward showing the setup step. */
+export async function onboardingStatus(json: RouteJson): Promise<{ credentialRequired: boolean }> {
+    const o = (await json("GET", "/account/onboarding-status")) as { credential_required?: boolean };
+    return { credentialRequired: o.credential_required !== false };
+}
+
 /** Start the codex OAuth link; returns the authorize URL to open in a browser. The
  *  server's helper runs the callback server and writes the credential on success —
  *  poll {@link codexStatus} to see it land. */

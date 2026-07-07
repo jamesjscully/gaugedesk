@@ -80,6 +80,7 @@ import {
     searchWithFile,
     SessionProvider,
     Shelf,
+    FirstRunOverlay,
     TaskBar,
     tapGesture,
     thinkingLevelsFor,
@@ -261,6 +262,31 @@ export function App() {
     // shows up on the next chat open). Failures degrade to "nothing linked" → just Default.
     const [linkedCreds] = createResource(selected, () => api.accountCredentials().catch(() => []));
     const [codexCred] = createResource(selected, () => api.codexStatus().catch(() => null));
+    // First-run credential gate (ADR 0075 Phase 0): a startup-time (not selection-
+    // keyed) read of whether *any* LLM credential is linked. `undefined` while
+    // loading — we never flash the welcome before we know. `refetch*` re-check
+    // after the overlay links one, which flips `hasAnyCredential` and dismisses it.
+    const [startupCreds, { refetch: refetchStartupCreds }] = createResource(() =>
+        api.accountCredentials().catch(() => []),
+    );
+    const [startupCodex, { refetch: refetchStartupCodex }] = createResource(() =>
+        api.codexStatus().catch(() => null),
+    );
+    // Whether the default runtime actually needs a credential (server truth): off
+    // under the scripted fake agent (dev/e2e), so the overlay never blocks a
+    // no-credential test. Fail toward showing setup if the probe fails.
+    const [credentialRequired] = createResource(() =>
+        api.onboardingStatus().then((s) => s.credentialRequired).catch(() => true),
+    );
+    const [firstRunDismissed, setFirstRunDismissed] = createSignal(false);
+    const hasAnyCredential = (): boolean | undefined => {
+        const creds = startupCreds();
+        const codex = startupCodex();
+        if (creds === undefined || codex === undefined) return undefined; // still loading
+        return creds.some((c) => c.linked) || Boolean(codex?.linked);
+    };
+    const showFirstRun = () =>
+        credentialRequired() === true && hasAnyCredential() === false && !firstRunDismissed();
     // The operator's curated "which models show" preference (managed in the Account panel,
     // persisted in the account-settings KV). `null` = never curated → default-visible subset.
     const [acctSettings] = createResource(selected, () => api.accountSettings().catch((): Record<string, string> => ({})));
@@ -1787,6 +1813,19 @@ export function App() {
     // inactive layout never builds (no double-mounted FacetBrowser / Workspace).
     return (
         <SessionProvider value={desktopSession}>
+            {/* First-run credential gate (ADR 0075 Phase 0): overlays both shells
+                until a model is connected, then dismisses itself. */}
+            <Show when={showFirstRun()}>
+                <FirstRunOverlay
+                    api={api}
+                    productName="GaugeBench"
+                    onConnected={() => {
+                        void refetchStartupCreds();
+                        void refetchStartupCodex();
+                    }}
+                    onDismiss={() => setFirstRunDismissed(true)}
+                />
+            </Show>
             <Show when={isMobile()} fallback={<DesktopShell />}>
                 <MobileShell />
             </Show>

@@ -1919,10 +1919,14 @@ async fn task_queue_lists_a_pending_review_then_clears_on_keep() {
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"q1"}"#)).await;
 
-    // no work yet → empty queue.
+    // no work yet → no review task. (A fresh workbench seeds onboarding `issue`
+    // tasks, ADR 0075; this lifecycle is about `review` tasks specifically.)
     let (s, body) = send(&app, "GET", "/tasks", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(body, r#"{"tasks":[]}"#, "got {body}");
+    assert!(
+        !body.contains(r#""kind":"review""#),
+        "no review yet: {body}"
+    );
 
     // a finished turn leaves a clean diff → a review task queues.
     send(&app, "POST", "/chats/q1/task", Some(r#"{"prompt":"go"}"#)).await;
@@ -1941,7 +1945,10 @@ async fn task_queue_lists_a_pending_review_then_clears_on_keep() {
     )
     .await;
     let (_, body) = send(&app, "GET", "/tasks", None).await;
-    assert_eq!(body, r#"{"tasks":[]}"#, "cleared: {body}");
+    assert!(
+        !body.contains(r#""kind":"review""#),
+        "review cleared: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1967,4 +1974,65 @@ async fn admitted_run_events_reach_the_live_stream() {
     assert!(phases[0].contains("Requested"));
     assert!(phases[1].contains("Admitted"));
     assert!(phases[2].contains("Running"));
+}
+
+/// The onboarding checklist (ADR 0075 Phase 2/3) is seeded on a fresh workbench,
+/// surfaces as `issue` tasks in the unified `/tasks` projection, and advances
+/// when the matching app event fires — here, connecting an LLM credential closes
+/// the "credential" step end-to-end through the HTTP surface.
+#[tokio::test]
+async fn onboarding_checklist_appears_and_advances_on_credential() {
+    // Onboarding is gated off under the fake agent; pin the real runtime (and
+    // serialize against fake-agent tests) so the checklist actually seeds.
+    let _real = crate::test_support::real_agent_env();
+    let dir = tempfile::tempdir().unwrap();
+    let wb = crate::workbench_state::build_workbench(dir.path()).unwrap();
+    let app = open_control_plane(Arc::new(Mutex::new(wb)));
+
+    // The seeded onboarding steps show up as `issue` tasks, each with an assignee.
+    let (status, body) = send(&app, "GET", "/tasks", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let tasks = v["tasks"].as_array().unwrap();
+    let issue_titles = |v: &serde_json::Value| -> Vec<String> {
+        v["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["kind"] == "issue")
+            .filter_map(|t| t["title"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let titles = issue_titles(&v);
+    assert!(
+        titles.iter().any(|t| t == "Connect a model"),
+        "expected the credential onboarding step, got {titles:?}"
+    );
+    assert!(titles.iter().any(|t| t == "Create a project"));
+    assert!(
+        tasks.iter().all(|t| t["assignee"].is_string()),
+        "every task carries an assignee authority (ADR 0075 §4)"
+    );
+
+    // Connecting a credential fires app.credential_connected, which closes the step.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(r#"{"provider":"anthropic","token":"sk-test-xyz"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let titles = issue_titles(&v);
+    assert!(
+        !titles.iter().any(|t| t == "Connect a model"),
+        "the credential step should be closed after linking, got {titles:?}"
+    );
+    assert!(
+        titles.iter().any(|t| t == "Create a project"),
+        "unrelated onboarding steps stay open"
+    );
 }

@@ -178,13 +178,24 @@ export function isWorkspaceRecord(v: unknown): v is WorkspaceChange["record"] {
     return typeof v === "string" && (WORKSPACE_RECORDS as readonly string[]).includes(v);
 }
 
-/** One item in the human task queue (the top bar) — M0 sources `review` tasks
- *  from chats awaiting a keep/reject. */
+/** The kinds of task the top bar surfaces (ADR 0075 §5): a clean-merge chat
+ *  awaiting keep/reject (`review`), or an onboarding checklist item from the
+ *  per-boundary whip tracker (`issue`). */
+export type TaskKind = "review" | "issue";
+
+/** One item in the human task queue (the top bar). `review` tasks come from
+ *  chats awaiting a keep/reject; `issue` tasks come from the account-global whip
+ *  tracker (onboarding). Note `id` is an {@link EngagementId} for `review` tasks
+ *  but a whip work-item id (`WS-N`) for `issue` tasks — narrow on `kind` before
+ *  treating it as an engagement. */
 export interface HumanTask {
-    readonly id: EngagementId;
+    readonly id: string;
     readonly title: string;
     readonly agent: string;
-    readonly kind: "review";
+    readonly kind: TaskKind;
+    /** The authority this task is assigned to — v1: the acting/owner authority.
+     *  Undefined = unassigned / visible to the boundary owner (ADR 0075 §4). */
+    readonly assignee?: string;
 }
 
 const parseChat = (c: { id: string; title: string; kind?: ChatKind; workstream?: string | null; placement?: string | null; changes?: boolean; conflict?: boolean }): ChatNode => ({

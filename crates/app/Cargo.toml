@@ -21,6 +21,10 @@ gaugewright-workspace = { path = "../workspace" }
 gaugewright-boundary = { path = "../boundary" }
 gaugewright-harness = { path = "../harness" }
 gaugewright-pi-bridge = { path = "../pi-bridge" }
+# The per-boundary WhippleScript tracker runtime (ADR 0075): embeds whip's
+# RuntimeKernel + WorkItemStore for the onboarding/issue surface projected into
+# the task bar.
+gaugewright-tracker = { path = "../tracker" }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }

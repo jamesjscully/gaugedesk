@@ -75,12 +75,20 @@ export async function getWorkspaceCarriage(
     return parseProjectionCarriage(raw, (v) => parseWorkspace(v));
 }
 
-/** The human task queue (top bar): review-needed work, current-first. */
+/** The human task queue (top bar): onboarding issues + review-needed work.
+ *  `review` ids are engagement ids; `issue` ids are whip work-item ids (`WS-N`),
+ *  so we keep `id` a raw string here and narrow on `kind` at the use site. */
 export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask[]> {
     const o = (await transport.json("GET", "/tasks")) as {
-        tasks: { id: string; title: string; agent: string; kind: "review" }[];
+        tasks: { id: string; title: string; agent: string; kind: string; assignee?: string }[];
     };
-    return o.tasks.map((t) => ({ id: engagementId(t.id), title: t.title, agent: t.agent, kind: t.kind }));
+    return o.tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        agent: t.agent,
+        kind: t.kind === "issue" ? "issue" : "review",
+        assignee: t.assignee,
+    }));
 }
 
 /** Content search across chat transcripts. */

@@ -153,10 +153,12 @@ export function MobileApp(): JSX.Element {
         setQueueOpen(false);
         void selectEngagement(id);
     }
-    // The badge tap jumps to the *current* (first) task; a no-op on an empty queue.
+    // The badge tap jumps to the *current* (first) navigable task; a no-op on an
+    // empty queue. Onboarding `issue` tasks (ADR 0075) carry a whip work-item id,
+    // not an engagement, so they are skipped here — only `review` tasks jump.
     function jumpToCurrentTask() {
-        const first = (tasks() ?? [])[0];
-        if (first) jumpToTask(first.id);
+        const first = (tasks() ?? []).find((t) => t.kind === "review");
+        if (first) jumpToTask(first.id as EngagementId);
     }
 
     // Load (or switch to) a chat: subscribe its transcript and jump to the Chat

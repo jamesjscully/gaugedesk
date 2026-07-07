@@ -1605,8 +1605,44 @@ impl Workbench {
         snippet.replace('\n', " ")
     }
 
+    /// The unified task-bar projection (ADR 0075 §3/§5): onboarding checklist
+    /// `issue` tasks from the account-global whip tracker, followed by the
+    /// existing clean-merge `review` tasks. It owns no truth — it joins the whip
+    /// issue (content) with the acting authority (the v1 assignee). Every task
+    /// carries `kind` ∈ {`issue`, `review`} and an `assignee` authority.
     pub(crate) fn task_queue_value(&self) -> serde_json::Value {
-        let mut tasks: Vec<(i64, serde_json::Value)> = Vec::new();
+        // Solo v1: everything is assigned to the boundary owner (the acting
+        // authority). A future multi-user pass assigns per-authority and filters
+        // (ADR 0075 §4, deferred).
+        let assignee = self.authority.as_str();
+
+        // Onboarding issues first — the active first-run guidance. `list_items`
+        // returns them in filing order (WS-1, WS-2, …), which is checklist order.
+        let mut tasks: Vec<serde_json::Value> = Vec::new();
+        if let Some(tracker) = self
+            .tracker_runtimes
+            .get(crate::workbench_state::ACCOUNT_GLOBAL_BOUNDARY)
+        {
+            match tracker.list_items(Some(crate::onboarding::ONBOARDING_QUEUE), Some("open")) {
+                Ok(items) => {
+                    for item in items {
+                        tasks.push(serde_json::json!({
+                            "id": item.id,
+                            "title": item.title,
+                            "agent": "",
+                            "kind": "issue",
+                            "assignee": assignee,
+                        }));
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "task queue: could not list onboarding items");
+                }
+            }
+        }
+
+        // Review tasks: clean-merge chats awaiting keep/reject, current-first.
+        let mut reviews: Vec<(i64, serde_json::Value)> = Vec::new();
         for chat in self.library.chats.values() {
             if !self.engagement_index.contains_key(&chat.id) {
                 continue;
@@ -1624,19 +1660,22 @@ impl Workbench {
                     .and_then(|instance| self.library.agents.get(&instance.agent_id))
                     .map(|agent| agent.name.clone())
                     .unwrap_or_default();
-                tasks.push((
+                reviews.push((
                     chat.created_position,
                     serde_json::json!({
                         "id": chat.id,
                         "title": chat.title,
                         "agent": agent,
                         "kind": "review",
+                        "assignee": assignee,
                     }),
                 ));
             }
         }
-        tasks.sort_by_key(|(position, _)| std::cmp::Reverse(*position));
-        serde_json::json!({ "tasks": tasks.into_iter().map(|(_, task)| task).collect::<Vec<_>>() })
+        reviews.sort_by_key(|(position, _)| std::cmp::Reverse(*position));
+        tasks.extend(reviews.into_iter().map(|(_, task)| task));
+
+        serde_json::json!({ "tasks": tasks })
     }
 
     fn pairing_status_json(state: &BoundaryState) -> serde_json::Value {

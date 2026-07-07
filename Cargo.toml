@@ -9,14 +9,14 @@
 # See specs/implementation/backend-stack.md and mvp-plan.md.
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/app", "ee/app"]
+members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/app", "ee/app"]
 # The Tauri desktop shell is its own workspace (needs system webkit/CLI to build);
 # excluded so `cargo test` over the backend stays self-contained.
 exclude = ["src-tauri"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.1"
+version = "0.2.0"
 # The platform default (ADR 0069 / SPLIT-5). Crates that are not Apache
 # override explicitly: ee/app is BUSL-1.1.
 license = "Apache-2.0"

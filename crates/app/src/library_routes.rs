@@ -400,6 +400,9 @@ pub async fn create_project(
     // visible placements alongside it.
     let placement =
         place_archetype_with_id(&mut wb, &id, DEFAULT_AGENT, &general_placement_id(&id)).ok();
+    // Advance the onboarding checklist (ADR 0075 Phase 2): the user created their
+    // first real project. Best-effort; the project already exists.
+    wb.advance_onboarding("project", &json!({ "project": id }).to_string());
     (
         StatusCode::CREATED,
         Json(json!({ "id": id, "name": body.name, "placement": placement })),

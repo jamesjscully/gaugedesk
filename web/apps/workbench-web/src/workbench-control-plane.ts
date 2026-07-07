@@ -501,6 +501,10 @@ export class WorkbenchControlPlane {
         return accountClient.codexStatus(this.routeJson());
     }
 
+    onboardingStatus(): Promise<{ credentialRequired: boolean }> {
+        return accountClient.onboardingStatus(this.routeJson());
+    }
+
     codexLoginStart(): Promise<{ url: string }> {
         return accountClient.codexLoginStart(this.routeJson());
     }
