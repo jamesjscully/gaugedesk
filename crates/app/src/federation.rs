@@ -4964,11 +4964,11 @@ mod handoff_routes_tests {
         // active member — an anonymous caller is `401`, not admitted. A valid member bearer is let
         // through (it reaches the "no pending handoff" `404`, past the auth gate). Solo mode is
         // covered by the other accept tests, which POST with no bearer and still proceed.
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
         use crate::identity::LoopbackIdentityProvider;
         use crate::library::RecordOp;
         use crate::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
         use gaugewright_core::abac::AuthorityAttributes;
         use gaugewright_core::ids::AuthorityId;
         use std::sync::{Arc, Mutex};
@@ -4993,7 +4993,11 @@ mod handoff_routes_tests {
             team: None,
         };
         wb.store_mut()
-            .append_record(ORG_SCOPE, "membership", &serde_json::to_string(&member).unwrap())
+            .append_record(
+                ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&member).unwrap(),
+            )
             .unwrap();
 
         let app = featured_routes(true).with_state(Arc::new(Mutex::new(wb)));
@@ -5005,7 +5009,8 @@ mod handoff_routes_tests {
             if let Some(t) = bearer {
                 b = b.header("authorization", format!("Bearer {t}"));
             }
-            b.body(Body::from(r#"{"project":"p1","source":"peer"}"#)).unwrap()
+            b.body(Body::from(r#"{"project":"p1","source":"peer"}"#))
+                .unwrap()
         };
 
         // No bearer ⇒ refused before any handoff work (fail-closed).

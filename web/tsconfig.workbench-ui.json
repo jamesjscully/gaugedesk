@@ -9,7 +9,7 @@
     "packages/workbench-ui/src/AuditTimeline.tsx",
     "packages/workbench-ui/src/access-request.ts",
     "packages/workbench-ui/src/audit-activity.ts",
-    "packages/workbench-ui/src/Carousel.tsx",
+    "packages/workbench-ui/src/CarouselIsland.tsx",
     "packages/workbench-ui/src/carousel.ts",
     "packages/workbench-ui/src/carousel-view.ts",
     "packages/workbench-ui/src/ChatApprovalCard.tsx",

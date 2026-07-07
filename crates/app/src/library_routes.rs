@@ -1230,7 +1230,11 @@ mod tests {
             team: None,
         };
         wb.store_mut()
-            .append_record(ORG_SCOPE, "membership", &serde_json::to_string(&member).unwrap())
+            .append_record(
+                ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&member).unwrap(),
+            )
             .unwrap();
         let app = open_control_plane(Arc::new(Mutex::new(wb)));
 
