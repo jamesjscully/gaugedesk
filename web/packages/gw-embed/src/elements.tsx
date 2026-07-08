@@ -55,6 +55,20 @@ const EMBED_THEME_CSS = `
   color: var(--ink);
   font-family: var(--ui);
 }
+/* Powered-by attribution (EMBED-7): a quiet mark on every embedded panel. It is
+   unconditional today; white-label *removal* is a gated follow-on that reads a
+   deployment config flag delivered through the session bootstrap. */
+.gw-powered-by {
+  display: block;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: right;
+  color: var(--muted);
+  text-decoration: none;
+}
+.gw-powered-by:hover { color: var(--accent); }
 `;
 
 /** `<gw-session cp="…" engagement="…">`: builds + owns the scoped remote Session. */
@@ -172,6 +186,13 @@ abstract class GwPanelElement extends HTMLElement {
  *  owner affordances and intentionally absent here. */
 function EmbeddedChat(props: { session: Session }) {
     const [draft, setDraft] = createSignal("");
+    // White-label (EMBED-7): a deployment can suppress the attribution mark via its embed
+    // config. Fail toward branded — a missing endpoint (direct/preview binding) or any error
+    // leaves the mark shown, so attribution is the default and never depends on a live fetch.
+    const [embedConfig] = createResource(() =>
+        props.session.api.embedGetConfig?.().catch(() => ({ white_label: false })) ??
+        Promise.resolve({ white_label: false }),
+    );
     const submit = () => {
         const text = draft().trim();
         if (!text) return;
@@ -199,6 +220,18 @@ function EmbeddedChat(props: { session: Session }) {
                 />
                 <button type="submit" data-embed-send>Send</button>
             </form>
+            {/* Attribution (EMBED-7): shown unless the deployment is white-labeled. */}
+            <Show when={!embedConfig()?.white_label}>
+                <a
+                    class="gw-powered-by"
+                    data-embed-powered-by
+                    href="https://gaugewright.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                >
+                    Powered by GaugeBench
+                </a>
+            </Show>
         </div>
     );
 }

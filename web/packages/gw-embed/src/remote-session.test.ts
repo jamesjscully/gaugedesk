@@ -32,6 +32,7 @@ function fakeApi() {
         putFile: async () => undefined,
         getTree: async () => [],
         embedMyChats: async () => [],
+        embedGetConfig: async () => ({ white_label: false }),
     };
     return { api, calls };
 }

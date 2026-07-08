@@ -28,6 +28,9 @@ export interface SessionApi {
     putFile(id: EngagementId, path: string, content: string): Promise<void>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
     embedMyChats(): Promise<{ chat: string; title: string }[]>;
+    /** The deployment's public embed config (EMBED-7 white-label). Optional: only a
+     *  scoped embed session serves `/embed/config`; desktop sessions omit it. */
+    embedGetConfig?(): Promise<{ white_label: boolean }>;
 }
 
 export interface Session {

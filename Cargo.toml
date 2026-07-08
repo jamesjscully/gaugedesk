@@ -16,7 +16,7 @@ exclude = ["src-tauri"]
 
 [workspace.package]
 edition = "2021"
-version = "0.2.1"
+version = "0.3.0"
 # The platform default (ADR 0069 / SPLIT-5). Crates that are not Apache
 # override explicitly: ee/app is BUSL-1.1.
 license = "Apache-2.0"

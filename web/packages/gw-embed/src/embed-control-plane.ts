@@ -28,15 +28,22 @@ export interface EmbedSessionApi {
     putFile(id: EngagementId, path: string, content: string): Promise<void>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
     embedMyChats(): Promise<{ chat: string; title: string }[]>;
+    embedGetConfig(): Promise<{ white_label: boolean }>;
 }
 
 /** Package-owned control-plane edge for the public embed bundle. */
 export class EmbedControlPlane implements EmbedSessionApi {
     private bearer: string | null = null;
     private publishableKey: string | null = null;
+    private readonly base: string;
     private readonly route: RouteJson;
 
-    constructor(private readonly base = controlPlaneBase()) {
+    constructor(base = controlPlaneBase()) {
+        // Normalize away any trailing slash: the panel prepends leading-slash paths
+        // ("/embed/config", "/chats/:id/…"), so a trailing-slash base yields a double
+        // slash ("…//embed/config") → 404. The hosted cp (exposePort) returns one, so
+        // be robust here rather than trusting every base to be clean.
+        this.base = base.replace(/\/+$/, "");
         this.route = browserRouteJson(this.base, {
             bearer: () => this.bearer,
             publishableKey: () => this.publishableKey,
@@ -69,6 +76,10 @@ export class EmbedControlPlane implements EmbedSessionApi {
 
     embedMyChats(): Promise<{ chat: string; title: string }[]> {
         return embedClient.embedMyChats(this.routeJson());
+    }
+
+    embedGetConfig(): Promise<{ white_label: boolean }> {
+        return embedClient.embedGetConfig(this.routeJson());
     }
 
     runEmbedTurn(
