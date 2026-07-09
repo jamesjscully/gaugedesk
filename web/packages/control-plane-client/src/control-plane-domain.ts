@@ -143,13 +143,18 @@ export interface Workspace {
     readonly personalPlacement: PlacementId | null;
 }
 
-/** One chat-content search hit (SEARCH-1): a chat whose **log** matched the query,
- *  with a one-line snippet of the match. This is the server's chat-log relevance
- *  tier (`navigation.md`); the title tier is filtered client-side over the tree. */
+/** One chat-content search hit: a chat whose **log** (SEARCH-1) or **worktree file**
+ *  (SEARCH-2) matched the query, with a one-line snippet of the match. These are the
+ *  server's content relevance tiers (`navigation.md`); the title tier is filtered
+ *  client-side over the tree. `tier` tells log from file (log ranks above file, and the
+ *  server emits at most one hit per chat via its strongest tier); `path` is the matching
+ *  file for a `file` hit (the snippet already leads with it), absent for a `log` hit. */
 export interface SearchHit {
     readonly id: EngagementId;
     readonly title: string;
     readonly snippet: string;
+    readonly tier: "log" | "file";
+    readonly path?: string;
 }
 
 /** A workspace-change **reference** pushed on the event stream (ADR 0037): what

@@ -700,6 +700,26 @@ impl Engagement {
         std::fs::read_to_string(&abs).map_err(WorkspaceError::io)
     }
 
+    /// Read at most `max_bytes` of a worktree file as text for content search, or
+    /// `None` when the file looks **binary** (a NUL byte in the scanned prefix).
+    /// Path-confined exactly like [`read_file`](Self::read_file); the byte cap bounds
+    /// a per-query content walk so a large blob is never fully materialized (SEARCH-2).
+    pub fn read_file_capped(&self, rel: &str, max_bytes: usize) -> Result<Option<String>> {
+        use std::io::Read;
+        let abs = self.safe_path(rel)?;
+        let file = std::fs::File::open(&abs).map_err(WorkspaceError::io)?;
+        let mut buf = Vec::new();
+        file.take(max_bytes as u64)
+            .read_to_end(&mut buf)
+            .map_err(WorkspaceError::io)?;
+        // Null-byte sniff (how text tools detect non-text): a NUL in the scanned
+        // prefix marks the file binary — skip it rather than match on noise.
+        if buf.contains(&0) {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    }
+
     /// Write a worktree file (the human's edit). Path-confined to the worktree;
     /// parent dirs are created. Does not commit — the caller decides when.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<()> {
@@ -916,6 +936,11 @@ pub trait ChatWorkspace: Send {
     fn tree(&self) -> Result<Vec<FileEntry>>;
     /// Read a file's text (path-confined).
     fn read_file(&self, rel: &str) -> Result<String>;
+    /// Read up to `max_bytes` of a file as text (path-confined), or `None` when it
+    /// looks binary (a NUL byte in the scanned prefix). The byte-capped, binary-
+    /// skipping counterpart of [`read_file`](Self::read_file) — the read primitive a
+    /// bounded per-query content walk stands on (SEARCH-2), never a persistent index.
+    fn read_file_capped(&self, rel: &str, max_bytes: usize) -> Result<Option<String>>;
     /// Write a file, creating parents; does not record a revision (path-confined).
     fn write_file(&self, rel: &str, content: &str) -> Result<()>;
 }
@@ -1023,6 +1048,9 @@ impl ChatWorkspace for Engagement {
     }
     fn read_file(&self, rel: &str) -> Result<String> {
         Engagement::read_file(self, rel)
+    }
+    fn read_file_capped(&self, rel: &str, max_bytes: usize) -> Result<Option<String>> {
+        Engagement::read_file_capped(self, rel, max_bytes)
     }
     fn write_file(&self, rel: &str, content: &str) -> Result<()> {
         Engagement::write_file(self, rel, content)
@@ -1647,6 +1675,32 @@ mod tests {
         // path escapes are rejected
         assert!(eng.read_file("../../etc/passwd").is_err());
         assert!(eng.write_file("/etc/x", "x").is_err());
+    }
+
+    #[test]
+    fn read_file_capped_bounds_bytes_skips_binary_and_stays_confined() {
+        let (_d, inst) = instance();
+        let eng = inst.create_engagement("e2").unwrap();
+
+        // A short text file reads back in full when the cap is generous.
+        write(eng.path(), "note.txt", "hello world");
+        assert_eq!(
+            eng.read_file_capped("note.txt", 1024).unwrap().as_deref(),
+            Some("hello world")
+        );
+
+        // The byte cap truncates: only the first `max_bytes` are returned.
+        assert_eq!(
+            eng.read_file_capped("note.txt", 5).unwrap().as_deref(),
+            Some("hello")
+        );
+
+        // A NUL byte in the scanned prefix marks the file binary → None (skipped).
+        eng.write_file("blob.bin", "abc\u{0}def").unwrap();
+        assert_eq!(eng.read_file_capped("blob.bin", 1024).unwrap(), None);
+
+        // Confinement is the same as `read_file`: an escaping path is rejected.
+        assert!(eng.read_file_capped("../../etc/passwd", 1024).is_err());
     }
 
     #[test]

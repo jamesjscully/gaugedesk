@@ -91,13 +91,21 @@ export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask
     }));
 }
 
-/** Content search across chat transcripts. */
+/** Content search across chat transcripts (SEARCH-1) and worktree files (SEARCH-2).
+ *  The server ranks log hits before file hits and emits one hit per chat via its
+ *  strongest tier; the tree renders each hit's snippet in place. */
 export async function search(transport: WorkbenchTransport, query: string): Promise<SearchHit[]> {
     if (!query.trim()) return [];
     const o = (await transport.json("GET", `/search?q=${encodeURIComponent(query)}`)) as {
-        hits?: { id: string; title: string; snippet: string }[];
+        hits?: { id: string; title: string; snippet: string; tier?: "log" | "file"; path?: string }[];
     };
-    return (o.hits ?? []).map((h) => ({ id: engagementId(h.id), title: h.title, snippet: h.snippet }));
+    return (o.hits ?? []).map((h) => ({
+        id: engagementId(h.id),
+        title: h.title,
+        snippet: h.snippet,
+        tier: h.tier ?? "log",
+        path: h.path,
+    }));
 }
 
 export async function createArchetype(

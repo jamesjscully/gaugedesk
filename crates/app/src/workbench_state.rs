@@ -122,6 +122,16 @@ pub struct Workbench {
     pub(crate) oidc_throttle: Arc<throttle::Throttle>,
     /// Per-session activity ledger enforcing the org session-timeout policy (`SEC-2`).
     pub(crate) session_activity: Arc<crate::session_activity::SessionActivity>,
+    /// Per-session pending device-enrollment legs (`ACCT-1`, the enrollment drive).
+    /// An `Arc` so a route handler can clone the handle out under the lock and then
+    /// run the broker legs (which await) without holding the workbench mutex.
+    pub(crate) enroll_drive: Arc<crate::device_enroll_drive::EnrollDrive>,
+    /// The rendezvous broker this workbench dials / advertises for enrollment
+    /// (`ACCT-1`); `None` falls back to `GAUGEWRIGHT_BROKER_ADDR` / the default.
+    pub(crate) enroll_broker: Option<String>,
+    /// The account key a newly-enrolled device recovered over the handshake
+    /// (`ACCT-1`), held in memory — never returned over HTTP (`INV-10`).
+    pub(crate) recovered_account_key: Option<[u8; 32]>,
 }
 
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
@@ -226,6 +236,11 @@ impl Workbench {
             oidc_throttle: Arc::new(throttle::Throttle::new(10, 60_000)),
             // SEC-2: enforce the org session lifetime / idle-timeout policy on data routes.
             session_activity: Arc::new(crate::session_activity::SessionActivity::new()),
+            // ACCT-1: the per-session device-enrollment drive; broker + recovered key
+            // resolve lazily (env fallback) / on a successful handshake.
+            enroll_drive: Arc::new(crate::device_enroll_drive::EnrollDrive::new()),
+            enroll_broker: None,
+            recovered_account_key: None,
         }
     }
 

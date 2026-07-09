@@ -21,6 +21,58 @@ export async function accountRevokeDevice(json: RouteJson, id: string): Promise<
     await json("POST", `/account/devices/${encodeURIComponent(id)}/revoke`);
 }
 
+/** An out-of-band device-enrollment ticket (ACCT-1, ADR 0055): the rendezvous session,
+ *  the account root the new device pins, and the broker both legs dial. Carries no secret —
+ *  the trust anchor is the SAS compare + the root-signed delegation. */
+export interface EnrollmentTicket {
+    readonly session: string;
+    readonly account_root: string;
+    readonly broker: string;
+}
+
+/** One enrollment leg's live status: its phase and the 6-char SAS to compare out-of-band
+ *  (never the account key, which crosses only as sealed ciphertext — INV-10). */
+export interface EnrollmentStatus {
+    readonly phase: string;
+    readonly sas: string | null;
+    readonly error: string | null;
+}
+
+/** Holder: start the enrollment host leg; returns the ticket to show (QR + code). */
+export async function enrollHost(json: RouteJson): Promise<EnrollmentTicket> {
+    const o = (await json("POST", "/account/devices/enroll/host")) as { ticket: EnrollmentTicket };
+    return o.ticket;
+}
+
+/** Holder: poll a host leg's phase + SAS after showing the ticket. */
+export async function enrollHostStatus(json: RouteJson, session: string): Promise<EnrollmentStatus> {
+    return (await json(
+        "GET",
+        `/account/devices/enroll/host/${encodeURIComponent(session)}`,
+    )) as EnrollmentStatus;
+}
+
+/** Holder: the human confirmed the SAS matches the new device's — authorize. */
+export async function enrollAuthorize(json: RouteJson, session: string): Promise<void> {
+    await json("POST", "/account/devices/enroll/authorize", { session });
+}
+
+/** New device: consume a ticket and start the join leg; returns the session to poll. */
+export async function enrollJoin(json: RouteJson, ticket: EnrollmentTicket): Promise<string> {
+    const o = (await json("POST", "/account/devices/enroll/join", { ticket })) as {
+        session: string;
+    };
+    return o.session;
+}
+
+/** New device: poll a join leg's phase + SAS (compare with the holder's, then wait). */
+export async function enrollJoinStatus(json: RouteJson, session: string): Promise<EnrollmentStatus> {
+    return (await json(
+        "GET",
+        `/account/devices/enroll/join/${encodeURIComponent(session)}`,
+    )) as EnrollmentStatus;
+}
+
 export async function accountSettings(json: RouteJson): Promise<Record<string, string>> {
     const o = (await json("GET", "/account/settings")) as { settings: Record<string, string> };
     return o.settings;

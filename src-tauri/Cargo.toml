@@ -3,7 +3,7 @@
 # cargo workspace (which stays self-contained and green).
 [package]
 name = "gaugewright-desktop"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "GaugeBench desktop workbench (Tauri v2 shell + co-resident control plane)."
@@ -19,6 +19,11 @@ tauri-plugin-dialog = "2"
 # Self-update: verifies signed update artifacts against the pubkey in
 # tauri.conf.json (plugins.updater) and fetches the GitHub Release `latest.json`.
 tauri-plugin-updater = "2"
+# FED-7: register the `gaugewright://` URL scheme so an invite link opens the app
+# directly. single-instance routes a deep link into the already-running instance on
+# Linux/Windows (must be registered first); macOS delivers to the running app natively.
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 gaugewright-app = { path = "../crates/app", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # `tauri::generate_context!()` expands to code that parses the bundled config via

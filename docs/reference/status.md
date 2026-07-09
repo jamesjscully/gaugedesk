@@ -14,16 +14,27 @@ it has on this table.
     plaintext is spelled out in
     [Where your data goes](../concepts/protection.md#where-your-data-goes).
 
-!!! note "Network egress is open by default, isolation is an opt-in"
-    The runtime's **network-egress default is open**, not deny-by-default (product
-    decision, 2026-06-17): a [chat](../concepts/glossary.md#chat) can reach the model
-    out of the box. An operator **opts into** network isolation **per project**
-    (`network_isolated`, default off), which restores kernel-enforced network
-    containment. This is a deliberate low-friction trade-off — the egress chokepoint
-    and taint/consent gating are *always on*, but because the per-host egress proxy
-    (a model-endpoint allowlist) is **deferred**, "open" means unfiltered host egress,
-    so a non-isolated project carries a **lower** [boundary](../concepts/glossary.md#boundary)
-    ceiling than an isolated one.
+!!! note "Network egress: filtered where enforceable, else open-by-default (disclosed)"
+    A non-isolated [chat](../concepts/glossary.md#chat) runs under **filtered egress**
+    (CORE-5, [ADR 0079](https://github.com/jamesjscully/gaugebench-src/blob/main/specs/decisions/0079-per-host-egress-filtering.md))
+    — the sandbox may reach **only the model endpoints**, enforced by a host-filtering
+    `CONNECT` proxy — **on hosts that can enforce it** (a rootless netns route via
+    `slirp4netns`/`pasta`). Where that enforcement isn't available, a non-isolated chat
+    keeps the accepted **open-by-default** posture (unfiltered egress with a *disclosed
+    lower ceiling* — the 2026-06-17 product decision): the model is reachable out of the
+    box, but the agent can reach any host. An operator can **opt into** full network
+    isolation **per project** (`network_isolated`), which denies network entirely.
+    **Honest status of enforcement:** the proxy and the whole policy path are
+    **built and tested**; the last-mile netns routing that makes the proxy the
+    sandbox's *sole* outbound path (`slirp4netns`/`pasta` + an nft default-drop)
+    is **designed but not yet verified on a routing-capable host**
+    (`FILTERED_ROUTING_VERIFIED = false`). Until it is verified, the engine does **not**
+    request `Filtered` (which the harness fails closed to isolation), so the default
+    stays the disclosed open-by-default posture and model access is **never silently
+    broken**; filtering **upgrades** the default automatically once a host can enforce
+    it. `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1` remains a conscious, logged opt-in to
+    unfiltered egress regardless. The egress chokepoint and taint/consent gating are
+    *always on* regardless.
 
 ## What the statuses mean
 

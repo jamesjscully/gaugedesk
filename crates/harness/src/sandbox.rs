@@ -12,33 +12,53 @@
 //! full power everywhere else. Filesystem integrity + workspace confinement are
 //! what this discharges.
 //!
-//! Network is **deny-by-default** (RF-B3). Declaring hosts via
-//! [`SandboxPolicy::allow_hosts`] records *intent* but does NOT open the kernel
-//! network: with no per-host egress proxy yet (deferred infra — the kernel can
-//! only deny *all* or allow *all*), opening it would be silent UNFILTERED egress
-//! (a compromised/prompt-injected agent could exfiltrate protected method+context
-//! to any host). So the posture stays isolated (`--unshare-net`) until the
-//! operator explicitly accepts unfiltered egress via
-//! [`SandboxPolicy::allow_unfiltered_egress`] (env `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`),
-//! mirroring the conscious `GAUGEWRIGHT_SANDBOX=0` opt-out.
+//! Network is **deny-by-default** (RF-B3), with three postures (CORE-5):
+//! [`Network::Deny`] (isolated, loopback only), [`Network::Filtered`] (egress ONLY
+//! to [`SandboxPolicy::allowed_hosts`], enforced by the host-filtering egress
+//! proxy in [`crate::egress_proxy`] routed as the netns's sole outbound path), and
+//! [`Network::Allow`] (UNFILTERED — reaches any host). `Filtered` is the load-
+//! bearing default a non-isolated project runs under: `allowed_hosts` names the
+//! model endpoints and nothing else is reachable.
+//!
+//! **Fail-closed realization (honest boundary).** `Filtered` is only enforceable
+//! where the netns can be given a proxy-only outbound path — bubblewrap plus a
+//! rootless userspace-net helper (`slirp4netns`/`pasta`). Where that routing is
+//! not available (or not yet verified — see [`FILTERED_ROUTING_VERIFIED`]),
+//! `Filtered` **degrades to [`Network::Deny`]** (isolated), NEVER silently to
+//! unfiltered `Allow`: an unenforceable filter fails to *no* egress, not *open*
+//! egress. Declaring hosts via [`SandboxPolicy::allow_hosts`] alone still records
+//! *intent* only. Unfiltered egress remains a conscious operator opt-in via
+//! [`SandboxPolicy::allow_unfiltered_egress`] (env
+//! `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`), mirroring `GAUGEWRIGHT_SANDBOX=0`.
 
 use std::path::{Path, PathBuf};
 
-/// Network posture (RF-B3). The policy is **deny-by-default**: a process gets no
-/// network unless it declares a need. `Deny` with no `allowed_hosts` is enforced
-/// at the kernel (bubblewrap `--unshare-net`: the namespace has only an empty
-/// loopback, so `curl` cannot reach anything). `Allow` is the un-filtered escape
-/// hatch; `allowed_hosts` names the *intended* egress targets (e.g. the model
-/// endpoint) for the per-host allowlist proxy. Host-level filtering among allowed
-/// targets needs that proxy routing the namespace's traffic — the one piece that
-/// is deferred infra (a userspace-net helper); the kernel can only deny *all* or
-/// allow *all*. So `allowed_hosts` only records the *intended* targets; the
-/// posture flips to `Allow` (kernel network not isolated) **only** when the
-/// operator explicitly accepts unfiltered egress via
-/// [`SandboxPolicy::allow_unfiltered_egress`] — never silently from declaring hosts.
+/// Network posture (RF-B3, CORE-5). The policy is **deny-by-default**: a process
+/// gets no network unless it declares a need. Three postures, in ascending reach:
+///
+/// - [`Network::Deny`] — network-isolated. Enforced at the kernel (bubblewrap
+///   `--unshare-net`: the namespace has only an empty loopback, so `curl` cannot
+///   reach anything). This is what `SandboxPolicy::new` starts at.
+/// - [`Network::Filtered`] — egress ONLY to [`SandboxPolicy::allowed_hosts`]. The
+///   netns is isolated (`--unshare-net`) and its *sole* outbound path is the
+///   host-filtering [`crate::egress_proxy`], which exact-matches the `CONNECT`
+///   target host against the allowlist. A host off the list is unreachable even
+///   if the agent ignores the proxy env (the netns has no other route). This is
+///   the load-bearing posture: `allowed_hosts` becomes the enforced boundary, not
+///   mere recorded intent. Realized fail-closed to `Deny` where the routing helper
+///   is absent (see [`effective_network`]).
+/// - [`Network::Allow`] — the UNFILTERED escape hatch: the namespace shares the
+///   host network and can reach *any* host. Set only via
+///   [`SandboxPolicy::allow_unfiltered_egress`] (a conscious operator opt-in).
+///
+/// `allowed_hosts` names the intended egress targets; on its own (via
+/// [`SandboxPolicy::allow_hosts`]) it records intent without opening the network —
+/// only [`SandboxPolicy::filter_egress`] (→ `Filtered`) or
+/// [`SandboxPolicy::allow_unfiltered_egress`] (→ `Allow`) changes the posture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
     Allow,
+    Filtered,
     Deny,
 }
 
@@ -87,6 +107,22 @@ impl SandboxPolicy {
         self
     }
 
+    /// Request **filtered** egress (CORE-5): the process may reach `hosts` and
+    /// *only* `hosts`, enforced by the host-filtering [`crate::egress_proxy`]
+    /// routed as the isolated netns's sole outbound path. Unlike
+    /// [`Self::allow_hosts`], this DOES change the posture — to [`Network::Filtered`]
+    /// — because the allowlist is now load-bearing, not just recorded intent. It is
+    /// still fail-closed: where the netns routing helper is unavailable the posture
+    /// realizes as [`Network::Deny`] (isolated), never as unfiltered `Allow` (see
+    /// [`effective_network`]). This is the posture a non-isolated project runs
+    /// under; unfiltered egress stays the separate conscious opt-in
+    /// ([`Self::allow_unfiltered_egress`]).
+    pub fn filter_egress(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = hosts;
+        self.network = Network::Filtered;
+        self
+    }
+
     /// Explicitly accept **unfiltered** network egress (RF-B3). With no per-host
     /// proxy yet, the kernel cannot filter to [`Self::allowed_hosts`], so allowing
     /// egress means the process can reach *any* host — a real exfiltration surface
@@ -100,6 +136,83 @@ impl SandboxPolicy {
             self.network = Network::Allow;
         }
         self
+    }
+}
+
+/// Whether the netns→proxy last-mile routing for [`Network::Filtered`] is wired
+/// **and verified non-bypassable on a real `slirp4netns`/`pasta` host**.
+///
+/// The enforcement heart — the host-filtering [`crate::egress_proxy`] and the
+/// whole policy/posture path — is built and tested. The remaining piece is
+/// attaching the userspace-net helper to the spawned bubblewrap process's netns
+/// and default-dropping every route except the proxy (the design of record is in
+/// ADR 0079). That attach cannot be verified without a `slirp4netns`/`pasta` host,
+/// and an *unverified* egress filter that silently leaks would be worse than
+/// honest isolation. So until it is landed and verified, this stays `false` and
+/// `Filtered` realizes **fail-closed to [`Network::Deny`]** (isolated) — see
+/// [`effective_network`]. Flip to `true` only together with the verified attach.
+pub const FILTERED_ROUTING_VERIFIED: bool = false;
+
+/// Host capabilities that decide whether [`Network::Filtered`] can be *enforced*
+/// (CORE-5). Filtered needs a bubblewrap netns plus a rootless userspace-net
+/// helper to give that netns a proxy-only outbound path; without both there is no
+/// non-bypassable route, so Filtered must fail closed to isolation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoutingCaps {
+    /// bubblewrap is available to create the isolated netns.
+    pub bwrap: bool,
+    /// The rootless outbound helper on PATH (`pasta` preferred, else `slirp4netns`),
+    /// or `None` if neither is present.
+    pub userspace_net: Option<&'static str>,
+}
+
+impl RoutingCaps {
+    /// Can [`Network::Filtered`] be enforced end-to-end here? Requires the netns
+    /// backend, the outbound helper, AND the verified last-mile routing.
+    pub fn can_enforce_filtered(&self) -> bool {
+        FILTERED_ROUTING_VERIFIED && self.bwrap && self.userspace_net.is_some()
+    }
+}
+
+/// Probe this host for the [`Network::Filtered`] enforcement capabilities. Linux
+/// only (bubblewrap + `slirp4netns`/`pasta` are the rootless path); every other OS
+/// reports no capability, so `Filtered` fails closed to isolation there.
+pub fn detect_routing_caps() -> RoutingCaps {
+    #[cfg(target_os = "linux")]
+    {
+        let userspace_net = if program_on_path("pasta") {
+            Some("pasta")
+        } else if program_on_path("slirp4netns") {
+            Some("slirp4netns")
+        } else {
+            None
+        };
+        RoutingCaps {
+            bwrap: program_on_path("bwrap"),
+            userspace_net,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        RoutingCaps {
+            bwrap: false,
+            userspace_net: None,
+        }
+    }
+}
+
+/// Resolve the **effective** network posture from the requested one and this
+/// host's capabilities (CORE-5 fail-closed rule). Pure so the precedence is
+/// unit-testable:
+///
+/// - `Allow` and `Deny` pass through unchanged.
+/// - `Filtered` stays `Filtered` **only** when [`RoutingCaps::can_enforce_filtered`]
+///   holds; otherwise it degrades to `Deny` (isolated). It NEVER degrades to
+///   `Allow` — an unenforceable filter fails to *no* egress, not *open* egress.
+pub fn effective_network(requested: Network, caps: RoutingCaps) -> Network {
+    match requested {
+        Network::Filtered if !caps.can_enforce_filtered() => Network::Deny,
+        other => other,
     }
 }
 
@@ -152,7 +265,13 @@ impl Sandbox for Bubblewrap {
             v.push(r.to_string_lossy().into_owned());
             v.push(r.to_string_lossy().into_owned());
         }
-        if policy.network == Network::Deny {
+        // Isolate the netns for both `Deny` (fully isolated) and `Filtered`
+        // (isolated, with the host-filtering egress proxy attached out-of-band as
+        // its sole outbound path — ADR 0079). Only the unfiltered `Allow` opt-in
+        // shares the host network. The Filtered→Deny fail-closed degrade
+        // ([`effective_network`]) produces the same `--unshare-net` argv, so an
+        // unenforceable filter is byte-for-byte an isolated run.
+        if policy.network != Network::Allow {
             v.push("--unshare-net".into());
         }
         if let Some(cwd) = cwd {
@@ -188,7 +307,13 @@ impl Seatbelt {
                 r.to_string_lossy()
             ));
         }
-        if policy.network == Network::Deny {
+        // macOS Seatbelt cannot host the Linux netns-proxy routing that `Filtered`
+        // needs (no rootless userspace-net + isolated netns to pin outbound to the
+        // proxy), and SBPL `network*` filters by address/port, not by TLS SNI/host —
+        // so there is no honest per-host filter to write here. `Filtered` therefore
+        // fails closed to isolated on macOS: deny network for both `Deny` and
+        // `Filtered`; only the unfiltered `Allow` opt-in leaves it open.
+        if policy.network != Network::Allow {
             p.push_str("(deny network*)\n");
         }
         p
@@ -313,14 +438,35 @@ pub fn wrap_or_refuse(
     let backend = detect();
     match backend.wrap(policy, program, args, cwd) {
         Some(argv) => {
+            // Resolve the effective posture for THIS host (CORE-5 fail-closed):
+            // `Filtered` realizes as `Deny` (isolated) where the netns routing
+            // helper is unavailable/unverified — never as unfiltered `Allow`.
+            let effective = effective_network(policy.network, detect_routing_caps());
             // Observability (RF-A8): record the enforcement decision —
             // backend name + posture only, never the worktree contents.
             tracing::info!(
                 backend = backend.name(),
-                network = ?policy.network,
+                requested_network = ?policy.network,
+                effective_network = ?effective,
                 read_only_roots = policy.read_only_roots.len(),
                 "pi spawn: sandboxed"
             );
+            if policy.network == Network::Filtered && effective == Network::Deny {
+                // Honest, loud: the operator asked for filtered egress but this host
+                // can't enforce it, so the run is network-isolated (the model
+                // endpoint is unreachable) rather than opened wide.
+                eprintln!(
+                    "gaugewright: filtered egress requested but not enforceable here \
+                     (needs bubblewrap + slirp4netns/pasta{}); failing CLOSED to \
+                     network-isolated. Set GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1 to \
+                     consciously allow UNFILTERED egress instead.",
+                    if FILTERED_ROUTING_VERIFIED {
+                        ""
+                    } else {
+                        ", and verified netns routing (not yet landed)"
+                    }
+                );
+            }
             let mut c = std::process::Command::new(&argv[0]);
             c.args(&argv[1..]);
             Ok(c)
@@ -483,6 +629,100 @@ mod tests {
             .allow_hosts(vec!["api.openai.com".into()])
             .allow_unfiltered_egress(false);
         assert_eq!(not_ack.network, Network::Deny);
+    }
+
+    #[test]
+    fn filter_egress_sets_the_filtered_posture_and_records_the_allowlist() {
+        // CORE-5: `filter_egress` is the load-bearing builder — unlike `allow_hosts`
+        // it changes the posture, because the allowlist is now enforced.
+        let p = SandboxPolicy::new(vec![PathBuf::from("/wt")])
+            .filter_egress(vec!["api.openai.com".into(), "chatgpt.com".into()]);
+        assert_eq!(p.network, Network::Filtered);
+        assert_eq!(
+            p.allowed_hosts,
+            vec!["api.openai.com".to_string(), "chatgpt.com".to_string()]
+        );
+        // The unfiltered opt-in still wins over a filtered request (conscious escalation).
+        let unfiltered = SandboxPolicy::new(vec![PathBuf::from("/wt")])
+            .filter_egress(vec!["api.openai.com".into()])
+            .allow_unfiltered_egress(true);
+        assert_eq!(unfiltered.network, Network::Allow);
+    }
+
+    #[test]
+    fn effective_network_fails_closed_from_filtered_to_deny_never_to_allow() {
+        // Allow and Deny always pass through unchanged.
+        let full = RoutingCaps {
+            bwrap: true,
+            userspace_net: Some("slirp4netns"),
+        };
+        assert_eq!(effective_network(Network::Allow, full), Network::Allow);
+        assert_eq!(effective_network(Network::Deny, full), Network::Deny);
+
+        // Filtered is enforceable ONLY when caps allow AND the routing is verified.
+        // The gate is tied to the flag so this stays honest when the flag flips.
+        assert_eq!(full.can_enforce_filtered(), FILTERED_ROUTING_VERIFIED);
+        let expected_full = if FILTERED_ROUTING_VERIFIED {
+            Network::Filtered
+        } else {
+            Network::Deny // the honest current reality: routing not yet verified
+        };
+        assert_eq!(effective_network(Network::Filtered, full), expected_full);
+
+        // Missing either capability ⇒ Filtered fails CLOSED to Deny, never Allow.
+        let no_helper = RoutingCaps {
+            bwrap: true,
+            userspace_net: None,
+        };
+        let no_bwrap = RoutingCaps {
+            bwrap: false,
+            userspace_net: Some("pasta"),
+        };
+        assert_eq!(
+            effective_network(Network::Filtered, no_helper),
+            Network::Deny
+        );
+        assert_eq!(
+            effective_network(Network::Filtered, no_bwrap),
+            Network::Deny
+        );
+    }
+
+    #[test]
+    fn bubblewrap_isolates_the_netns_for_filtered_and_shares_it_only_for_allow() {
+        // Filtered: the netns is isolated (`--unshare-net`) — the egress proxy is
+        // its only outbound path, attached out-of-band. Same argv as Deny, so an
+        // unenforceable filter is byte-for-byte an isolated run.
+        let filtered = SandboxPolicy::new(vec![PathBuf::from("/wt")])
+            .filter_egress(vec!["api.openai.com".into()]);
+        let argv = Bubblewrap.wrap(&filtered, "pi", &[], None).unwrap();
+        assert!(
+            argv.iter().any(|a| a == "--unshare-net"),
+            "Filtered must isolate the netns (proxy is its sole route)"
+        );
+        // Only the unfiltered Allow opt-in shares the host network.
+        let allow = SandboxPolicy::new(vec![PathBuf::from("/wt")])
+            .filter_egress(vec!["api.openai.com".into()])
+            .allow_unfiltered_egress(true);
+        let argv = Bubblewrap.wrap(&allow, "pi", &[], None).unwrap();
+        assert!(
+            !argv.iter().any(|a| a == "--unshare-net"),
+            "unfiltered Allow shares the host network"
+        );
+    }
+
+    #[test]
+    fn seatbelt_denies_network_for_filtered_failing_closed_on_macos() {
+        // macOS can't host the netns-proxy routing, so Filtered fails closed to
+        // isolated: the profile denies network (same as Deny).
+        let filtered = SandboxPolicy::new(vec![PathBuf::from("/wt")])
+            .filter_egress(vec!["api.openai.com".into()]);
+        assert!(Seatbelt::profile(&filtered).contains("(deny network*)"));
+        // The unfiltered opt-in leaves the network open (no deny line).
+        let allow = SandboxPolicy::new(vec![PathBuf::from("/wt")])
+            .filter_egress(vec!["api.openai.com".into()])
+            .allow_unfiltered_egress(true);
+        assert!(!Seatbelt::profile(&allow).contains("(deny network*)"));
     }
 
     #[test]

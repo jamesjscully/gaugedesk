@@ -16,10 +16,14 @@ export function SettingsMenu(props: {
     /** A monotonically increasing counter; each increment opens the Account panel.
      *  Lets another surface (e.g. an in-chat "no model" prompt) open settings. */
     openAccount?: Accessor<number>;
+    /** FED-7: an OS-delivered `gaugewright://invite` deep link. Each non-empty value opens the
+     *  Devices modal seeded with that link, so its consent preview renders immediately. */
+    openInvite?: Accessor<string>;
 }): JSX.Element {
     const [menuOpen, setMenuOpen] = createSignal(false);
     const [devicesOpen, setDevicesOpen] = createSignal(false);
     const [accountOpen, setAccountOpen] = createSignal(false);
+    const [inviteSeed, setInviteSeed] = createSignal("");
 
     // Open the Account panel when an external request comes in (defer the initial run
     // so we never pop it open on mount).
@@ -29,6 +33,22 @@ export function SettingsMenu(props: {
             () => {
                 setMenuOpen(false);
                 setAccountOpen(true);
+            },
+            { defer: true },
+        ),
+    );
+
+    // FED-7: open the Devices modal, seeded with the deep-linked invite, when one arrives
+    // (defer so a value present at mount never auto-pops the modal).
+    createEffect(
+        on(
+            () => props.openInvite?.() ?? "",
+            (url) => {
+                if (!url) return;
+                setMenuOpen(false);
+                setAccountOpen(false);
+                setInviteSeed(url);
+                setDevicesOpen(true);
             },
             { defer: true },
         ),
@@ -92,7 +112,11 @@ export function SettingsMenu(props: {
                 <DevicesModal
                     api={props.api}
                     environment={props.environment}
-                    onClose={() => setDevicesOpen(false)}
+                    initialInviteLink={inviteSeed()}
+                    onClose={() => {
+                        setDevicesOpen(false);
+                        setInviteSeed("");
+                    }}
                 />
             </Show>
 

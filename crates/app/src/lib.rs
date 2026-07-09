@@ -21,6 +21,7 @@ pub mod codex_oauth;
 pub mod content_vault;
 pub mod crypto_erasure;
 pub mod device_enroll;
+pub mod device_enroll_drive;
 pub mod directory_sync;
 pub mod engagement_routes;
 pub mod engine;

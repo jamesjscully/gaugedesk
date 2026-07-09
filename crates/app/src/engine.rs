@@ -264,6 +264,44 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
     hosts.iter().map(|s| s.to_string()).collect()
 }
 
+/// The network egress posture a turn runs under (RF-B3, CORE-5). Pure so the
+/// precedence is unit-testable:
+///
+/// - operator forced unfiltered egress (`GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`) ⇒
+///   [`Network::Allow`] — the conscious unfiltered opt-in wins over everything;
+/// - the project isolates its network ⇒ [`Network::Deny`] (kernel-isolated);
+/// - a non-isolated project ⇒ [`Network::Filtered`] (egress ONLY to the model
+///   endpoints, via the host-filtering proxy) **when that filter can actually be
+///   enforced on this host** (`filtered_enforceable`, from
+///   [`RoutingCaps::can_enforce_filtered`]); otherwise it stays on the accepted
+///   open-by-default posture [`Network::Allow`] (unfiltered, with the *disclosed*
+///   lower ceiling — the 2026-06-17 product decision).
+///
+/// The last clause is deliberate: we do NOT request `Filtered` where it can't be
+/// enforced, because the harness fails an unenforceable `Filtered` closed to
+/// `Deny` (isolated), which would silently break out-of-box model access and
+/// reverse the open-by-default product decision. Instead, filtering **upgrades**
+/// the default automatically the moment a host can enforce it (bwrap + a rootless
+/// userspace-net helper + verified routing); until then the documented unfiltered
+/// ceiling stands. Isolation (`Deny`) and the conscious unfiltered opt-in (`Allow`)
+/// are always honored.
+fn egress_posture(
+    project_isolated: bool,
+    forced_unfiltered: bool,
+    filtered_enforceable: bool,
+) -> gaugewright_harness::sandbox::Network {
+    use gaugewright_harness::sandbox::Network;
+    if forced_unfiltered {
+        Network::Allow
+    } else if project_isolated {
+        Network::Deny
+    } else if filtered_enforceable {
+        Network::Filtered
+    } else {
+        Network::Allow
+    }
+}
+
 fn method_surface_readonly_roots(worktree: &Path, mode: ChatMode) -> Vec<std::path::PathBuf> {
     if !matches!(mode, ChatMode::Use) {
         return Vec::new();
@@ -889,43 +927,73 @@ pub fn run_engagement_turn(
         // adapter extends it with its private needs (Pi adds its session dir +
         // `~/.pi` as writable roots — see the Pi factory's `pi_config_for`).
         let sandbox_policy = {
+            use gaugewright_harness::sandbox::Network;
             let writable = vec![worktree.to_path_buf()];
-            // Network egress posture (RF-B3) is a **per-project** choice, open by
-            // default: the operator opts *into* isolation per project, so a chat can
-            // reach the model out of the box. The core `SandboxPolicy` still defaults
-            // deny (the library invariant is unchanged); we flip the app default here
-            // by acknowledging unfiltered egress unless this chat's project isolates.
-            // The one egress the bridge legitimately needs is the model endpoint, so
-            // we name it explicitly — recorded and auditable, not ambient. Because the
-            // per-host egress proxy is not yet built (deferred infra), the kernel can
-            // only deny *all* or allow *all*, so "open" is UNFILTERED egress (M-1).
-            // `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1` still force-opens regardless of the
-            // project setting, mirroring the conscious `GAUGEWRIGHT_SANDBOX=0` opt-out.
+            // Network egress posture (RF-B3, CORE-5) is a **per-project** choice. A
+            // non-isolated project reaches ONLY the model endpoints (Filtered, enforced
+            // by the host-filtering egress proxy) **where the host can enforce that**;
+            // where it can't, it keeps the accepted open-by-default posture (unfiltered
+            // with a disclosed lower ceiling — the 2026-06-17 product decision) rather
+            // than breaking model access. The model endpoint is named explicitly
+            // (recorded + auditable; load-bearing under Filtered).
+            // `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1` force-opens to UNFILTERED egress
+            // regardless (the conscious opt-in, mirroring `GAUGEWRIGHT_SANDBOX=0`); an
+            // isolated project denies network entirely. A `Filtered` request the host
+            // can't enforce is failed closed to `Deny` by the harness — never silently
+            // to `Allow` — which is exactly why the engine only requests it when enforceable.
             let egress_hosts = model_endpoint_hosts(Some(&provider));
             let project_isolated = wb.lock_unpoisoned().chat_network_isolated(id);
-            let forced_open =
+            let forced_unfiltered =
                 std::env::var("GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS").as_deref() == Ok("1");
-            let unfiltered_egress_ack = forced_open || !project_isolated;
-            if !unfiltered_egress_ack {
-                eprintln!(
+            // CORE-5: only *request* Filtered where this host can actually enforce it
+            // (bwrap + a rootless userspace-net helper + verified routing). Where it
+            // can't, a non-isolated project stays on the accepted open-by-default
+            // posture (unfiltered, disclosed ceiling) rather than requesting a Filtered
+            // that the harness would fail closed to Deny — which would silently break
+            // out-of-box model access. Filtering upgrades the default automatically when
+            // a host becomes capable.
+            let filtered_enforceable =
+                gaugewright_harness::sandbox::detect_routing_caps().can_enforce_filtered();
+            let posture = egress_posture(project_isolated, forced_unfiltered, filtered_enforceable);
+            match posture {
+                Network::Deny => eprintln!(
                     "[gaugewright] NOTE: this project isolates Pi's network (fail-closed); \
                      the model endpoint ({}) is unreachable. Turn off isolation for \
                      the project to let the agent reach the model.",
                     egress_hosts.join(", ")
-                );
-            } else if !project_isolated {
-                eprintln!(
-                    "[gaugewright] NOTE: Pi runs with UNFILTERED network egress (project \
-                     network is open; the per-host egress proxy is not yet built, so \
-                     the agent can reach ANY host — not just the model endpoint {}). \
-                     Isolate the project to fail closed.",
+                ),
+                Network::Filtered => eprintln!(
+                    "[gaugewright] NOTE: Pi runs with FILTERED network egress — reachable \
+                     ONLY the model endpoint ({}), via the host-filtering proxy (CORE-5).",
                     egress_hosts.join(", ")
-                );
+                ),
+                // Two ways to land here (see `egress_posture`): the conscious unfiltered
+                // opt-in, or a non-isolated project on a host that can't enforce filtering.
+                Network::Allow if forced_unfiltered => eprintln!(
+                    "[gaugewright] NOTE: Pi runs with UNFILTERED network egress \
+                     (GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1) — the agent can reach ANY host, \
+                     not just the model endpoint ({}). Unset it to fall back to filtered egress.",
+                    egress_hosts.join(", ")
+                ),
+                Network::Allow => eprintln!(
+                    "[gaugewright] NOTE: Pi runs with UNFILTERED network egress — per-host \
+                     filtering (CORE-5) isn't enforceable on this host (needs bwrap + \
+                     pasta/slirp4netns with verified routing), so 'open' keeps its disclosed \
+                     lower ceiling: the agent can reach ANY host, not just the model endpoint \
+                     ({}). Isolate the project to fail closed, or install the routing helper.",
+                    egress_hosts.join(", ")
+                ),
             }
-            gaugewright_harness::sandbox::SandboxPolicy::new(writable)
-                .read_only(method_surface_readonly_roots(worktree, mode))
-                .allow_hosts(egress_hosts)
-                .allow_unfiltered_egress(unfiltered_egress_ack)
+            let base = gaugewright_harness::sandbox::SandboxPolicy::new(writable)
+                .read_only(method_surface_readonly_roots(worktree, mode));
+            match posture {
+                // Filtered: the allowlist is load-bearing (enforced by the proxy).
+                Network::Filtered => base.filter_egress(egress_hosts),
+                // Unfiltered opt-in: record the intended targets, then open wide.
+                Network::Allow => base.allow_hosts(egress_hosts).allow_unfiltered_egress(true),
+                // Isolated: record intent for audit; posture stays Deny.
+                Network::Deny => base.allow_hosts(egress_hosts),
+            }
         };
         let spec = HarnessSpec {
             chat_id: id.to_string(),
@@ -1438,6 +1506,28 @@ mod tests {
         assert!(model_endpoint_hosts(Some("cloudflare-workers-ai"))
             .iter()
             .any(|h| h == "api.cloudflare.com"));
+    }
+
+    // CORE-5: the per-turn egress posture. A non-isolated project now defaults to
+    // CORE-5 posture precedence: a non-isolated project is FILTERED only where the
+    // host can enforce it, else it keeps the disclosed open-by-default (Allow) — never
+    // a Filtered that would fail closed to Deny and break model access; isolation
+    // denies; the env forces unfiltered.
+    #[test]
+    fn egress_posture_is_filtered_only_when_enforceable_else_open_default() {
+        use gaugewright_harness::sandbox::Network;
+        // Non-isolated + filtering enforceable ⇒ filtered egress to the model endpoints.
+        assert_eq!(egress_posture(false, false, true), Network::Filtered);
+        // Non-isolated + NOT enforceable ⇒ the accepted open-by-default (unfiltered,
+        // disclosed ceiling), NOT a Filtered that would fail closed to Deny (which would
+        // silently break out-of-box model access).
+        assert_eq!(egress_posture(false, false, false), Network::Allow);
+        // Project isolates ⇒ denied (kernel-isolated), regardless of enforceability.
+        assert_eq!(egress_posture(true, false, true), Network::Deny);
+        assert_eq!(egress_posture(true, false, false), Network::Deny);
+        // The unfiltered opt-in wins over everything, isolation and enforceability included.
+        assert_eq!(egress_posture(false, true, true), Network::Allow);
+        assert_eq!(egress_posture(true, true, false), Network::Allow);
     }
 
     /// A scripted Pi transport: canned stdout lines in, sent commands recorded.

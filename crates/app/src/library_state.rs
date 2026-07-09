@@ -1542,15 +1542,33 @@ impl Workbench {
         })
     }
 
-    pub(crate) fn search_transcripts_value(&self, query: &str) -> serde_json::Value {
+    /// SEARCH-2 file-content walk bounds. A per-query worktree walk (NOT a persistent
+    /// file index): the WhippleScript workspace swap (v0.5.0) brings the proper indexing
+    /// primitive, so an index now would be throwaway migration — a bounded walk is correct
+    /// at current scale (the SCALE-* items are deferred as "fine at current scale"). These
+    /// caps keep the walk from being "materially heavier" than folding the chat log:
+    /// at most `FILE_SEARCH_MAX_FILES` files per chat, `FILE_SEARCH_MAX_BYTES` read per file.
+    pub(crate) const FILE_SEARCH_MAX_FILES: usize = 500;
+    pub(crate) const FILE_SEARCH_MAX_BYTES: usize = 256 * 1024;
+
+    /// The full content-search projection (`navigation.md` "Search scope and relevance"):
+    /// the **chat-log** tier (tier 2, SEARCH-1) followed by the **file-content** tier
+    /// (tier 3, SEARCH-2), each hit carrying its `tier` so the nav preserves title > log >
+    /// file ordering. Both tiers are server projections (`INV-5`, projection-first): the
+    /// client never folds transcripts nor walks worktrees. A chat that already matched in
+    /// the log tier is not repeated as a file hit — the stronger (log) tier wins per chat.
+    pub(crate) fn search_value(&self, query: &str) -> serde_json::Value {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
             return serde_json::json!({ "hits": [] });
         }
         let mut chats: Vec<&ChatRecord> = self.library.chats.values().collect();
         chats.sort_by_key(|chat| std::cmp::Reverse(chat.created_position));
+
+        // Tier 2 — chat log: fold each chat's transcript records and substring-match.
         let mut hits = Vec::new();
-        for chat in chats {
+        let mut logged: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for chat in &chats {
             let Ok(rows) = self.store_ref().records(&chat.id, "transcript") else {
                 continue;
             };
@@ -1567,14 +1585,71 @@ impl Workbench {
                 }
             }
             if let Some(index) = hay.to_lowercase().find(&needle) {
+                logged.insert(chat.id.as_str());
                 hits.push(serde_json::json!({
                     "id": chat.id,
                     "title": chat.title,
                     "snippet": Self::snippet_around(&hay, index, needle.len()),
+                    "tier": "log",
                 }));
             }
         }
+
+        // Tier 3 — file content: a bounded walk of each chat's worktree (SEARCH-2),
+        // ranked after the log tier. Chats that already matched in the log are skipped
+        // so each surfaces once via its strongest tier.
+        for chat in &chats {
+            if logged.contains(chat.id.as_str()) {
+                continue;
+            }
+            if let Some(hit) = self.search_engagement_files(chat, &needle) {
+                hits.push(hit);
+            }
+        }
         serde_json::json!({ "hits": hits })
+    }
+
+    /// SEARCH-2 tier-3 walk for one chat: enumerate its live worktree (relative paths,
+    /// `.git` already skipped by [`ChatWorkspace::tree`]) and case-insensitively match the
+    /// first file whose content contains `needle`, returning its path + a one-line snippet.
+    /// Bounded per [`FILE_SEARCH_MAX_FILES`](Self::FILE_SEARCH_MAX_FILES) /
+    /// [`FILE_SEARCH_MAX_BYTES`](Self::FILE_SEARCH_MAX_BYTES); binary files are skipped
+    /// (null-byte sniff in `read_file_capped`). All reads go through the workspace's
+    /// path-confined API, so the walk can never read outside the chat's worktree.
+    fn search_engagement_files(
+        &self,
+        chat: &ChatRecord,
+        needle: &str,
+    ) -> Option<serde_json::Value> {
+        let eng = self.engagements.get(&chat.id)?;
+        let entries = eng.tree().ok()?;
+        let mut scanned = 0usize;
+        for entry in entries {
+            if entry.is_dir {
+                continue;
+            }
+            if scanned >= Self::FILE_SEARCH_MAX_FILES {
+                break;
+            }
+            scanned += 1;
+            let Ok(Some(text)) = eng.read_file_capped(&entry.path, Self::FILE_SEARCH_MAX_BYTES)
+            else {
+                continue;
+            };
+            if let Some(index) = text.to_lowercase().find(needle) {
+                let snippet = Self::snippet_around(&text, index, needle.len());
+                return Some(serde_json::json!({
+                    "id": chat.id,
+                    "title": chat.title,
+                    "path": entry.path,
+                    // The nav renders one snippet per hit (id → snippet); lead a file
+                    // snippet with its path so the row shows which file matched.
+                    "snippet": format!("{}: {}", entry.path, snippet),
+                    "tier": "file",
+                }));
+            }
+        }
+        None
     }
 
     fn snippet_around(text: &str, match_byte: usize, match_len: usize) -> String {

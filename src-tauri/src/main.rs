@@ -9,9 +9,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
 
 fn main() {
     tauri::Builder::default()
+        // FED-7: a `gaugewright://` invite link should reach the RUNNING app, not spawn a
+        // duplicate. single-instance MUST be registered first; on Linux/Windows a deep link
+        // launches a second instance whose argv carries the URL — focus the existing window and
+        // forward that URL into it. macOS delivers to the running instance via `on_open_url`.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+            if let Some(url) = deep_link_from_argv(&argv) {
+                forward_deep_link(app, &url);
+            }
+        }))
         // Native OS folder picker for "add files" (the webview opens a real
         // folder browser; the chosen absolute path is ingested over HTTP).
         .plugin(tauri_plugin_dialog::init())
@@ -21,6 +34,9 @@ fn main() {
         // matching TAURI_SIGNING_PRIVATE_KEY. The startup check/prompt/apply runs
         // in `check_for_update`, spawned from the setup hook below.
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // FED-7: register the `gaugewright://` scheme (schemes declared in tauri.conf.json
+        // `plugins.deep-link`), so the OS routes invite links to this app.
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             // Self-contained runtime (SELFHOST-1): a packaged bundle vendors Pi +
             // git + the membrane plugin and points the control plane at them via
@@ -112,6 +128,19 @@ fn main() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     check_for_update(handle).await;
+                });
+            }
+
+            // FED-7: an OS-delivered `gaugewright://` link arrives here — on cold start (the link
+            // launched the app) on every OS, and on the running app on macOS. Hand each URL to the
+            // web client, which routes an `gaugewright://invite` into the same consent flow as a
+            // pasted link. (The running-app case on Linux/Windows is handled by single-instance.)
+            {
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        forward_deep_link(&handle, url.as_str());
+                    }
                 });
             }
 
@@ -253,9 +282,44 @@ fn webview_org_cp_script(org_cp: Option<&str>) -> Option<String> {
     ))
 }
 
+/// Hand an OS-delivered `gaugewright://` deep link to the web client (FED-7) by dispatching a
+/// `gw-deep-link` DOM CustomEvent on the main window. A plain DOM event — not Tauri IPC — so the
+/// shared web client stays transport-agnostic (a browser build simply never receives one); the
+/// frontend routes the URL into the same invite-decode path as a pasted link.
+fn forward_deep_link(app: &tauri::AppHandle, url: &str) {
+    if let (Some(script), Some(w)) = (
+        deep_link_dispatch_script(url),
+        app.get_webview_window("main"),
+    ) {
+        let _ = w.eval(&script);
+    }
+}
+
+/// The first `gaugewright://` URL in a process argv (FED-7): on Linux/Windows a deep link
+/// launches a second instance with the URL as an argument, which single-instance forwards to the
+/// running app. Pure in its input → unit-testable without a process.
+fn deep_link_from_argv(argv: &[String]) -> Option<String> {
+    argv.iter()
+        .find(|a| a.starts_with("gaugewright://"))
+        .cloned()
+}
+
+/// The webview init script that dispatches a `gw-deep-link` CustomEvent carrying `url` (FED-7).
+/// JSON-escaped (via `serde_json`) so a crafted URL cannot break out of the string literal.
+/// Pure in its input → the produced script is unit-testable without a window.
+fn deep_link_dispatch_script(url: &str) -> Option<String> {
+    let lit = serde_json::to_string(url).ok()?;
+    Some(format!(
+        "try {{ window.dispatchEvent(new CustomEvent('gw-deep-link', {{ detail: {lit} }})); }} catch (e) {{}}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cp_launch_decision, local_cp_bind, webview_org_cp_script};
+    use super::{
+        cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv, local_cp_bind,
+        webview_org_cp_script,
+    };
 
     #[test]
     fn solo_spawns_the_co_resident_control_plane() {
@@ -333,5 +397,35 @@ mod tests {
         assert!(script.contains("setItem('gw.cp'"));
         // The embedded double-quotes are backslash-escaped, not left to close the literal early.
         assert!(script.contains("x\\\"+alert(1)+\\\"y"));
+    }
+
+    #[test]
+    fn deep_link_from_argv_finds_the_scheme() {
+        // FED-7: single-instance receives a second launch's argv; the deep link is the arg
+        // starting with the app scheme (else None — an ordinary launch).
+        assert_eq!(
+            deep_link_from_argv(&["gaugebench".into(), "gaugewright://invite?d=ab".into()]),
+            Some("gaugewright://invite?d=ab".to_string())
+        );
+        assert_eq!(
+            deep_link_from_argv(&["gaugebench".into(), "--some-flag".into()]),
+            None
+        );
+        assert_eq!(deep_link_from_argv(&[]), None);
+    }
+
+    #[test]
+    fn deep_link_dispatch_script_dispatches_the_event() {
+        let script = deep_link_dispatch_script("gaugewright://invite?d=ab").unwrap();
+        assert!(script.contains("gw-deep-link"));
+        assert!(script.contains("\"gaugewright://invite?d=ab\""));
+    }
+
+    #[test]
+    fn deep_link_dispatch_script_is_json_escaped_against_breakout() {
+        // A crafted URL with a double-quote must be escaped, not left to close the literal early.
+        let script = deep_link_dispatch_script("gaugewright://x\");evil()//").unwrap();
+        assert!(script.contains("gw-deep-link"));
+        assert!(script.contains("x\\\");evil()//"));
     }
 }

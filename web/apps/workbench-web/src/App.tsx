@@ -134,6 +134,20 @@ export function App() {
     // A pulse the in-chat "no model attached" action bumps to open the Account panel
     // (LLM-1): the transcript surfaces the refusal, this opens where you fix it.
     const [accountRequest, setAccountRequest] = createSignal(0);
+    // FED-7: an OS-delivered `gaugewright://invite` deep link. The Tauri shell dispatches it as a
+    // `gw-deep-link` DOM CustomEvent (plain event, not IPC), which we route into the Devices
+    // consent flow. A browser build simply never receives one.
+    const [inviteDeepLink, setInviteDeepLink] = createSignal("");
+    if (typeof window !== "undefined") {
+        const onDeepLink = (e: Event) => {
+            const url = (e as CustomEvent).detail;
+            if (typeof url === "string" && url.startsWith("gaugewright://invite")) {
+                setInviteDeepLink(url);
+            }
+        };
+        window.addEventListener("gw-deep-link", onDeepLink);
+        onCleanup(() => window.removeEventListener("gw-deep-link", onDeepLink));
+    }
     const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string } | null>(null);
     // The per-project Engagement pane (FED-7), opened from a project node.
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
@@ -1187,7 +1201,7 @@ export function App() {
             </Show>
             {/* Settings (FED-7): a gear to the right of the network toggle; opens the
                 settings menu → Devices, the single device-management modal. */}
-            <SettingsMenu api={api} openAccount={accountRequest} />
+            <SettingsMenu api={api} openAccount={accountRequest} openInvite={inviteDeepLink} />
         </div>
     );
 

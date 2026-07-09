@@ -483,6 +483,26 @@ export class WorkbenchControlPlane {
         return accountClient.accountRevokeDevice(this.routeJson(), id);
     }
 
+    enrollHost(): Promise<accountClient.EnrollmentTicket> {
+        return accountClient.enrollHost(this.routeJson());
+    }
+
+    enrollHostStatus(session: string): Promise<accountClient.EnrollmentStatus> {
+        return accountClient.enrollHostStatus(this.routeJson(), session);
+    }
+
+    enrollAuthorize(session: string): Promise<void> {
+        return accountClient.enrollAuthorize(this.routeJson(), session);
+    }
+
+    enrollJoin(ticket: accountClient.EnrollmentTicket): Promise<string> {
+        return accountClient.enrollJoin(this.routeJson(), ticket);
+    }
+
+    enrollJoinStatus(session: string): Promise<accountClient.EnrollmentStatus> {
+        return accountClient.enrollJoinStatus(this.routeJson(), session);
+    }
+
     accountSettings(): Promise<Record<string, string>> {
         return accountClient.accountSettings(this.routeJson());
     }

@@ -106,7 +106,7 @@ pub fn workspace_value(wb: &Workbench) -> serde_json::Value {
     wb.workspace_value()
 }
 
-// ---- GET /search : content search across chat transcripts (SEARCH-1) ------
+// ---- GET /search : content search across chat log + worktree files (SEARCH-1/2) ----
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -114,21 +114,23 @@ pub struct SearchQuery {
     pub q: String,
 }
 
-/// Search chat **content** — the chat-log relevance tier of `navigation.md`
-/// "Search scope and relevance". A server projection over the event log
-/// (`INV-5`, projection-first): for each chat we fold its `transcript` records,
-/// pull the human-readable text (user/assistant/admitted `text` and streamed
-/// `delta`), and case-insensitively substring-match the query, returning the
-/// matching chat ids with a one-line snippet of the hit. The client never folds
-/// transcripts itself; the title tier (label match) is a separate pure
-/// client-side filter over the workspace projection. File content is the
-/// deferred third tier (SEARCH-2).
+/// Search chat **content** — the chat-log tier (SEARCH-1) and the file-content tier
+/// (SEARCH-2) of `navigation.md` "Search scope and relevance". A server projection
+/// (`INV-5`, projection-first): for each chat we fold its `transcript` records
+/// (user/assistant/admitted `text` and streamed `delta`) and — for the file tier —
+/// run a **bounded walk** of the chat's worktree, case-insensitively substring-matching
+/// the query and returning matching chat ids with a one-line snippet (and, for a file
+/// hit, its path). Each hit carries a `tier` (`"log"` | `"file"`); log hits rank first,
+/// then file hits, so with the client's title tier the order is title > log > file. The
+/// client never folds transcripts nor walks worktrees; the title tier (label match) is a
+/// separate pure client-side filter over the workspace projection. File search is a
+/// per-query bounded walk, not an index — see [`Workbench::search_value`].
 pub async fn search(
     State(wb): State<SharedWorkbench>,
     Query(sq): Query<SearchQuery>,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    Json(wb.search_transcripts_value(&sq.q)).into_response()
+    Json(wb.search_value(&sq.q)).into_response()
 }
 
 // ---- GET /tasks : the human task queue -----------------------------------
@@ -1573,14 +1575,17 @@ mod tests {
 
 #[cfg(test)]
 mod search_tests {
-    //! Content search (SEARCH-1): `GET /search?q=` folds chat transcripts and
-    //! returns the chats whose **log** matches, with a snippet — the chat-log
-    //! relevance tier of `navigation.md`.
+    //! Content search: `GET /search?q=` folds chat transcripts (SEARCH-1, the
+    //! chat-log tier) and runs a bounded walk of each chat's worktree files
+    //! (SEARCH-2, the file-content tier) — tiers 2 and 3 of `navigation.md`
+    //! "Search scope and relevance", each hit tagged with its `tier`.
     use crate::library::ChatRecord;
     use crate::stream::ServerEvent;
     use crate::{open_control_plane, Workbench};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use gaugewright_store::Store;
+    use gaugewright_workspace::Instance;
     use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
@@ -1662,5 +1667,141 @@ mod search_tests {
         let (status, v) = get(&seed(), "/search?q=").await;
         assert_eq!(status, StatusCode::OK);
         assert!(v["hits"].as_array().unwrap().is_empty());
+    }
+
+    // ---- SEARCH-2: the file-content tier (bounded worktree walk) --------------
+
+    /// A router with one real chat on a live instance, holding the given worktree
+    /// files. The chat's log is empty (nothing tasked), so a hit here can only come
+    /// from the file tier. The `TempDir` must outlive the router (it owns the repo).
+    fn router_with_worktree_files(files: &[(&str, &str)]) -> (tempfile::TempDir, axum::Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut wb = Workbench::with_instance("inst-test", instance, store);
+        wb.create_default_engagement("chat-f".into(), "files chat".into())
+            .unwrap_or_else(|_| panic!("create default engagement"));
+        {
+            // Write via the same path-confined worktree API the walk reads back through.
+            let eng = wb.engagements.get("chat-f").unwrap();
+            for (path, content) in files {
+                eng.write_file(path, content).unwrap();
+            }
+        }
+        (dir, open_control_plane(Arc::new(Mutex::new(wb))))
+    }
+
+    /// SEARCH-2: a term present only in a worktree file (not the title, not the log)
+    /// surfaces the chat as a `file`-tier hit, carrying the file path and a snippet.
+    #[tokio::test]
+    async fn file_content_match_surfaces_chat_with_snippet() {
+        let (_dir, app) =
+            router_with_worktree_files(&[("notes/spec.md", "the WIDGETRON schematic lives here")]);
+        let (status, v) = get(&app, "/search?q=widgetron").await;
+        assert_eq!(status, StatusCode::OK);
+        let hits = v["hits"].as_array().unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the worktree file mentions widgetron: {v}"
+        );
+        assert_eq!(hits[0]["id"], "chat-f");
+        assert_eq!(hits[0]["tier"], "file");
+        assert_eq!(hits[0]["path"], "notes/spec.md");
+        let snippet = hits[0]["snippet"].as_str().unwrap();
+        assert!(
+            snippet.contains("WIDGETRON"),
+            "snippet shows the hit: {snippet}"
+        );
+        assert!(
+            snippet.contains("notes/spec.md"),
+            "snippet leads with path: {snippet}"
+        );
+    }
+
+    /// The walk skips **binary** files (null-byte sniff): a match inside a file with a
+    /// NUL byte is not a content hit, so binary blobs never surface as noise.
+    #[tokio::test]
+    async fn binary_file_is_skipped_in_content_search() {
+        let (_dir, app) =
+            router_with_worktree_files(&[("blob.bin", "WIDGETRON\u{0}\u{1}\u{2}binary")]);
+        let (status, v) = get(&app, "/search?q=widgetron").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            v["hits"].as_array().unwrap().is_empty(),
+            "a NUL-bearing file is treated as binary and skipped: {v}"
+        );
+    }
+
+    /// The per-file byte cap bounds the walk: a term past `FILE_SEARCH_MAX_BYTES` is
+    /// never read, so it does not match — the walk stays no heavier than the log fold.
+    #[tokio::test]
+    async fn content_search_respects_per_file_byte_cap() {
+        let mut big = "x".repeat(Workbench::FILE_SEARCH_MAX_BYTES);
+        big.push_str("WIDGETRON"); // past the cap — outside the scanned prefix
+        let (_dir, app) = router_with_worktree_files(&[("big.txt", &big)]);
+        let (_status, v) = get(&app, "/search?q=widgetron").await;
+        assert!(
+            v["hits"].as_array().unwrap().is_empty(),
+            "a term beyond the byte cap is not read, so not matched: {v}"
+        );
+    }
+
+    /// The per-chat file cap bounds the walk: with more than `FILE_SEARCH_MAX_FILES`
+    /// files, one whose (sorted) path falls past the cap is never scanned.
+    #[tokio::test]
+    async fn content_search_stops_after_per_chat_file_cap() {
+        // FILE_SEARCH_MAX_FILES filler files sort before `zzz-last.txt`, which alone
+        // carries the term — so the term-bearing file is beyond the scan cap.
+        let mut files: Vec<(String, String)> = (0..Workbench::FILE_SEARCH_MAX_FILES)
+            .map(|i| (format!("f{i:04}.txt"), "nothing to see".to_string()))
+            .collect();
+        files.push(("zzz-last.txt".into(), "the WIDGETRON is here".into()));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let (_dir, app) = router_with_worktree_files(&refs);
+        let (_status, v) = get(&app, "/search?q=widgetron").await;
+        assert!(
+            v["hits"].as_array().unwrap().is_empty(),
+            "the term-bearing file past the file cap is not scanned: {v}"
+        );
+    }
+
+    /// Ordering (title > log > file): a chat whose **log** matches surfaces as a `log`
+    /// hit and is not repeated as a `file` hit even when a worktree file also carries the
+    /// term — the stronger tier wins per chat, so the row shows the log snippet once.
+    #[tokio::test]
+    async fn log_hit_suppresses_file_hit_for_same_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut wb = Workbench::with_instance("inst-test", instance, store);
+        wb.create_default_engagement("chat-both".into(), "both tiers".into())
+            .unwrap_or_else(|_| panic!("create default engagement"));
+        wb.engagements
+            .get("chat-both")
+            .unwrap()
+            .write_file("note.txt", "the SENTINEL token in a file")
+            .unwrap();
+        // The same term also in the chat's log.
+        wb.write_chat_transcript_event(
+            "chat-both",
+            ServerEvent::User {
+                text: "please check the SENTINEL".into(),
+            },
+        )
+        .unwrap();
+        let app = open_control_plane(Arc::new(Mutex::new(wb)));
+        let (status, v) = get(&app, "/search?q=sentinel").await;
+        assert_eq!(status, StatusCode::OK);
+        let hits = v["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "one hit per chat, log tier wins: {v}");
+        assert_eq!(hits[0]["tier"], "log");
+        assert!(
+            hits[0]["path"].is_null(),
+            "a log hit carries no file path: {v}"
+        );
     }
 }

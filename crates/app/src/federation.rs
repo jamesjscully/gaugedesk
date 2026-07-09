@@ -4292,6 +4292,25 @@ fn incoming_deployment_mode(
         .and_then(|p| p.deployment_mode)
 }
 
+/// ITGOV-3(a): does `policy` admit the relocated `project`'s declared deployment mode?
+/// No attestation quote is exchanged over a handoff, so an attested-required policy refuses a
+/// handoff that can't prove it (`pairing_admitted(..., measurement_verified = false)`),
+/// fail-closed. Always `true` (no-op) when `policy` is `open()` — solo / no policy. Shared by
+/// `post_handoff_accept` (single, 403) and `post_handoff_accept_all` (bulk, skip) so the batch
+/// path enforces the same gate.
+fn handoff_placement_admitted(
+    policy: &gaugewright_core::boundary_lifecycle::PlacementPolicy,
+    log: &[HandoffLogRecord],
+    project: &str,
+) -> bool {
+    if *policy == gaugewright_core::boundary_lifecycle::PlacementPolicy::open() {
+        return true;
+    }
+    let declared = incoming_deployment_mode(log, project)
+        .unwrap_or_else(gaugewright_core::boundary_lifecycle::Placement::local);
+    gaugewright_core::boundary_lifecycle::pairing_admitted(policy, &declared, false)
+}
+
 pub async fn post_handoff_accept(
     State(wb): State<SharedWorkbench>,
     headers: axum::http::HeaderMap,
@@ -4329,20 +4348,12 @@ pub async fn post_handoff_accept(
         let placement_policy = crate::org::Org::rebuild(guard.store_ref())
             .map(|o| o.effective_placement_policy())
             .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
-        if placement_policy != gaugewright_core::boundary_lifecycle::PlacementPolicy::open() {
-            let declared = incoming_deployment_mode(&log, req.project.as_str())
-                .unwrap_or_else(gaugewright_core::boundary_lifecycle::Placement::local);
-            if !gaugewright_core::boundary_lifecycle::pairing_admitted(
-                &placement_policy,
-                &declared,
-                false,
-            ) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    "the incoming project's deployment mode is not admitted by this org's placement policy",
-                )
-                    .into_response();
-            }
+        if !handoff_placement_admitted(&placement_policy, &log, req.project.as_str()) {
+            return (
+                StatusCode::FORBIDDEN,
+                "the incoming project's deployment mode is not admitted by this org's placement policy",
+            )
+                .into_response();
         }
         let committed = commit_incoming_handoff(&mut guard, &req.project, &log, &content);
         if committed {
@@ -4418,6 +4429,12 @@ pub async fn post_handoff_accept_all(
             return (code, msg).into_response();
         }
         let me = guard.authority().as_str().to_string();
+        // ITGOV-3(a): the same org placement policy `post_handoff_accept` enforces, applied per
+        // offer in the batch — a non-compliant relocated project is skipped (left pending, not
+        // committed), the bulk analog of the single-accept 403. Rebuilt once (org-wide).
+        let placement_policy = crate::org::Org::rebuild(guard.store_ref())
+            .map(|o| o.effective_placement_policy())
+            .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
         let mut accepted: Vec<String> = Vec::new();
         let mut notifies: Vec<(HandoffNotify, String)> = Vec::new();
         for offer in pending_incoming(guard.store_ref()) {
@@ -4430,6 +4447,11 @@ pub async fn post_handoff_accept_all(
                 serde_json::from_value(offer["log"].clone()).unwrap_or_default();
             let content: Vec<HandoffContentBundle> =
                 serde_json::from_value(offer["content"].clone()).unwrap_or_default();
+            // Fail-closed: a project whose declared deployment mode the org policy won't admit is
+            // not committed and not marked resolved — it stays pending (`INV-20`).
+            if !handoff_placement_admitted(&placement_policy, &log, &project) {
+                continue;
+            }
             let committed = commit_incoming_handoff(&mut guard, &project, &log, &content);
             if committed {
                 record_participants(guard.store_mut(), &project, &me, &source);
@@ -4954,6 +4976,68 @@ mod handoff_routes_tests {
             resp.status(),
             StatusCode::FORBIDDEN,
             "an attested-required org policy refuses a handoff that can't prove attestation"
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_accept_all_skips_projects_refused_by_org_placement_policy() {
+        // ITGOV-3(a): the batch accept-all enforces the SAME placement policy as single accept —
+        // a non-compliant relocated project is skipped (committed=no), left pending rather than
+        // resolved. Previously accept-all had no policy gate (a fail-open batch seam).
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use http_body_util::BodyExt;
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+
+        let mut wb = crate::Workbench::new(mem_store());
+        // Attested-required org policy; a handoff carries no attestation quote (fail-closed).
+        wb.store_mut()
+            .append_record(
+                "org",
+                "placement_policy",
+                &serde_json::json!({"id":"","op":"upsert","policy":{"require_attested":true,"allowed_operators":[]}})
+                    .to_string(),
+            )
+            .unwrap();
+        // A pending incoming handoff for a project that declares no (attested) deployment mode.
+        wb.store_mut()
+            .append_record(
+                "handoff::incoming",
+                "event",
+                &serde_json::json!({"op":"offer","project":"p1","source":"peer","log":[],"content":[]})
+                    .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_incoming(wb.store_ref()).len(),
+            1,
+            "the seeded offer is pending"
+        );
+
+        let state = Arc::new(Mutex::new(wb));
+        let app = featured_routes(true).with_state(state.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/federation/handoff/accept-all")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["accepted"].as_array().map(|a| a.len()),
+            Some(0),
+            "the non-compliant project is not accepted"
+        );
+        // Fail-closed, not declined: the offer stays pending (no `resolved` event written), so a
+        // later policy-compliant path can still admit it.
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            pending_incoming(guard.store_ref()).len(),
+            1,
+            "the refused offer remains pending, not resolved"
         );
     }
 

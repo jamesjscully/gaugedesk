@@ -8,6 +8,10 @@ description = "gaugewright runtime seam: the adapter-free Harness contract, egre
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
+# Async local TCP for the host-filtering egress proxy (CORE-5). Reuses the
+# workspace's existing tokio (the `app` crate already pins 1.x, so no new external
+# dependency enters the lock); only the net/io/rt features the proxy needs.
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"

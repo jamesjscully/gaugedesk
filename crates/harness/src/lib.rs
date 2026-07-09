@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub mod egress_proxy;
 pub mod sandbox;
 pub mod testing;
 

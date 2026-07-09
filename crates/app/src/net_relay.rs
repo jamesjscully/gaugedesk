@@ -141,7 +141,7 @@ impl EnvelopeWire {
 /// Frame a message as a 4-byte big-endian length prefix followed by its bytes,
 /// and write it. The broker forwards these bytes verbatim — it never decodes the
 /// frame.
-async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
     if bytes.len() > MAX_FRAME_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -162,7 +162,7 @@ async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()
 
 /// Read one length-prefixed frame. The claimed length is validated against
 /// [`MAX_FRAME_SIZE`] before any allocation (RF-A1).
-async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+pub(crate) async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -178,7 +178,7 @@ async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 }
 
 /// Pad/truncate a session token to the fixed wire width.
-fn token_bytes(token: &str) -> [u8; TOKEN_LEN] {
+pub(crate) fn token_bytes(token: &str) -> [u8; TOKEN_LEN] {
     let mut buf = [0u8; TOKEN_LEN];
     let src = token.as_bytes();
     let n = src.len().min(TOKEN_LEN);

@@ -16,6 +16,8 @@
 
 import { createResource, createSignal, For, onMount, Show, type JSX } from "solid-js";
 import type {
+    EnrollmentStatus,
+    EnrollmentTicket,
     FederationPeer,
     HandoffStatus,
     IncomingHandoff,
@@ -39,6 +41,9 @@ function freshDeviceId(): string {
 export function DevicesModal(props: {
     api: DevicesModalApi;
     environment?: string;
+    /** FED-7: seed the invite paste field from an OS-delivered `gaugewright://invite` deep link,
+     *  so the consent preview renders as if the link had been pasted. */
+    initialInviteLink?: string;
     onClose: () => void;
 }): JSX.Element {
     const [status, setStatus] = createSignal("");
@@ -49,7 +54,87 @@ export function DevicesModal(props: {
     const [peerTicket, setPeerTicket] = createSignal("");
     const [peerCopied, setPeerCopied] = createSignal(false);
     const [pasted, setPasted] = createSignal("");
-    const [inviteLink, setInviteLink] = createSignal("");
+    const [inviteLink, setInviteLink] = createSignal(props.initialInviteLink ?? "");
+
+    // Device-enrollment handshake (ACCT-1). The holder hosts a session, shows the ticket,
+    // then compares the 6-char SAS with the new device before confirming; the new device
+    // pastes the ticket, shows its SAS, and waits. A relay-substituted subkey shows up as a
+    // mismatched SAS the human catches — so the confirm is the load-bearing act.
+    const [hostTicket, setHostTicket] = createSignal<EnrollmentTicket | null>(null);
+    const [hostStatus, setHostStatus] = createSignal<EnrollmentStatus | null>(null);
+    const [joinTicketText, setJoinTicketText] = createSignal("");
+    const [joinStatus, setJoinStatus] = createSignal<EnrollmentStatus | null>(null);
+    // The session currently being polled per role (a restart cancels the old loop).
+    let hostSession = "";
+    let joinSession = "";
+    const terminal = (phase?: string) =>
+        phase === "completed" || phase === "failed" || phase === "expired";
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+    const startHost = async () => {
+        try {
+            const ticket = await props.api.enrollHost();
+            setHostTicket(ticket);
+            setHostStatus(null);
+            hostSession = ticket.session;
+            void pollHost(ticket.session);
+        } catch (e) {
+            setStatus(`add-a-device failed: ${e}`);
+        }
+    };
+    const pollHost = async (session: string) => {
+        while (hostSession === session) {
+            try {
+                const s = await props.api.enrollHostStatus(session);
+                if (hostSession !== session) return;
+                setHostStatus(s);
+                if (terminal(s.phase)) return;
+            } catch {
+                /* keep polling — a transient read is not fatal */
+            }
+            await sleep(1000);
+        }
+    };
+    const confirmHost = async () => {
+        const t = hostTicket();
+        if (!t) return;
+        try {
+            await props.api.enrollAuthorize(t.session);
+        } catch (e) {
+            setStatus(`confirm failed: ${e}`);
+        }
+    };
+
+    const startJoin = async () => {
+        let ticket: EnrollmentTicket;
+        try {
+            ticket = JSON.parse(joinTicketText()) as EnrollmentTicket;
+        } catch {
+            setStatus("that does not look like a device ticket");
+            return;
+        }
+        try {
+            const session = await props.api.enrollJoin(ticket);
+            setJoinStatus(null);
+            joinSession = session;
+            void pollJoin(session);
+        } catch (e) {
+            setStatus(`join failed: ${e}`);
+        }
+    };
+    const pollJoin = async (session: string) => {
+        while (joinSession === session) {
+            try {
+                const s = await props.api.enrollJoinStatus(session);
+                if (joinSession !== session) return;
+                setJoinStatus(s);
+                if (terminal(s.phase)) return;
+            } catch {
+                /* keep polling */
+            }
+            await sleep(1000);
+        }
+    };
 
     const [peers, { refetch: refetchPeers }] = createResource(() => props.api.listPeers());
     const [incoming, { refetch: refetchIncoming }] = createResource(() =>
@@ -232,6 +317,105 @@ export function DevicesModal(props: {
                     </button>
                 </div>
 
+                {/* Secure enrollment handshake (ACCT-1): the holder shows a ticket + compares
+                    the SAS before authorizing; the account key is transferred sealed. */}
+                <h4 style={{ "margin-top": "16px" }}>Add a device securely</h4>
+                <p class="status" style={{ margin: "0 0 8px" }}>
+                    Enroll a new device into this account. Show it this ticket, then compare the
+                    6-digit code on both screens before you confirm — it must match.
+                </p>
+                <Show
+                    when={hostTicket()}
+                    fallback={
+                        <button type="button" class="tree-action" data-enroll-host-start onClick={() => void startHost()}>
+                            add a device
+                        </button>
+                    }
+                >
+                    {(t) => (
+                        <div data-enroll-host>
+                            <div
+                                class="pd-qr"
+                                data-enroll-host-qr
+                                innerHTML={qrSvg(JSON.stringify(t()))}
+                            />
+                            <code class="pair-ticket" data-enroll-host-ticket>{JSON.stringify(t())}</code>
+                            <Show
+                                when={hostStatus()?.sas}
+                                fallback={
+                                    <p class="status" data-enroll-host-waiting>
+                                        Waiting for the new device to connect…
+                                    </p>
+                                }
+                            >
+                                {(sas) => (
+                                    <div class="engagement-invite" data-enroll-host-sas>
+                                        <Show
+                                            when={hostStatus()?.phase === "completed"}
+                                            fallback={
+                                                <>
+                                                    <p class="status">
+                                                        Compare this code with the new device:{" "}
+                                                        <strong data-enroll-host-code>{sas()}</strong>
+                                                    </p>
+                                                    <button
+                                                        type="button"
+                                                        class="tree-action"
+                                                        data-enroll-host-confirm
+                                                        onClick={() => void confirmHost()}
+                                                    >
+                                                        it matches — confirm &amp; authorize
+                                                    </button>
+                                                </>
+                                            }
+                                        >
+                                            <p class="status" data-enroll-host-done>
+                                                Device enrolled ✓
+                                            </p>
+                                        </Show>
+                                    </div>
+                                )}
+                            </Show>
+                        </div>
+                    )}
+                </Show>
+
+                <h4 style={{ "margin-top": "16px" }}>Join this account</h4>
+                <p class="status" style={{ margin: "0 0 8px" }}>
+                    On a new device: paste the ticket from an already-enrolled device, then check the
+                    6-digit code matches before the other device confirms.
+                </p>
+                <textarea
+                    class="fed-paste"
+                    data-enroll-join-ticket
+                    rows={2}
+                    value={joinTicketText()}
+                    placeholder="paste a device ticket"
+                    onInput={(e) => setJoinTicketText(e.currentTarget.value)}
+                />
+                <button type="button" class="tree-action" data-enroll-join-start onClick={() => void startJoin()}>
+                    join
+                </button>
+                <Show when={joinStatus()?.sas}>
+                    {(sas) => (
+                        <div class="engagement-invite" data-enroll-join-sas>
+                            <Show
+                                when={joinStatus()?.phase === "completed"}
+                                fallback={
+                                    <p class="status">
+                                        Your code: <strong data-enroll-join-code>{sas()}</strong> — check it
+                                        matches the other device, then wait for it to confirm.
+                                    </p>
+                                }
+                            >
+                                <p class="status" data-enroll-join-done>
+                                    Enrolled ✓ — this device now shares the account.
+                                </p>
+                            </Show>
+                        </div>
+                    )}
+                </Show>
+
                 <hr class="devices-sep" />
 
                 {/* Connect a separate party — a different authority (the client). This is
@@ -325,6 +509,13 @@ export function DevicesModal(props: {
 }
 
 export interface DevicesModalApi {
+    // Device-enrollment handshake (ACCT-1, ADR 0055): the holder hosts + authorizes on a
+    // matched SAS; the new device joins and recovers the account key (sealed over the broker).
+    enrollHost(): Promise<EnrollmentTicket>;
+    enrollHostStatus(session: string): Promise<EnrollmentStatus>;
+    enrollAuthorize(session: string): Promise<void>;
+    enrollJoin(ticket: EnrollmentTicket): Promise<string>;
+    enrollJoinStatus(session: string): Promise<EnrollmentStatus>;
     listPeers(): Promise<FederationPeer[]>;
     handoffIncoming(): Promise<IncomingHandoff[]>;
     mintPairingTicket(): Promise<PairingTicket>;

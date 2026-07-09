@@ -30,6 +30,24 @@ pub fn routes() -> Router<SharedWorkbench> {
         // sealed linked-credentials. Ungated (the operator owns their account).
         .route("/account/devices", get(get_devices).post(post_device))
         .route("/account/devices/:id/revoke", post(post_device_revoke))
+        // Device-enrollment handshake drive (ACCT-1, ADR 0055): the holder hosts +
+        // authorizes; the new device joins. Both dial the rendezvous broker; status
+        // GETs surface the phase + SAS for the out-of-band human compare. The account
+        // key crosses only as ECIES ciphertext over the broker, never over HTTP.
+        .route("/account/devices/enroll/host", post(post_enroll_host))
+        .route(
+            "/account/devices/enroll/host/:session",
+            get(get_enroll_host),
+        )
+        .route(
+            "/account/devices/enroll/authorize",
+            post(post_enroll_authorize),
+        )
+        .route("/account/devices/enroll/join", post(post_enroll_join))
+        .route(
+            "/account/devices/enroll/join/:session",
+            get(get_enroll_join),
+        )
         .route("/account/settings", get(get_settings))
         .route("/account/settings/:key", put(put_setting))
         .route(
@@ -193,6 +211,116 @@ pub async fn post_device_revoke(
         Err(e) => return err_response(e),
     };
     (StatusCode::OK, Json(json!({ "device": record }))).into_response()
+}
+
+// ---- device enrollment handshake (ACCT-1, ADR 0055) ----------------------
+//
+// The full handshake `post_device` deferred: an existing (holder) device authorizes
+// a new one over the rendezvous broker and hands over the account key, sealed to the
+// new device's subkey. Two roles, each a background leg the status GETs poll:
+//
+//   holder:      POST /enroll/host        -> mint + show the ticket
+//                GET  /enroll/host/:sess   -> phase + SAS (compare with the new device)
+//                POST /enroll/authorize    -> the human confirmed the SAS matches
+//   new device:  POST /enroll/join {ticket} -> consume the ticket, start the leg
+//                GET  /enroll/join/:sess    -> phase + SAS (compare with the holder)
+//
+// Fail-closed: no authorize without the explicit confirm; a substituted subkey shows
+// up as a mismatched SAS the human catches; a lapsed pairing times the leg out.
+
+/// A leg's phase + SAS for a status poll (never the account key — `INV-10`).
+fn enroll_status_json(
+    snapshot: Option<(
+        crate::device_enroll_drive::EnrollPhase,
+        Option<String>,
+        Option<String>,
+    )>,
+) -> axum::response::Response {
+    match snapshot {
+        Some((phase, sas, error)) => (
+            StatusCode::OK,
+            Json(json!({ "phase": phase, "sas": sas, "error": error })),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no such enrollment session").into_response(),
+    }
+}
+
+/// Holder: start the enrollment host leg and return the out-of-band ticket to show
+/// (QR + code). The leg waits at the broker for the new device, then for the human's
+/// SAS confirm.
+pub async fn post_enroll_host(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let scope = wb
+        .lock_unpoisoned()
+        .account_scope_for(net_http::bearer(&headers));
+    match crate::device_enroll_drive::start_host(&wb, scope) {
+        Some(ticket) => (StatusCode::OK, Json(json!({ "ticket": ticket }))).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not start enrollment",
+        )
+            .into_response(),
+    }
+}
+
+/// Holder: the current phase + SAS of a host leg (poll after showing the ticket).
+pub async fn get_enroll_host(
+    State(wb): State<SharedWorkbench>,
+    Path(session): Path<String>,
+) -> impl IntoResponse {
+    let drive = wb.lock_unpoisoned().enroll_drive();
+    enroll_status_json(drive.host_snapshot(&session))
+}
+
+#[derive(Deserialize)]
+pub struct EnrollAuthorizeBody {
+    session: String,
+}
+
+/// Holder: the human confirmed the SAS matches the new device's — release the host
+/// leg to authorize. `409` if the leg is not awaiting confirmation (fail-closed).
+pub async fn post_enroll_authorize(
+    State(wb): State<SharedWorkbench>,
+    Json(body): Json<EnrollAuthorizeBody>,
+) -> impl IntoResponse {
+    let drive = wb.lock_unpoisoned().enroll_drive();
+    match drive.confirm_host(&body.session) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "authorized": true }))).into_response(),
+        Err(e) => (StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct EnrollJoinBody {
+    ticket: crate::device_enroll_drive::EnrollmentTicket,
+}
+
+/// New device: consume a ticket and start the join leg. Returns the session id to
+/// poll for the SAS + outcome.
+pub async fn post_enroll_join(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Json(body): Json<EnrollJoinBody>,
+) -> impl IntoResponse {
+    let scope = wb
+        .lock_unpoisoned()
+        .account_scope_for(net_http::bearer(&headers));
+    match crate::device_enroll_drive::start_join(&wb, scope, body.ticket) {
+        Ok(session) => (StatusCode::OK, Json(json!({ "session": session }))).into_response(),
+        Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e).into_response(),
+    }
+}
+
+/// New device: the current phase + SAS of a join leg (poll for the outcome).
+pub async fn get_enroll_join(
+    State(wb): State<SharedWorkbench>,
+    Path(session): Path<String>,
+) -> impl IntoResponse {
+    let drive = wb.lock_unpoisoned().enroll_drive();
+    enroll_status_json(drive.join_snapshot(&session))
 }
 
 // ---- settings ------------------------------------------------------------

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capability for the GaugeBench window.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "updater:default"]
+  "permissions": ["core:default", "dialog:allow-open", "updater:default", "deep-link:default"]
 }
