@@ -1,4 +1,4 @@
-# Public CI for the gaugebench open-source mirror. Published AS ci.yml by
+# Public CI for the gaugedesk open-source mirror. Published AS ci.yml by
 # scripts/publish-public-mirror.sh. It runs only the lanes that need nothing but
 # public source: Rust fmt/clippy/test and the web/ee typecheck+build+unit tests.
 # The private repo's ci.yml additionally runs the Quint model checks, the

@@ -185,6 +185,10 @@ pub(crate) fn build_workbench_with_content_keywrap(
     wb.restore_startup_local_projections();
     wb.apply_startup_root(root);
     wb.activate_configured_authority();
+    // ACCT-1 / ADR 0053 §4: re-adopt a previously-recovered account key (an enrolled
+    // device that joined another root) from its at-rest wrap, so restarts keep opening
+    // the sealed account state. No-op on a holder / seed-recovered device (none stored).
+    wb.restore_recovered_account_key();
     // Stand up + seed the account-global onboarding tracker (ADR 0075). Runs
     // after the root is applied so the tracker's store files resolve under it;
     // best-effort, so a tracker failure never aborts workbench startup.

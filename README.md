@@ -1,10 +1,10 @@
-# GaugeBench
+# GaugeDesk
 
-GaugeBench is a free, event-sourced, projection-first desktop workbench for
+GaugeDesk is a free, event-sourced, projection-first desktop workbench for
 governed, multi-party agentic work — a way to apply external expertise to
 private operational context under review, release, and audit controls.
 
-This repository is the open, source-available distribution of the GaugeBench
+This repository is the open, source-available distribution of the GaugeDesk
 platform.
 
 ## What's here
@@ -24,7 +24,7 @@ platform.
 ## Download
 
 Prebuilt desktop bundles — Linux `.deb`/`.AppImage`, macOS `.dmg`, Windows `.msi`
-— are on the [releases page](https://github.com/jamesjscully/gaugebench/releases).
+— are on the [releases page](https://github.com/jamesjscully/gaugedesk/releases).
 Installers are currently unsigned.
 
 ## Licensing
@@ -52,7 +52,7 @@ npm run typecheck && npm run test
 
 ## Verifying the security claims
 
-GaugeBench's protection model is structural, and much of it is machine-checked.
+GaugeDesk's protection model is structural, and much of it is machine-checked.
 [Verifying the security claims](docs/reference/verifying-claims.md) maps each
 guarantee to the executable tests in this repository that exercise it. The formal
 Quint models those tests are derived from are maintained in a separate private
@@ -62,7 +62,7 @@ repository; the tests that check the same properties are public here.
 
 | Project | What it is |
 | --- | --- |
-| GaugeWright | The company that builds GaugeBench |
+| GaugeWright | The company that builds GaugeDesk |
 | WhippleScript | Orchestration language + runtime |
 | `gaugewright-cloud` (private) | Hosted control plane, managed relay, embed host, attestation/KMS, settlement plane |
 | `gaugewright-directory` | The blind account directory service |

@@ -180,7 +180,7 @@ async fn check_for_update(app: tauri::AppHandle) {
     let accepted = app
         .dialog()
         .message(format!(
-            "GaugeBench {} is available (you have {}). Download it and restart to update?",
+            "GaugeDesk {} is available (you have {}). Download it and restart to update?",
             update.version, update.current_version
         ))
         .title("Update available")
@@ -404,11 +404,11 @@ mod tests {
         // FED-7: single-instance receives a second launch's argv; the deep link is the arg
         // starting with the app scheme (else None — an ordinary launch).
         assert_eq!(
-            deep_link_from_argv(&["gaugebench".into(), "gaugewright://invite?d=ab".into()]),
+            deep_link_from_argv(&["gaugedesk".into(), "gaugewright://invite?d=ab".into()]),
             Some("gaugewright://invite?d=ab".to_string())
         );
         assert_eq!(
-            deep_link_from_argv(&["gaugebench".into(), "--some-flag".into()]),
+            deep_link_from_argv(&["gaugedesk".into(), "--some-flag".into()]),
             None
         );
         assert_eq!(deep_link_from_argv(&[]), None);

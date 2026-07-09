@@ -1,5 +1,5 @@
 /**
- * Step definitions for the GaugeBench user stories. The client is a thin
+ * Step definitions for the GaugeDesk user stories. The client is a thin
  * renderer over the control plane, so the steps drive the real UI (clicks +
  * reads) and assert on rendered projections — never on internal state.
  *

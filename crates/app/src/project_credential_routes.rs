@@ -57,8 +57,7 @@ pub async fn post_project_credential(
             .into_response();
     }
     let mut wb = wb.lock_unpoisoned();
-    let authority = wb.authority().as_str().to_string();
-    let Some(sealed) = seal_token(&authority, &body.token) else {
+    let Some(sealed) = seal_token(wb.account_key(), &body.token) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "seal failed").into_response();
     };
     let provider = body.provider;

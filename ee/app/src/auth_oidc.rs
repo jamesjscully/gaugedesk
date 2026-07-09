@@ -630,8 +630,7 @@ pub fn provision_web_account(
 /// (`INV-1`). A single latest-wins `refresh` record — best-effort (a seal failure is a no-op, the
 /// session just falls back to re-login at id-token expiry).
 fn store_refresh_token(wb: &mut Workbench, person: &str, refresh_token: &str) {
-    let authority = wb.authority().as_str().to_string();
-    let Some(sealed) = gaugewright_app::account::seal_token(&authority, refresh_token) else {
+    let Some(sealed) = wb.seal_account_secret(refresh_token) else {
         return;
     };
     let scope = gaugewright_app::account::account_scope(person);
@@ -642,12 +641,11 @@ fn store_refresh_token(wb: &mut Workbench, person: &str, refresh_token: &str) {
 /// The person's stored refresh token, unsealed — `None` if none is stored or it fails to open.
 fn resolve_refresh_token(wb: &Workbench, person: &str) -> Option<String> {
     let scope = gaugewright_app::account::account_scope(person);
-    let authority = wb.authority().as_str().to_string();
     let rows = wb.store_ref().records(&scope, "refresh").ok()?;
     let last = rows.last()?; // latest-wins
     let doc: serde_json::Value = serde_json::from_str(last).ok()?;
     let sealed = doc.get("sealed").and_then(|v| v.as_str())?;
-    gaugewright_app::account::unseal_token(&authority, sealed)
+    wb.unseal_account_secret(sealed)
 }
 
 /// A Google (or any OIDC) SSO connection for the hosted web account, from env — so the hub

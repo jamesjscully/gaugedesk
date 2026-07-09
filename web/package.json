@@ -1,10 +1,10 @@
 {
-  "name": "gaugewright-web",
-  "version": "0.4.2",
+  "name": "gaugedesk-web",
+  "version": "0.4.3",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
-  "description": "GaugeBench \u2014 the Solid 1.x projection-first island.",
+  "description": "GaugeDesk \u2014 the Solid 1.x projection-first island.",
   "workspaces": [
     "apps/*",
     "packages/*"

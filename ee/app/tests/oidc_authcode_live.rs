@@ -46,7 +46,7 @@ fn auth_code_exchanges_for_a_token_that_verifies() {
     let http = HttpClient::new();
 
     // Redeem the code with the PKCE verifier — the real token exchange.
-    let id_token = exchange_code(
+    let (id_token, _refresh_token) = exchange_code(
         &token_endpoint,
         &client_id,
         &redirect,

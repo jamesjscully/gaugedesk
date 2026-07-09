@@ -28,7 +28,7 @@ export async function embedMyChats(json: RouteJson): Promise<{ chat: string; tit
 }
 
 /** The deployment's public embed config the panel reads to honor white-label (EMBED-7):
- *  when `white_label` is set, the panel suppresses the "Powered by GaugeBench" mark. */
+ *  when `white_label` is set, the panel suppresses the "Powered by GaugeDesk" mark. */
 export async function embedGetConfig(json: RouteJson): Promise<{ white_label: boolean }> {
     const o = (await json("GET", "/embed/config")) as { config?: { white_label?: boolean } };
     return { white_label: Boolean(o.config?.white_label) };

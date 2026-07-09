@@ -7,7 +7,7 @@ Feature: Output catalog (O-4)
 
   Scenario: a produced output appears in the catalog with its review state
     Given a new engagement
-    When I attach the context folder "/home/jack/code/gaugebench/plugin"
+    When I attach the context folder "/home/jack/code/gaugedesk/plugin"
     And I task the agent and let the turn settle
     When I open the outputs catalog
     Then the outputs catalog lists an output
@@ -20,7 +20,7 @@ Feature: Output catalog (O-4)
 
   Scenario: a held output shows its stakeholders and can be consented to release (UX-11)
     Given a new engagement
-    When I attach the context folder "/home/jack/code/gaugebench/plugin"
+    When I attach the context folder "/home/jack/code/gaugedesk/plugin"
     And I task the agent and let the turn settle
     And review is proposed on this chat's output
     And I open the outputs catalog

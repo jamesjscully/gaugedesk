@@ -11,7 +11,7 @@ description = "Per-boundary WhippleScript tracker runtime (ADR 0075): a RuntimeK
 # private, whipplescript public/MIT). The Rust API is "internal-stability"
 # (whip docs/rust-api.md), pre-1.0 with no semver contract, so we pin a rev and
 # absorb churn deliberately. A git dep checks the rev out into cargo's cache; the
-# HTTPS URL is public, so the public gaugebench mirror's CI (and any external
+# HTTPS URL is public, so the public gaugedesk mirror's CI (and any external
 # clone) can fetch it. rev 737bbc09 carries whip-src @ 987cf15 (workspace 0.2.0,
 # tag v0.2.0 on the mirror). codex/claude provider adapters are dropped
 # (default-features = false): the tracker needs only the native rusqlite store +

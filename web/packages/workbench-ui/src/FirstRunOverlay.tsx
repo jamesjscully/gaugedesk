@@ -31,7 +31,7 @@ const KEY_PROVIDERS: readonly { id: string; label: string }[] = [
 
 export function FirstRunOverlay(props: {
     api: FirstRunApi;
-    /** Product name to greet with (e.g. "GaugeBench"). */
+    /** Product name to greet with (e.g. "GaugeDesk"). */
     productName: string;
     /** A credential was just linked — the host refetches status, which dismisses us. */
     onConnected: () => void;

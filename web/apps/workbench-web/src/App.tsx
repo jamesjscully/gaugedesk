@@ -1836,7 +1836,7 @@ export function App() {
             <Show when={showFirstRun()}>
                 <FirstRunOverlay
                     api={api}
-                    productName="GaugeBench"
+                    productName="GaugeDesk"
                     onConnected={() => {
                         void refetchStartupCreds();
                         void refetchStartupCodex();

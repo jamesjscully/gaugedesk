@@ -54,7 +54,7 @@ The chain is deliberately short, so there is no place for a claim to drift:
    `specs/principles.md`
    — e.g. *uncertainty denies; never permits.*
 2. A **Quint model** under
-   [`specs/models/`](https://github.com/jamesjscully/gaugebench/tree/main/specs/models)
+   [`specs/models/`](https://github.com/jamesjscully/gaugedesk/tree/main/specs/models)
    encodes that invariant as a property over an adversarial state space and
    proves the property holds.
 3. A **teeth probe** inside the same model is a deliberately injected bug behind a
@@ -94,7 +94,7 @@ probe inside it. All file links point at the canonical sources on GitHub.
   honestly in the model, not hidden.
 - **End-to-end test:** the protection chain (grant → run → taint → review/export
   consent) is exercised over random interleavings in
-  [`crates/app/tests/protection_chain_proptest.rs`](https://github.com/jamesjscully/gaugebench/blob/main/crates/app/tests/protection_chain_proptest.rs).
+  [`crates/app/tests/protection_chain_proptest.rs`](https://github.com/jamesjscully/gaugedesk/blob/main/crates/app/tests/protection_chain_proptest.rs).
 
 !!! note "Confidentiality is an *emergent* goal, not a separate gate"
     The overall confidentiality guarantee — *protected payload never reaches a
@@ -170,7 +170,7 @@ probe inside it. All file links point at the canonical sources on GitHub.
   `federated-delivery.qnt`,
   `remote-call.qnt`,
   `handoff.qnt`.
-- **End-to-end test:** [`crates/app/tests/federation_crossing.rs`](https://github.com/jamesjscully/gaugebench/blob/main/crates/app/tests/federation_crossing.rs)
+- **End-to-end test:** [`crates/app/tests/federation_crossing.rs`](https://github.com/jamesjscully/gaugedesk/blob/main/crates/app/tests/federation_crossing.rs)
   drives two paired authorities through a real broker and asserts the adversarial
   cases — a crossing to an unpaired peer is refused, a shared output releases only
   after the remote stakeholder consents, and **a revoked device subkey can no
@@ -194,7 +194,7 @@ probe inside it. All file links point at the canonical sources on GitHub.
 - **Teeth:** `UNKNOWN_ALLOWED` (default-allow), `MEMBER_GETS_CONSOLE`,
   `BILLING_GETS_MEMBERS` (privilege escalation) — each widens exactly one cell and
   breaks a property.
-- **End-to-end test:** [`ee/app/tests/rbac_enforcement.rs`](https://github.com/jamesjscully/gaugebench/blob/main/ee/app/tests/rbac_enforcement.rs)
+- **End-to-end test:** [`ee/app/tests/rbac_enforcement.rs`](https://github.com/jamesjscully/gaugedesk/blob/main/ee/app/tests/rbac_enforcement.rs)
   confirms a `member` token is forbidden the admin routes and a viewer is denied
   export by policy (HTTP 403, the gate firing before admit).
 - **Status caveat:** the enterprise identity layer (OIDC / SAML / SCIM / RBAC) is
@@ -210,8 +210,8 @@ probe inside it. All file links point at the canonical sources on GitHub.
 
 - **Why it matters here:** attestation is what lets `boundary.qnt`'s
   `METHOD_HIDDEN_FROM_B` *pass* — removing the host from the trusted set.
-- **Tests:** [`crates/app/src/attestation_verifier.rs`](https://github.com/jamesjscully/gaugebench/blob/main/crates/app/src/attestation_verifier.rs)
-  and [`crates/core/src/attestation.rs`](https://github.com/jamesjscully/gaugebench/blob/main/crates/core/src/attestation.rs)
+- **Tests:** [`crates/app/src/attestation_verifier.rs`](https://github.com/jamesjscully/gaugedesk/blob/main/crates/app/src/attestation_verifier.rs)
+  and [`crates/core/src/attestation.rs`](https://github.com/jamesjscully/gaugedesk/blob/main/crates/core/src/attestation.rs)
   exercise the verifier against attestation vectors.
 - **Status caveat:** the **verifier** is <span class="status built">Built</span>;
   running real workloads under attestation (live confidential VMs) is
@@ -235,7 +235,7 @@ probe inside it. All file links point at the canonical sources on GitHub.
 
 You do not need GaugeWright installed to verify the structural claims — only the
 [Quint](https://quint-lang.org/) checker and the repository. The exact commands CI
-runs are in [`.github/workflows/ci.yml`](https://github.com/jamesjscully/gaugebench/blob/main/.github/workflows/ci.yml)
+runs are in [`.github/workflows/ci.yml`](https://github.com/jamesjscully/gaugedesk/blob/main/.github/workflows/ci.yml)
 and the project's green-bar contract.
 
 === "Verify the formal models"

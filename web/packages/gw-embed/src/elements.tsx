@@ -229,7 +229,7 @@ function EmbeddedChat(props: { session: Session }) {
                     target="_blank"
                     rel="noopener noreferrer"
                 >
-                    Powered by GaugeBench
+                    Powered by GaugeDesk
                 </a>
             </Show>
         </div>

@@ -16,7 +16,7 @@ it has on this table.
 
 !!! note "Network egress: filtered where enforceable, else open-by-default (disclosed)"
     A non-isolated [chat](../concepts/glossary.md#chat) runs under **filtered egress**
-    (CORE-5, [ADR 0079](https://github.com/jamesjscully/gaugebench-src/blob/main/specs/decisions/0079-per-host-egress-filtering.md))
+    (CORE-5, [ADR 0079](https://github.com/jamesjscully/gaugedesk-src/blob/main/specs/decisions/0079-per-host-egress-filtering.md))
     — the sandbox may reach **only the model endpoints**, enforced by a host-filtering
     `CONNECT` proxy — **on hosts that can enforce it** (a rootless netns route via
     `slirp4netns`/`pasta`). Where that enforcement isn't available, a non-isolated chat

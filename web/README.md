@@ -1,4 +1,4 @@
-# GaugeBench (web island)
+# GaugeDesk (web island)
 
 The client-owned Solid island — projection-first per `app-stack.md`:
 the client **renders projections and submits commands; it never defines a

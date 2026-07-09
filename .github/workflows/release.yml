@@ -194,7 +194,7 @@ jobs:
           projectPath: src-tauri
           # Draft a single GitHub Release that all three matrix legs upload into.
           tagName: ${{ github.ref_name }}
-          releaseName: "GaugeBench ${{ github.ref_name }}"
+          releaseName: "GaugeDesk ${{ github.ref_name }}"
           releaseDraft: true
           args: --bundles ${{ matrix.bundles }} --config tauri.bundle.conf.json
 
@@ -205,7 +205,7 @@ jobs:
         # bundle fails loudly rather than silently uploading nothing.
         uses: actions/upload-artifact@v4
         with:
-          name: gaugebench-bundles-${{ matrix.os-label }}
+          name: gaugedesk-bundles-${{ matrix.os-label }}
           path: |
             src-tauri/target/release/bundle/**
           if-no-files-found: error

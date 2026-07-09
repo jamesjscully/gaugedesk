@@ -139,46 +139,51 @@ impl Account {
 
 // --- the account encryption key + sealing (SEC-4) -------------------------------
 
-/// Derive the account encryption key from the authority. **Loopback double** — like
-/// [`crate::key_store::LoopbackKeyStore`], it is deterministic from the authority id
-/// and therefore *not secure*; the real key is recovered from the governance seed
-/// (`recovery.rs`) and attaches behind the same [`Encryptor`] seam (ADR 0053 §4).
-pub fn account_key(authority: &str) -> [u8; 32] {
+/// Derive the account encryption key from the governance root **seed** (ADR 0053 §4).
+/// The seed is the *private* key material behind the recovery code — unlike the public
+/// authority id it is secret, so this key is secret too. Restoring the seed
+/// ([`gaugewright_core::recovery`]) re-derives the **same** account key, so seed recovery
+/// restores access to all sealed account state. The `v2` domain tag marks the deliberate
+/// break from the old public-id "loopback double" (`v1`), which **anyone** who knew your
+/// public root id could derive — the vulnerability this closes. Callers never derive this
+/// themselves; the one resolver is [`Workbench::account_key`], which also returns a
+/// device's *recovered* key (enrollment) ahead of the seed path.
+pub fn account_key_from_seed(seed: &[u8; 32]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"gaugewright-account-key:v1:");
-    h.update(authority.as_bytes());
+    h.update(b"gaugewright-account-key:v2:");
+    h.update(seed);
     h.finalize().into()
 }
 
-/// The account [`Encryptor`] for `authority` (loopback `LocalAeadEncryptor`).
-pub fn account_encryptor(authority: &str) -> LocalAeadEncryptor {
-    LocalAeadEncryptor::new(account_key(authority))
+/// The account [`Encryptor`] for a resolved account `key`.
+pub fn account_encryptor(key: [u8; 32]) -> LocalAeadEncryptor {
+    LocalAeadEncryptor::new(key)
 }
 
-/// Seal a plaintext token → hex ciphertext for storage.
-pub fn seal_token(authority: &str, token: &str) -> Option<String> {
-    account_encryptor(authority)
+/// Seal a plaintext token → hex ciphertext for storage, under the account `key`.
+pub fn seal_token(key: [u8; 32], token: &str) -> Option<String> {
+    account_encryptor(key)
         .encrypt(token.as_bytes())
         .ok()
         .map(hex::encode)
 }
 
-/// Unseal a stored hex ciphertext → the plaintext token (None on any failure —
-/// fail-closed).
-pub fn unseal_token(authority: &str, sealed_hex: &str) -> Option<String> {
+/// Unseal a stored hex ciphertext → the plaintext token under the account `key` (None on
+/// any failure — fail-closed; a token sealed under a different key does not open).
+pub fn unseal_token(key: [u8; 32], sealed_hex: &str) -> Option<String> {
     let ct = hex::decode(sealed_hex).ok()?;
-    let pt = account_encryptor(authority).decrypt(&ct).ok()?;
+    let pt = account_encryptor(key).decrypt(&ct).ok()?;
     String::from_utf8(pt).ok()
 }
 
-/// Resolve the **plaintext** linked token for `provider`, decrypting the sealed record
-/// — the internal API the local runtime uses (never exposed over HTTP). `None` if no
-/// credential is linked or it fails to unseal.
-pub fn resolve_token(store: &Store, authority: &str, provider: &str) -> Option<String> {
+/// Resolve the **plaintext** linked token for `provider` under the account `key`,
+/// decrypting the sealed record — the internal API the local runtime uses (never exposed
+/// over HTTP). `None` if no credential is linked or it fails to unseal.
+pub fn resolve_token(store: &Store, key: [u8; 32], provider: &str) -> Option<String> {
     let acct = Account::rebuild(store).ok()?;
     let rec = acct.credentials.get(provider)?;
-    unseal_token(authority, &rec.sealed_token)
+    unseal_token(key, &rec.sealed_token)
 }
 
 /// The provider → API-key env-var mapping — the ONE map (the engine's fail-closed
@@ -223,14 +228,14 @@ pub fn credentials_in_scope(store: &Store, scope: &str) -> BTreeMap<String, Cred
 pub fn credential_envs_in_scope(
     store: &Store,
     scope: &str,
-    authority: &str,
+    key: [u8; 32],
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (provider, rec) in credentials_in_scope(store, scope) {
         let Some(var) = provider_env_var(&provider) else {
             continue;
         };
-        if let Some(token) = unseal_token(authority, &rec.sealed_token) {
+        if let Some(token) = unseal_token(key, &rec.sealed_token) {
             out.push((var.to_string(), token));
         }
     }
@@ -240,8 +245,8 @@ pub fn credential_envs_in_scope(
 /// Env vars carrying the **resolved** (decrypted) account-linked credential tokens —
 /// injected into the runtime so a linked account is actually *used* (ACCT-1 → the agent
 /// harness). The account-scope tier of [`resolved_credential_envs`].
-pub fn credential_envs(store: &Store, authority: &str) -> Vec<(String, String)> {
-    credential_envs_in_scope(store, ACCOUNT_SCOPE, authority)
+pub fn credential_envs(store: &Store, key: [u8; 32]) -> Vec<(String, String)> {
+    credential_envs_in_scope(store, ACCOUNT_SCOPE, key)
 }
 
 /// The runtime credential env vars for a turn, applying **nearest-scope-wins** (`LLM-2`,
@@ -251,13 +256,12 @@ pub fn credential_envs(store: &Store, authority: &str) -> Vec<(String, String)> 
 /// default, or an unknown chat) resolves to the account default alone.
 pub fn resolved_credential_envs(
     store: &Store,
-    authority: &str,
+    key: [u8; 32],
     project: Option<&str>,
 ) -> Vec<(String, String)> {
-    let mut envs: BTreeMap<String, String> =
-        credential_envs(store, authority).into_iter().collect();
+    let mut envs: BTreeMap<String, String> = credential_envs(store, key).into_iter().collect();
     if let Some(project) = project {
-        for (var, token) in credential_envs_in_scope(store, &project_scope(project), authority) {
+        for (var, token) in credential_envs_in_scope(store, &project_scope(project), key) {
             envs.insert(var, token); // project pin beats the account default for this provider
         }
     }
@@ -265,15 +269,56 @@ pub fn resolved_credential_envs(
 }
 
 impl Workbench {
+    /// The **account encryption key** this workbench seals/unseals account state with
+    /// (ADR 0053 §4). Resolution order: the key this device **recovered** over enrollment
+    /// (a device that joined someone else's root holds *their* account key), else the key
+    /// derived from this account's own governance root **seed**. Never the retired
+    /// public-id loopback double — see [`account_key_from_seed`].
+    pub(crate) fn account_key(&self) -> [u8; 32] {
+        if let Some(k) = self.recovered_account_key() {
+            return k;
+        }
+        account_key_from_seed(&self.governance_seed())
+    }
+
+    /// Seal an account-scoped secret without exposing the resolved account key to a
+    /// band-specific crate. Hosted and enterprise shells use this for credentials such as
+    /// refresh tokens; key resolution remains centralized in [`Workbench::account_key`].
+    pub fn seal_account_secret(&self, value: &str) -> Option<String> {
+        seal_token(self.account_key(), value)
+    }
+
+    /// Open an account-scoped secret sealed by [`Workbench::seal_account_secret`].
+    /// Returns `None` on malformed ciphertext or a non-matching account key.
+    pub fn unseal_account_secret(&self, sealed: &str) -> Option<String> {
+        unseal_token(self.account_key(), sealed)
+    }
+
+    /// This account's governance root **seed** — the private key material the account key
+    /// and the recovered-key wrap both derive from. Resolved through the file-backed key
+    /// store when a real state root exists (persisted on first use, stable across restarts);
+    /// a **bare/test workbench with no root** derives it purely via the loopback double
+    /// *without touching disk*, so credential resolution never writes a key store into the
+    /// process CWD. The private half never leaves this in-process value.
+    pub(crate) fn governance_seed(&self) -> [u8; 32] {
+        use crate::key_store::{FileKeyStore, KeyStore, LoopbackKeyStore};
+        let root = self.root_path();
+        if root.as_os_str().is_empty() {
+            LoopbackKeyStore
+                .signing_key(self.authority())
+                .to_seed_bytes()
+        } else {
+            FileKeyStore::new(root.join("keys"))
+                .signing_key(self.authority())
+                .to_seed_bytes()
+        }
+    }
+
     /// Runtime credential env vars for one chat, with project BYOK pins overriding
     /// account defaults per provider.
     pub(crate) fn resolved_credential_envs_for_chat(&self, chat_id: &str) -> Vec<(String, String)> {
         let project = self.library_project_of_chat(chat_id);
-        resolved_credential_envs(
-            self.store_ref(),
-            self.authority().as_str(),
-            project.as_deref(),
-        )
+        resolved_credential_envs(self.store_ref(), self.account_key(), project.as_deref())
     }
 
     /// Provider ids pinned as BYOK credentials in one project's coordination scope.
@@ -590,21 +635,19 @@ pub fn account_blob(acct: &Account) -> AccountBlob {
     }
 }
 
-/// Seal the account blob (hex ciphertext) for the directory to store opaquely.
-pub fn seal_account_blob(authority: &str, acct: &Account) -> Option<String> {
+/// Seal the account blob (hex ciphertext) for the directory to store opaquely, under the
+/// account `key`.
+pub fn seal_account_blob(key: [u8; 32], acct: &Account) -> Option<String> {
     let bytes = serde_json::to_vec(&account_blob(acct)).ok()?;
-    account_encryptor(authority)
-        .encrypt(&bytes)
-        .ok()
-        .map(hex::encode)
+    account_encryptor(key).encrypt(&bytes).ok().map(hex::encode)
 }
 
-/// Open a sealed account blob back into its metadata — only your own key can
-/// (fail-closed). This is what a device does after fetching the blob from the
+/// Open a sealed account blob back into its metadata — only the matching account `key`
+/// can (fail-closed). This is what a device does after fetching the blob from the
 /// directory.
-pub fn open_account_blob(authority: &str, sealed_hex: &str) -> Option<AccountBlob> {
+pub fn open_account_blob(key: [u8; 32], sealed_hex: &str) -> Option<AccountBlob> {
     let ct = hex::decode(sealed_hex).ok()?;
-    let pt = account_encryptor(authority).decrypt(&ct).ok()?;
+    let pt = account_encryptor(key).decrypt(&ct).ok()?;
     serde_json::from_slice(&pt).ok()
 }
 
@@ -643,7 +686,11 @@ pub fn directory_record(
 mod tests {
     use super::*;
 
-    const AUTH: &str = "local-user";
+    /// A fixed account key for the sealing tests (stands in for the seed-derived key the
+    /// [`Workbench::account_key`] resolver hands the sealing primitives at runtime).
+    const KEY: [u8; 32] = [7u8; 32];
+    /// A *different* key — the "not your key" negative in the fail-closed cases.
+    const OTHER: [u8; 32] = [9u8; 32];
 
     fn store() -> Store {
         Store::open_in_memory().unwrap()
@@ -756,14 +803,14 @@ mod tests {
     #[test]
     fn token_seals_and_unseals_and_is_never_plaintext_at_rest() {
         let token = "sk-oauth-secret-12345";
-        let sealed = seal_token(AUTH, token).unwrap();
+        let sealed = seal_token(KEY, token).unwrap();
         assert!(
             !sealed.contains("secret"),
             "ciphertext is not the plaintext"
         );
-        assert_eq!(unseal_token(AUTH, &sealed).unwrap(), token);
+        assert_eq!(unseal_token(KEY, &sealed).unwrap(), token);
         // A different authority's key cannot unseal it.
-        assert_eq!(unseal_token("someone-else", &sealed), None);
+        assert_eq!(unseal_token(OTHER, &sealed), None);
     }
 
     fn seeded_account() -> Account {
@@ -791,7 +838,7 @@ mod tests {
             CredentialRecord {
                 id: "openai".into(),
                 op: RecordOp::Upsert,
-                sealed_token: seal_token(AUTH, "tok").unwrap(),
+                sealed_token: seal_token(KEY, "tok").unwrap(),
             },
         );
         acct
@@ -808,7 +855,7 @@ mod tests {
             let rec = CredentialRecord {
                 id: provider.into(),
                 op: RecordOp::Upsert,
-                sealed_token: seal_token(AUTH, token).unwrap(),
+                sealed_token: seal_token(KEY, token).unwrap(),
             };
             s.append_record(
                 ACCOUNT_SCOPE,
@@ -817,7 +864,7 @@ mod tests {
             )
             .unwrap();
         }
-        let envs = credential_envs(&s, AUTH);
+        let envs = credential_envs(&s, KEY);
         // Known providers map to their env var with the decrypted token; unknown skipped.
         assert!(envs.contains(&("OPENAI_API_KEY".to_string(), "tok-oai".to_string())));
         assert!(envs.contains(&("ANTHROPIC_API_KEY".to_string(), "tok-ant".to_string())));
@@ -827,15 +874,15 @@ mod tests {
     #[test]
     fn account_blob_seals_and_opens_only_with_your_key() {
         let acct = seeded_account();
-        let sealed = seal_account_blob(AUTH, &acct).unwrap();
+        let sealed = seal_account_blob(KEY, &acct).unwrap();
         // The directory stores opaque ciphertext — no readable settings/devices.
         assert!(!sealed.contains("dark") && !sealed.contains("phone"));
         // Your key opens it back to the same metadata.
-        let blob = open_account_blob(AUTH, &sealed).unwrap();
+        let blob = open_account_blob(KEY, &sealed).unwrap();
         assert_eq!(blob, account_blob(&acct));
         assert_eq!(blob.settings.get("theme").unwrap(), "dark");
         // A different key cannot (fail-closed).
-        assert_eq!(open_account_blob("someone-else", &sealed), None);
+        assert_eq!(open_account_blob(OTHER, &sealed), None);
     }
 
     #[test]
@@ -856,7 +903,7 @@ mod tests {
         let cred = CredentialRecord {
             id: "openai".into(),
             op: RecordOp::Upsert,
-            sealed_token: seal_token(AUTH, "tok-abc").unwrap(),
+            sealed_token: seal_token(KEY, "tok-abc").unwrap(),
         };
         s.append_record(
             ACCOUNT_SCOPE,
@@ -874,11 +921,8 @@ mod tests {
             .sealed_token
             .contains("tok-abc"));
         // …but the runtime resolves the plaintext.
-        assert_eq!(
-            resolve_token(&s, AUTH, "openai").as_deref(),
-            Some("tok-abc")
-        );
-        assert_eq!(resolve_token(&s, AUTH, "anthropic"), None);
+        assert_eq!(resolve_token(&s, KEY, "openai").as_deref(), Some("tok-abc"));
+        assert_eq!(resolve_token(&s, KEY, "anthropic"), None);
     }
 
     /// LLM-2 (ADR 0062): a credential pinned in the chat's project overrides the account
@@ -887,7 +931,7 @@ mod tests {
     #[test]
     fn project_pin_beats_account_per_provider() {
         let mut s = store();
-        let seal = |tok: &str| seal_token(AUTH, tok).unwrap();
+        let seal = |tok: &str| seal_token(KEY, tok).unwrap();
         let put = |s: &mut Store, scope: &str, provider: &str, tok: &str| {
             let rec = CredentialRecord {
                 id: provider.into(),
@@ -903,7 +947,7 @@ mod tests {
         put(&mut s, &project_scope("proj-1"), "openai", "proj-openai");
 
         // No project → account default for both.
-        let base: BTreeMap<_, _> = resolved_credential_envs(&s, AUTH, None)
+        let base: BTreeMap<_, _> = resolved_credential_envs(&s, KEY, None)
             .into_iter()
             .collect();
         assert_eq!(
@@ -916,7 +960,7 @@ mod tests {
         );
 
         // In proj-1: openai is overridden, anthropic inherited from the account.
-        let scoped: BTreeMap<_, _> = resolved_credential_envs(&s, AUTH, Some("proj-1"))
+        let scoped: BTreeMap<_, _> = resolved_credential_envs(&s, KEY, Some("proj-1"))
             .into_iter()
             .collect();
         assert_eq!(
@@ -929,7 +973,7 @@ mod tests {
         );
 
         // A project with no pin resolves exactly to the account default.
-        let other = resolved_credential_envs(&s, AUTH, Some("proj-other"));
-        assert_eq!(other, resolved_credential_envs(&s, AUTH, None));
+        let other = resolved_credential_envs(&s, KEY, Some("proj-other"));
+        assert_eq!(other, resolved_credential_envs(&s, KEY, None));
     }
 }

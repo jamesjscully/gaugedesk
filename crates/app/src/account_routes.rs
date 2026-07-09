@@ -403,10 +403,10 @@ pub async fn post_credential(
     }
     let mut wb = wb.lock_unpoisoned();
     let scope = wb.account_scope_for(net_http::bearer(&headers));
-    // The seal is at-rest encryption keyed by the control-plane authority; the per-person
-    // access boundary is the scope (INV-1), so a person only ever reads their own credentials.
-    let authority = wb.authority().as_str().to_string();
-    let Some(sealed) = seal_token(&authority, &body.token) else {
+    // The seal is at-rest encryption under this account's seed-derived key (ADR 0053 §4);
+    // the per-person access boundary is the scope (INV-1), so a person only ever reads their
+    // own credentials.
+    let Some(sealed) = seal_token(wb.account_key(), &body.token) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "seal failed").into_response();
     };
     let provider = body.provider;

@@ -49,20 +49,20 @@ pub struct SignedDirectoryPut {
     pub signature: Signature,
 }
 
-/// Build the signed publish for the account rooted at `signing_key`: seal the account blob to
-/// `authority`'s account key, assemble the readable directory record (root pubkey + active device
+/// Build the signed publish for the account rooted at `signing_key`: seal the account blob under
+/// the account `key`, assemble the readable directory record (root pubkey + active device
 /// pubkeys + placement pointers), and sign it with the root key. Pure (no I/O), so it is testable
 /// against the same [`verify_signature`] the service runs. `None` if the blob fails to seal.
 pub fn signed_put(
     signing_key: &SigningKey,
-    authority: &str,
+    key: [u8; 32],
     acct: &Account,
     placement_pointers: Vec<String>,
 ) -> Option<SignedDirectoryPut> {
     let root_pubkey = signing_key.public_key().as_str().to_string();
     let entry = DirectoryEntry {
         directory: directory_record(&root_pubkey, acct, placement_pointers),
-        sealed_blob: seal_account_blob(authority, acct)?,
+        sealed_blob: seal_account_blob(key, acct)?,
     };
     let signature = signing_key.sign(&signing_bytes(&entry));
     Some(SignedDirectoryPut { entry, signature })
@@ -128,10 +128,10 @@ impl crate::Workbench {
         if !self.library_sync_active() {
             return None;
         }
-        let key = crate::key_store::FileKeyStore::new(self.root_path().join("keys"))
+        let signing_key = crate::key_store::FileKeyStore::new(self.root_path().join("keys"))
             .signing_key(self.authority());
         let acct = Account::rebuild(self.store_ref()).ok()?;
-        signed_put(&key, self.authority().as_str(), &acct, vec![])
+        signed_put(&signing_key, self.account_key(), &acct, vec![])
     }
 
     /// Merge a fetched directory entry's sealed blob into the local account scope (the pull half):
@@ -139,8 +139,7 @@ impl crate::Workbench {
     /// fold). Returns how many records merged; errors if the blob does not open (a foreign key).
     pub fn library_sync_apply(&mut self, entry: &DirectoryEntry) -> Result<usize, String> {
         use crate::account::{open_account_blob, ACCOUNT_SCOPE};
-        let authority = self.authority().as_str().to_string();
-        let blob = open_account_blob(&authority, &entry.sealed_blob)
+        let blob = open_account_blob(self.account_key(), &entry.sealed_blob)
             .ok_or_else(|| "sealed blob did not open under this account key".to_string())?;
         let mut n = 0usize;
         for d in &blob.devices {
@@ -216,12 +215,16 @@ mod tests {
         SigningKey::from_seed(&[7u8; 32]).unwrap()
     }
 
+    /// A fixed account (sealing) key for these tests — distinct from the signing key.
+    const AKEY: [u8; 32] = [11u8; 32];
+    const OTHER_AKEY: [u8; 32] = [22u8; 32];
+
     #[test]
     fn signed_put_verifies_under_its_own_root_key() {
         // The signature the client produces passes the exact check the directory service runs at
         // PUT — so a real publish would be accepted (and a forged one rejected).
         let k = key();
-        let put = signed_put(&k, "local-user", &seeded_account(), vec![]).expect("seals");
+        let put = signed_put(&k, AKEY, &seeded_account(), vec![]).expect("seals");
         assert_eq!(put.entry.directory.root_pubkey, k.public_key().as_str());
         assert!(put_verifies(&put), "verifies under its own root key");
 
@@ -235,13 +238,8 @@ mod tests {
     fn the_directory_record_carries_no_secrets_and_the_blob_round_trips() {
         // The readable record is routing-only (root + device pubkeys); the settings/credentials
         // live only inside the sealed blob, which opens only under the same account key.
-        let put = signed_put(
-            &key(),
-            "local-user",
-            &seeded_account(),
-            vec!["relay://x".into()],
-        )
-        .expect("seals");
+        let put =
+            signed_put(&key(), AKEY, &seeded_account(), vec!["relay://x".into()]).expect("seals");
         assert_eq!(
             put.entry.directory.device_pubkeys,
             vec!["dev-pub-1".to_string()]
@@ -252,11 +250,11 @@ mod tests {
         );
         // the sealed blob is opaque hex, not the plaintext settings.
         assert!(!put.entry.sealed_blob.contains("dark"));
-        // the same authority opens it back to the account metadata.
-        let blob = open_account_blob("local-user", &put.entry.sealed_blob).expect("opens");
+        // the same account key opens it back to the account metadata.
+        let blob = open_account_blob(AKEY, &put.entry.sealed_blob).expect("opens");
         assert_eq!(blob.settings.get("theme").map(String::as_str), Some("dark"));
         assert_eq!(blob.devices.len(), 1);
-        // a different authority's key cannot open it (fail-closed).
-        assert!(open_account_blob("someone-else", &put.entry.sealed_blob).is_none());
+        // a different account key cannot open it (fail-closed).
+        assert!(open_account_blob(OTHER_AKEY, &put.entry.sealed_blob).is_none());
     }
 }

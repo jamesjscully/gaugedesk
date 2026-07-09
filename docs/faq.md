@@ -182,7 +182,7 @@ the words used here see the [glossary](concepts/glossary.md).
         Mark the `.AppImage` executable, or install the `.deb`.
 
     All releases are on
-    [GitHub](https://github.com/jamesjscully/gaugebench/releases). Code-signing is a
+    [GitHub](https://github.com/jamesjscully/gaugedesk/releases). Code-signing is a
     known gap. <span class="status planned">Planned</span>
 
 ??? question "Is GaugeWright SOC 2 / ISO 27001 certified?"
@@ -203,7 +203,7 @@ the words used here see the [glossary](concepts/glossary.md).
     invariant→control crosswalk and an honest compliance posture.
 
 ??? question "Where's the source?"
-    On [GitHub](https://github.com/jamesjscully/gaugebench). The authoritative
+    On [GitHub](https://github.com/jamesjscully/gaugedesk). The authoritative
     specification and the formal models live there, and this documentation lives
     alongside the code.
 

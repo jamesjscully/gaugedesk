@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "GaugeBench",
-  "version": "0.4.2",
-  "identifier": "com.gaugewright.gaugebench",
+  "productName": "GaugeDesk",
+  "version": "0.4.3",
+  "identifier": "com.gaugewright.gaugedesk",
   "build": {
     "frontendDist": "../web/dist",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "GaugeBench",
+        "title": "GaugeDesk",
         "width": 1280,
         "height": 800,
         "minWidth": 900,
@@ -36,14 +36,22 @@
     ],
     "linux": {
       "deb": {
-        "desktopTemplate": "deep-link.desktop"
+        "desktopTemplate": "deep-link.desktop",
+        "provides": ["gaugebench"],
+        "conflicts": ["gaugebench"],
+        "replaces": ["gaugebench"]
+      }
+    },
+    "windows": {
+      "wix": {
+        "upgradeCode": "9deb9a1a-723e-521b-892f-9b4a9d243585"
       }
     }
   },
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/jamesjscully/gaugebench/releases/latest/download/latest.json"
+        "https://github.com/jamesjscully/gaugedesk/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYxNTg4RUI0OUEyMDE5QwpSV1NjQWFKSjY0Z1ZCdXdXMXN0VGRvSnp1SVR0RzhTbU5maUMxMEtPY3ZWbUp2ZllNOUdJZVY2Kwo="
     },

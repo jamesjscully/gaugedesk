@@ -1,5 +1,5 @@
-site_name: GaugeBench Docs
-site_description: Documentation for GaugeBench — build, run, and deploy expert AI agents against private context under an enforced boundary.
+site_name: GaugeDesk Docs
+site_description: Documentation for GaugeDesk — build, run, and deploy expert AI agents against private context under an enforced boundary.
 site_url: https://docs.gaugewright.com/
 copyright: © 2026 GaugeWright LLC
 
@@ -37,8 +37,8 @@ theme:
   icon:
     repo: fontawesome/brands/github
 
-repo_url: https://github.com/jamesjscully/gaugebench
-repo_name: jamesjscully/gaugebench
+repo_url: https://github.com/jamesjscully/gaugedesk
+repo_name: jamesjscully/gaugedesk
 edit_uri: edit/main/docs/
 
 extra_css:

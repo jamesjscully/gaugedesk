@@ -1,4 +1,4 @@
-# GaugeBench documentation
+# GaugeDesk documentation
 
 GaugeWright lets an expert's **[method](concepts/glossary.md#method)** (an
 AI agent — its instructions, skills, and tools) run against a client's **private

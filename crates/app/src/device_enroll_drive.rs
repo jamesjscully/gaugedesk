@@ -42,6 +42,7 @@ use gaugewright_core::ids::PublicKey;
 use gaugewright_core::signature::SigningKey;
 
 use crate::account::{self, DeviceRecord, DeviceStatus, RecordOp};
+use crate::at_rest::Encryptor;
 use crate::device_enroll::{EnrollAuthorize, EnrollRequest, Holder, NewDevice};
 use crate::key_store::{FileKeyStore, KeyStore};
 use crate::net_relay::{read_frame, token_bytes, write_frame};
@@ -277,23 +278,76 @@ impl Workbench {
     /// in-process `SigningKey`.
     pub fn enroll_holder(&self, session: &str) -> Holder {
         let root = FileKeyStore::new(self.root_path().join("keys")).signing_key(self.authority());
-        let account_key = account::account_key(self.authority().as_str());
+        let account_key = self.account_key();
         Holder::new(root, account_key, session)
     }
 
-    /// Record the account key a newly-enrolled device recovered over the handshake.
-    /// Held in memory only — the durable, at-rest adoption of the account key ties
-    /// into the governance-seed recovery path (`recovery.rs`, ADR 0053 §4), behind
-    /// the same seam as [`account::account_key`]'s loopback double; never returned
-    /// over HTTP (`INV-10`).
+    /// Record the account key a newly-enrolled device recovered over the handshake, and
+    /// **adopt it durably at rest** (ADR 0053 §4): held in memory for the running process
+    /// *and* persisted, so a restart of the enrolled device still opens the sealed account
+    /// state it joined — [`Workbench::account_key`] returns this recovered key ahead of the
+    /// seed path. The key never crosses HTTP (`INV-10`); at rest it is wrapped under this
+    /// device's own key material (see [`Workbench::persist_recovered_account_key`]).
     pub fn set_recovered_account_key(&mut self, key: [u8; 32]) {
         self.recovered_account_key = Some(key);
+        self.persist_recovered_account_key(key);
     }
 
     /// The account key this device recovered on enrollment, if any (the internal
     /// accessor the integration test reads — off the HTTP surface).
     pub fn recovered_account_key(&self) -> Option<[u8; 32]> {
         self.recovered_account_key
+    }
+
+    /// Where the recovered account key is persisted (wrapped), alongside — but distinct
+    /// from — the governance key store under the state root.
+    fn recovered_account_key_path(&self) -> std::path::PathBuf {
+        self.root_path().join("account").join("account-key.sealed")
+    }
+
+    /// The **key-encryption key** wrapping the recovered account key at rest. Derived from
+    /// *this* device's own governance seed (stable, device-local), domain-separated from the
+    /// account key itself. At-rest protection therefore tracks the key store's tier: today a
+    /// loose seed file, a secure enclave later — moving the seed into an enclave protects
+    /// this wrap with it, no code change. Returns `None` only if no device seed resolves.
+    fn recovered_key_wrap(&self) -> [u8; 32] {
+        let seed = self.governance_seed();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"gaugewright-recovered-key-wrap:v1:");
+        h.update(seed);
+        h.finalize().into()
+    }
+
+    /// Wrap + write the recovered account key. Best-effort: a write failure leaves the
+    /// in-memory key intact (this process still works); the next enrollment re-establishes
+    /// it. Never writes the key in the clear.
+    fn persist_recovered_account_key(&self, key: [u8; 32]) {
+        let Ok(ct) = account::account_encryptor(self.recovered_key_wrap()).encrypt(&key) else {
+            return;
+        };
+        let path = self.recovered_account_key_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, hex::encode(ct));
+    }
+
+    /// Reload a previously-adopted recovered account key from disk (called on workbench
+    /// open), unwrapping it under this device's key. A missing/unreadable/foreign-wrapped
+    /// file is simply "no recovered key" (fail-closed) — the seed path then applies.
+    pub(crate) fn restore_recovered_account_key(&mut self) {
+        let Ok(hexed) = std::fs::read_to_string(self.recovered_account_key_path()) else {
+            return;
+        };
+        let Ok(ct) = hex::decode(hexed.trim()) else {
+            return;
+        };
+        if let Ok(pt) = account::account_encryptor(self.recovered_key_wrap()).decrypt(&ct) {
+            if let Ok(k) = <[u8; 32]>::try_from(pt.as_slice()) {
+                self.recovered_account_key = Some(k);
+            }
+        }
     }
 }
 
@@ -620,9 +674,10 @@ mod tests {
             g.authority = AuthorityId::new("holder-account");
             g.set_enroll_broker_addr(broker_addr.clone());
         }
-        let holder_account_key = account::account_key("holder-account");
-        let device_default_key =
-            account::account_key(device_wb.lock_unpoisoned().authority().as_str());
+        // Resolve each account's real (seed-derived) key through the same resolver the
+        // runtime uses (ADR 0053 §4) — before enrollment, so the device's is still its own.
+        let holder_account_key = holder_wb.lock_unpoisoned().account_key();
+        let device_default_key = device_wb.lock_unpoisoned().account_key();
         assert_ne!(
             holder_account_key, device_default_key,
             "the two accounts must differ so the transfer is observable"
@@ -805,6 +860,76 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "fail-closed: no device was enrolled without a confirmed SAS"
+        );
+    }
+
+    /// ACCT-1 / ADR 0053 §4 — the account key is **secret**, reduced to the governance
+    /// key's secrecy. It derives from the private root **seed** (not the public authority
+    /// id, the retired v1 "loopback double"), so enrolling a real secret seed yields an
+    /// account key equal to the seed-derived key — and restoring that seed re-derives it,
+    /// while a foreign seed does not.
+    #[test]
+    fn the_account_key_derives_from_the_governance_seed() {
+        use crate::key_store::FileKeyStore;
+        let dir = tempfile::tempdir().unwrap();
+        let wb = workbench(dir.path());
+        let mut g = wb.lock_unpoisoned();
+        g.authority = AuthorityId::new("me");
+        // Enroll a real (secret) seed for this authority — the production substrate, not the
+        // dev loopback default. The resolved account key must be exactly the seed-derived key.
+        let secret_seed = [0x2c; 32];
+        FileKeyStore::new(dir.path().join("keys"))
+            .enroll(g.authority(), &SigningKey::from_seed(&secret_seed).unwrap())
+            .unwrap();
+        assert_eq!(
+            g.account_key(),
+            account::account_key_from_seed(&secret_seed)
+        );
+        // Recovery re-derives the same key; a different (foreign) seed cannot.
+        assert_ne!(g.account_key(), account::account_key_from_seed(&[0x2d; 32]));
+    }
+
+    /// ACCT-1 / ADR 0053 §4 — durable at-rest adoption. A device that recovered another
+    /// root's account key over enrollment keeps it across a restart: it is persisted
+    /// (wrapped under this device's own key, never in the clear) and re-adopted on the next
+    /// workbench open, so the sealed account state it joined still opens.
+    #[test]
+    fn a_recovered_account_key_is_adopted_durably_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovered = [0x5a; 32];
+        {
+            let wb = workbench(dir.path());
+            let mut g = wb.lock_unpoisoned();
+            g.authority = AuthorityId::new("enrolled-device");
+            assert_ne!(
+                g.account_key(),
+                recovered,
+                "own seed-derived key, pre-adoption"
+            );
+            g.set_recovered_account_key(recovered);
+            assert_eq!(
+                g.account_key(),
+                recovered,
+                "resolver returns the recovered key"
+            );
+            // It is never written in the clear.
+            let raw = std::fs::read(dir.path().join("account").join("account-key.sealed")).unwrap();
+            assert!(
+                !raw.windows(recovered.len()).any(|w| w == recovered),
+                "the recovered key is wrapped at rest, not plaintext"
+            );
+        }
+        // A fresh workbench over the same root re-adopts it on open (the build path calls
+        // this; here we drive it directly on the test double).
+        let wb2 = workbench(dir.path());
+        let mut g2 = wb2.lock_unpoisoned();
+        g2.authority = AuthorityId::new("enrolled-device");
+        assert_eq!(g2.recovered_account_key(), None, "not yet restored");
+        g2.restore_recovered_account_key();
+        assert_eq!(
+            g2.account_key(),
+            recovered,
+            "the recovered account key survived the restart (durable adoption)"
         );
     }
 }

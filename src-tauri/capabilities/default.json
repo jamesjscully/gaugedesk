@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the GaugeBench window.",
+  "description": "Default capability for the GaugeDesk window.",
   "windows": ["main"],
   "permissions": ["core:default", "dialog:allow-open", "updater:default", "deep-link:default"]
 }

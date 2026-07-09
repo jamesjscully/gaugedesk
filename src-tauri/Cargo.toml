@@ -2,11 +2,11 @@
 # Tauri CLI + system webkit deps, so it is deliberately outside the backend
 # cargo workspace (which stays self-contained and green).
 [package]
-name = "gaugewright-desktop"
-version = "0.4.2"
+name = "gaugedesk-desktop"
+version = "0.4.3"
 edition = "2021"
 license = "Apache-2.0"
-description = "GaugeBench desktop workbench (Tauri v2 shell + co-resident control plane)."
+description = "GaugeDesk desktop workbench (Tauri v2 shell + co-resident control plane)."
 
 [workspace]
 

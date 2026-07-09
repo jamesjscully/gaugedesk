@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default capability for the GaugeBench window.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","updater:default","deep-link:default"]}}
+{"default":{"identifier":"default","description":"Default capability for the GaugeDesk window.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","updater:default","deep-link:default"]}}
