@@ -40,8 +40,8 @@ use gaugewright_core::abac::AuthorityAttributes;
 use gaugewright_core::ids::AuthorityId;
 
 use crate::identity_oidc::{
-    authorize_url, discover_endpoints, discover_jwks, exchange_code, ClaimMapping, HttpForm,
-    HttpGet, OidcIdentityProvider, Pkce,
+    authorize_url, discover_endpoints, discover_jwks, exchange_code, refresh_id_token,
+    ClaimMapping, HttpForm, HttpGet, OidcIdentityProvider, Pkce,
 };
 use base64::Engine as _;
 use gaugewright_app::identity::IdentityProvider;
@@ -74,6 +74,10 @@ pub struct PendingAuth {
     pub redirect_uri: String,
     /// How the returned id-token's claims map onto ABAC attributes (`ID-3`).
     pub mapping: ClaimMapping,
+    /// The OAuth **client secret** presented at token exchange, if the OP requires a confidential
+    /// client (Google "Web application" clients do, even with PKCE). `None` for a public PKCE
+    /// client (Okta/Entra). Held [`Secret`](gaugewright_app::secret::Secret) so it never logs.
+    pub client_secret: Option<gaugewright_app::secret::Secret>,
 }
 
 /// In-flight `/auth/login` → `/auth/callback` PKCE state, keyed by CSRF `state`
@@ -179,6 +183,14 @@ pub fn start_login(
     // 16 CSPRNG bytes hex-encoded — unguessable, so a forged `state` cannot collide
     // with a live login (the CSRF binding the OP echoes back).
     let state = hex::encode(gaugewright_app::session::random_bytes::<16>());
+    // Request **offline access** (ADR 0077 session refresh): Google returns a refresh token on the
+    // consent grant only with `access_type=offline`. `prompt=consent` (opt-in via env) forces the
+    // consent screen so a refresh token is re-issued even for an already-granted account — the hub
+    // sets it; enterprise SSO leaves it off (seamless SSO). Standard OAuth ignores unknown params.
+    let mut extra = String::from("&access_type=offline");
+    if std::env::var("GAUGEWRIGHT_OIDC_PROMPT_CONSENT").as_deref() == Ok("1") {
+        extra.push_str("&prompt=consent");
+    }
     let url = authorize_url(
         &endpoints.authorization_endpoint,
         client_id,
@@ -186,6 +198,7 @@ pub fn start_login(
         scope,
         &state,
         &pkce.challenge,
+        &extra,
     );
     let pending = PendingAuth {
         verifier: pkce.verifier.into(),
@@ -195,6 +208,9 @@ pub fn start_login(
         audiences: sso.audiences.clone(),
         redirect_uri: redirect_uri.to_string(),
         mapping,
+        // The pure login leg carries no secret; the handler injects one from env for a
+        // confidential OP (Google). Public PKCE clients leave it `None`.
+        client_secret: None,
     };
     Ok((url, state, pending))
 }
@@ -219,19 +235,19 @@ pub fn finish_callback(
     pending: &PendingAuth,
     code: &str,
     http: &(impl HttpForm + HttpGet),
-) -> Result<(AuthorityId, String), CallbackError> {
+) -> Result<(AuthorityId, String, Option<String>), CallbackError> {
     let client_id = pending
         .audiences
         .first()
         .map(String::as_str)
         .unwrap_or_default();
-    let id_token = exchange_code(
+    let (id_token, refresh_token) = exchange_code(
         &pending.token_endpoint,
         client_id,
         &pending.redirect_uri,
         code,
         pending.verifier.expose(),
-        None, // public PKCE client — no client_secret
+        pending.client_secret.as_ref().map(|s| s.expose()), // confidential OP (Google); None = public PKCE
         http,
     )
     .map_err(CallbackError::Exchange)?;
@@ -246,7 +262,9 @@ pub fn finish_callback(
     let authority = idp
         .authenticate(&id_token)
         .ok_or(CallbackError::NotVerified)?;
-    Ok((authority, id_token))
+    // The refresh token (present only on an offline-access consent grant) rides back so the
+    // callback can seal it for the session-refresh leg (ADR 0077).
+    Ok((authority, id_token, refresh_token))
 }
 
 // ---- enterprise-mode activation (wb.idp from the SSO connection) ---------
@@ -506,7 +524,13 @@ pub fn build_oidc_idp(
 /// calls it right after workbench open. Installs the verifier via the open
 /// `Workbench::set_identity_provider` seam.
 pub fn activate_configured_idp(wb: &mut Workbench) {
-    let sso = Org::rebuild(wb.store_ref()).ok().and_then(|o| o.sso);
+    // Prefer a stored SSO connection; else (hosted web account) the Google connection from env,
+    // so the verifier that honors the callback's id-token is built even without an /admin/sso
+    // record (ADR 0077).
+    let sso = Org::rebuild(wb.store_ref())
+        .ok()
+        .and_then(|o| o.sso)
+        .or_else(web_account_sso_from_env);
     if let Some((idp, warm)) = build_oidc_idp(sso.as_ref()) {
         if !warm {
             eprintln!(
@@ -572,6 +596,135 @@ pub fn jit_provision(wb: &mut Workbench, scope: &str, authority: &str, id_token:
     true
 }
 
+/// Whether this deployment is the **hosted web account** (`ADR 0077`): a successful login
+/// provisions the person their own account (a personal tenant-of-one), rather than only
+/// reconciling them into an enterprise org directory. Off by default — the enterprise SSO and
+/// desktop paths are unchanged; the hosted control-plane hub sets `GAUGEWRIGHT_WEB_ACCOUNT=1`.
+pub fn web_account_mode() -> bool {
+    std::env::var("GAUGEWRIGHT_WEB_ACCOUNT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Post-login account reconciliation for the hosted web account (`ADR 0077` §9): provision the
+/// authenticated person's **personal tenant-of-one** (idempotent), so a Google login lands them in
+/// the Console with their own space. The authenticated `authority` (the OIDC subject) *is* the
+/// person root. No-op unless `web_account` — the enterprise/desktop login paths are untouched.
+/// Returns the personal tenant id when provisioned. Best-effort: a store error yields `None` and
+/// the login still succeeds (the person retries; provisioning self-heals, `tenancy::…`).
+pub fn provision_web_account(
+    wb: &mut Workbench,
+    authority: &str,
+    web_account: bool,
+) -> Option<String> {
+    if !web_account {
+        return None;
+    }
+    // The personal tenant is the person's own space — displayed as "Personal", never as an org
+    // (ADR 0077 §9); the `TenantRef.personal` flag is what the Console keys on.
+    gaugewright_app::tenancy::provision_personal_tenant(wb.store_mut(), authority, "Personal").ok()
+}
+
+/// Seal `refresh_token` into `person`'s own account scope (`ADR 0077` session refresh). Sealed at
+/// rest by the control-plane authority (`SEC-4`); the per-person scope is the access boundary
+/// (`INV-1`). A single latest-wins `refresh` record — best-effort (a seal failure is a no-op, the
+/// session just falls back to re-login at id-token expiry).
+fn store_refresh_token(wb: &mut Workbench, person: &str, refresh_token: &str) {
+    let authority = wb.authority().as_str().to_string();
+    let Some(sealed) = gaugewright_app::account::seal_token(&authority, refresh_token) else {
+        return;
+    };
+    let scope = gaugewright_app::account::account_scope(person);
+    let rec = json!({ "id": "refresh", "sealed": sealed });
+    let _ = wb.write_account_record_in(&scope, "refresh", "refresh", &rec);
+}
+
+/// The person's stored refresh token, unsealed — `None` if none is stored or it fails to open.
+fn resolve_refresh_token(wb: &Workbench, person: &str) -> Option<String> {
+    let scope = gaugewright_app::account::account_scope(person);
+    let authority = wb.authority().as_str().to_string();
+    let rows = wb.store_ref().records(&scope, "refresh").ok()?;
+    let last = rows.last()?; // latest-wins
+    let doc: serde_json::Value = serde_json::from_str(last).ok()?;
+    let sealed = doc.get("sealed").and_then(|v| v.as_str())?;
+    gaugewright_app::account::unseal_token(&authority, sealed)
+}
+
+/// A Google (or any OIDC) SSO connection for the hosted web account, from env — so the hub
+/// offers "Continue with Google" without a manual `/admin/sso` POST. `GAUGEWRIGHT_GOOGLE_CLIENT_ID`
+/// is the OAuth client id (the id-token `aud`); the issuer defaults to Google's, overridable via
+/// `GAUGEWRIGHT_OIDC_ISSUER`. `None` unless web-account mode with a client id configured.
+pub fn web_account_sso_from_env() -> Option<SsoConnectionRecord> {
+    if !web_account_mode() {
+        return None;
+    }
+    let client_id = std::env::var("GAUGEWRIGHT_GOOGLE_CLIENT_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let issuer = std::env::var("GAUGEWRIGHT_OIDC_ISSUER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://accounts.google.com".to_string());
+    Some(google_sso(&issuer, &client_id))
+}
+
+/// Build an OIDC SSO connection record for `issuer` + `client_id` (pure; the env wrapper is
+/// [`web_account_sso_from_env`]). Singleton id, no enforce-SSO (the hosted account is opt-in
+/// login, not a locked-down org).
+pub fn google_sso(issuer: &str, client_id: &str) -> SsoConnectionRecord {
+    SsoConnectionRecord {
+        id: ORG_ID.to_string(),
+        op: RecordOp::Upsert,
+        protocol: SsoProtocol::Oidc,
+        issuer: issuer.to_string(),
+        audiences: vec![client_id.to_string()],
+        metadata: String::new(),
+        enforce_sso: false,
+        claim_mapping: Default::default(),
+    }
+}
+
+/// The shared web-account session cookie (`ADR 0077`) carrying the verified id-token as its
+/// value (the same credential the control plane accepts, `net_http::bearer`). Pure; the env
+/// wrapper is [`session_cookie_header`]. `domain` (e.g. `.gaugewright.com`) makes one sign-in
+/// authenticate the whole site; omitted for loopback dev (a Domain cookie can't be set on
+/// `localhost`). `HttpOnly` (no JS reads it) + `SameSite=Lax` (survives the top-level OAuth
+/// redirect, blocks CSRF on cross-site POSTs); `Secure` off only for dev.
+pub fn session_cookie_value(id_token: &str, domain: Option<&str>, secure: bool) -> String {
+    let mut c = format!(
+        "{}={id_token}; Path=/; HttpOnly; SameSite=Lax",
+        gaugewright_app::net_http::SESSION_COOKIE
+    );
+    if secure {
+        c.push_str("; Secure");
+    }
+    if let Some(d) = domain.map(str::trim).filter(|d| !d.is_empty()) {
+        c.push_str("; Domain=");
+        c.push_str(d);
+    }
+    c
+}
+
+/// The OAuth **client secret** for a confidential OP (Google), from `GAUGEWRIGHT_GOOGLE_CLIENT_SECRET`.
+/// `None` when unset — a public PKCE client (Okta/Entra) needs no secret at exchange.
+fn google_client_secret_from_env() -> Option<gaugewright_app::secret::Secret> {
+    std::env::var("GAUGEWRIGHT_GOOGLE_CLIENT_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(Into::into)
+}
+
+/// The `Set-Cookie` value for the login session, from env: `GAUGEWRIGHT_SESSION_COOKIE_DOMAIN`
+/// (e.g. `.gaugewright.com`; unset ⇒ host-only, for loopback) and `GAUGEWRIGHT_SESSION_COOKIE_INSECURE=1`
+/// (dev-only, drops `Secure` so the cookie works over http loopback).
+fn session_cookie_header(id_token: &str) -> String {
+    let domain = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_DOMAIN").ok();
+    let insecure = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_INSECURE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    session_cookie_value(id_token, domain.as_deref(), !insecure)
+}
+
 // ---- axum handlers -------------------------------------------------------
 
 /// The `redirect_uri` this control plane registers with the OP. An explicit
@@ -628,6 +781,9 @@ pub async fn get_login(
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
         }
     };
+    // Hosted web account: fall back to the Google connection from env, so the hub offers
+    // "Continue with Google" without a stored /admin/sso record (ADR 0077).
+    let sso = sso.or_else(web_account_sso_from_env);
     let Some(sso) = sso else {
         return (StatusCode::CONFLICT, "no SSO connection configured").into_response();
     };
@@ -645,13 +801,15 @@ pub async fn get_login(
         start_login(&sso, &redirect_uri, &scope, mapping, &http)
     })
     .await;
-    let (url, state, pending) = match started {
+    let (url, state, mut pending) = match started {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return login_err(e),
         Err(_) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response()
         }
     };
+    // Inject the confidential-client secret (Google) for the token exchange, if configured.
+    pending.client_secret = google_client_secret_from_env();
 
     auth.pending_auth_mut().begin(state, pending);
     Redirect::to(&url).into_response()
@@ -738,7 +896,7 @@ pub async fn get_callback(
         finish_callback(&pending, &code, &http)
     })
     .await;
-    let (authority, id_token) = match finished {
+    let (authority, id_token, refresh_token) = match finished {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             throttle.record_failure(&tenant, now);
@@ -764,11 +922,40 @@ pub async fn get_callback(
             authority.as_str(),
             &id_token,
         );
+        // Hosted web account (ADR 0077 §9): a successful login provisions the person's personal
+        // tenant-of-one (idempotent) so they land in the Console with their own space. No-op on
+        // the enterprise/desktop paths (web-account mode off).
+        provision_web_account(&mut wb, authority.as_str(), web_account_mode());
+        // Session refresh (ADR 0077): seal the offline-access refresh token into the person's own
+        // account scope, so /auth/refresh can mint fresh id-tokens without re-login. Only when the
+        // OP returned one (offline-access consent grant); best-effort.
+        if web_account_mode() {
+            if let Some(rt) = &refresh_token {
+                store_refresh_token(&mut wb, authority.as_str(), rt);
+            }
+        }
     }
 
-    // Deliver the bearer. With a configured client URL, 302 there with the token in
-    // the URL *fragment* (not a query param — fragments are never sent to servers, so
-    // the token stays out of access logs / `Referer`); otherwise return JSON.
+    // Hosted web account (ADR 0077): deliver the session as the shared `Domain=.gaugewright.com`
+    // cookie, not a URL-fragment bearer — one sign-in authenticates the whole site, and the cookie
+    // (unlike a header) rides SSE + top-level navigations. Redirect to the Console; the token never
+    // touches the URL.
+    if web_account_mode() {
+        let post_login = std::env::var("GAUGEWRIGHT_OIDC_POST_LOGIN_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        let mut resp = Redirect::to(&post_login).into_response();
+        if let Ok(cookie) = axum::http::HeaderValue::from_str(&session_cookie_header(&id_token)) {
+            resp.headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie);
+        }
+        return resp;
+    }
+
+    // Enterprise / programmatic clients: deliver the bearer. With a configured client URL, 302
+    // there with the token in the URL *fragment* (not a query param — fragments are never sent to
+    // servers, so the token stays out of access logs / `Referer`); otherwise return JSON.
     if let Ok(url) = std::env::var("GAUGEWRIGHT_OIDC_POST_LOGIN_URL") {
         if !url.trim().is_empty() {
             // A JWT is base64url + `.` — all URL-fragment-safe, no escaping needed.
@@ -785,6 +972,80 @@ pub async fn get_callback(
         })),
     )
         .into_response()
+}
+
+/// `GET /auth/refresh` (`ADR 0077` session refresh): mint a fresh id-token cookie from the person's
+/// stored refresh token — **without** re-login — but only while the current session is **still
+/// valid** (a still-authenticating id-token). An expired/absent session is `401` (re-login). This
+/// proactive model means the Console refreshes *before* expiry and an expired token can never
+/// refresh itself. Web-account only.
+pub async fn get_refresh(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !web_account_mode() {
+        return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
+    }
+    let bearer = gaugewright_app::net_http::bearer(&headers).map(str::to_string);
+    // The still-valid session resolves to the person + their sealed refresh token (fail-closed:
+    // an expired id-token authenticates to nobody, so it cannot refresh itself).
+    let (person, refresh_token) = {
+        let g = wb.lock_unpoisoned();
+        let person = g.actor(bearer.as_deref());
+        if person == "anonymous" {
+            return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
+        }
+        match resolve_refresh_token(&g, &person) {
+            Some(rt) => (person, rt),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "no refresh token on file; sign in again",
+                )
+                    .into_response()
+            }
+        }
+    };
+    let Some(sso) = web_account_sso_from_env() else {
+        return (StatusCode::CONFLICT, "web-account SSO not configured").into_response();
+    };
+    let client_id = sso.audiences.first().cloned().unwrap_or_default();
+    let client_secret = google_client_secret_from_env().map(|s| s.expose().to_string());
+    let issuer = sso.issuer.clone();
+    // Discovery + the refresh grant touch the network — off the async runtime.
+    let refreshed = tokio::task::spawn_blocking(move || {
+        let http = HttpClient::new();
+        let endpoints =
+            discover_endpoints(&issuer, &http).map_err(|e| format!("discovery: {e}"))?;
+        refresh_id_token(
+            &endpoints.token_endpoint,
+            &client_id,
+            client_secret.as_deref(),
+            &refresh_token,
+            &http,
+        )
+    })
+    .await;
+    let new_id = match refreshed {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_GATEWAY, format!("refresh failed: {e}")).into_response()
+        }
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "refresh task panicked").into_response()
+        }
+    };
+    // Set the refreshed id-token as the shared session cookie; the person is unchanged.
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({ "refreshed": true, "person": person })),
+    )
+        .into_response();
+    if let Ok(cookie) = axum::http::HeaderValue::from_str(&session_cookie_header(&new_id)) {
+        resp.headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -933,6 +1194,7 @@ iqlTEKVISscuchxZtKQJ4k8=
             audiences: vec![CLIENT_ID.into()],
             redirect_uri: "http://localhost/auth/callback".into(),
             mapping: ClaimMapping::default(),
+            client_secret: None,
         };
         store.begin("state-1", pending);
         assert_eq!(store.len(), 1);
@@ -1040,6 +1302,83 @@ iqlTEKVISscuchxZtKQJ4k8=
     }
 
     #[test]
+    fn web_account_login_provisions_the_persons_personal_tenant() {
+        use gaugewright_app::tenancy::{personal_tenant_id, Tenancy};
+        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let mut wb = Workbench::new(store);
+        let person = "google-sub-123";
+
+        // Off (enterprise/desktop): a login provisions no personal tenant.
+        assert!(provision_web_account(&mut wb, person, false).is_none());
+        assert!(Tenancy::rebuild_in(
+            wb.store_ref(),
+            &gaugewright_app::account::account_scope(person)
+        )
+        .unwrap()
+        .tenants
+        .is_empty());
+
+        // On (hosted web account): the login mints the person's personal tenant-of-one.
+        let tid =
+            provision_web_account(&mut wb, person, true).expect("provisions in web-account mode");
+        assert_eq!(tid, personal_tenant_id(person));
+        let tenancy = Tenancy::rebuild_in(
+            wb.store_ref(),
+            &gaugewright_app::account::account_scope(person),
+        )
+        .unwrap();
+        let personal = tenancy.personal().expect("a personal tenant is indexed");
+        assert_eq!(personal.id, tid);
+        assert_eq!(personal.role, "owner");
+        assert!(personal.personal);
+
+        // Idempotent: a second login does not duplicate it.
+        assert_eq!(
+            provision_web_account(&mut wb, person, true).as_deref(),
+            Some(tid.as_str())
+        );
+        assert_eq!(
+            Tenancy::rebuild_in(
+                wb.store_ref(),
+                &gaugewright_app::account::account_scope(person)
+            )
+            .unwrap()
+            .tenants
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_cookie_carries_the_token_and_shares_the_domain() {
+        // Production: parent-domain, Secure, HttpOnly, SameSite=Lax — one sign-in, whole site.
+        let c = session_cookie_value("id-tok-123", Some(".gaugewright.com"), true);
+        assert!(c.starts_with("gw_session=id-tok-123;"));
+        assert!(c.contains("Domain=.gaugewright.com"));
+        assert!(c.contains("HttpOnly") && c.contains("SameSite=Lax") && c.contains("Secure"));
+        // Loopback dev: no Domain (can't scope to localhost), Secure droppable.
+        let dev = session_cookie_value("t", None, false);
+        assert!(!dev.contains("Domain="));
+        assert!(!dev.contains("Secure"));
+        assert!(dev.contains("HttpOnly"));
+    }
+
+    #[test]
+    fn google_sso_pins_issuer_and_client_id() {
+        let sso = google_sso(
+            "https://accounts.google.com",
+            "client-xyz.apps.googleusercontent.com",
+        );
+        assert_eq!(sso.protocol, SsoProtocol::Oidc);
+        assert_eq!(sso.issuer, "https://accounts.google.com");
+        assert_eq!(sso.audiences, vec!["client-xyz.apps.googleusercontent.com"]);
+        assert!(
+            !sso.enforce_sso,
+            "hosted account is opt-in login, not locked-down"
+        );
+    }
+
+    #[test]
     fn start_login_builds_a_pkce_authorize_url() {
         let op = mock_op(String::new());
         let (url, state, pending) = start_login(
@@ -1127,7 +1466,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         )
         .unwrap();
 
-        let (authority, returned) =
+        let (authority, returned, _refresh) =
             finish_callback(&pending, "auth-code-xyz", &op).expect("callback verifies");
         assert_eq!(authority, AuthorityId::new("alice@example.test"));
         assert_eq!(

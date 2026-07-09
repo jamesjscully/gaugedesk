@@ -45,6 +45,11 @@ export function browserRouteJson(
                 ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
                 ...(publishableKey ? { "x-gw-publishable-key": publishableKey } : {}),
             },
+            // Send the shared `.gaugewright.com` session cookie cross-origin (the hosted Console at
+            // app.gaugewright.com → the hub at auth.gaugewright.com), so a cookie session
+            // authenticates without a JS-visible bearer (ADR 0077; the server allows credentials for
+            // its pinned origin allowlist). Same-origin/desktop is unaffected.
+            credentials: "include",
             body: body !== undefined ? JSON.stringify(body) : undefined,
         });
         if (res.status === 409) {

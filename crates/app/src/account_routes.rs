@@ -10,7 +10,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -20,7 +20,7 @@ use serde_json::json;
 
 use crate::account::{seal_token, DeviceRecord, DeviceStatus, RecordOp, SettingRecord};
 use crate::codex_oauth;
-use crate::{err_response, LockUnpoisoned, SharedWorkbench};
+use crate::{err_response, net_http, LockUnpoisoned, SharedWorkbench};
 
 /// Split account route surface. Local device/settings/credential ownership stays
 /// open; hosted token brokerage and account-ledger operation are split later.
@@ -52,6 +52,69 @@ pub fn routes() -> Router<SharedWorkbench> {
             "/account/oauth/openai-codex/start",
             post(codex_oauth::post_codex_login_start),
         )
+        // Library sync (ADR 0054 / the library_sync facility, ADR 0077): publish this account's
+        // sealed state to the blind directory / pull + merge from it. No-op unless the facility is
+        // active and GAUGEWRIGHT_DIRECTORY_URL is set. Signs with the workbench's root key (desktop).
+        .route("/account/library-sync", post(post_library_sync_publish))
+        .route("/account/library-sync/pull", post(post_library_sync_pull))
+}
+
+/// Publish the current account state to the blind directory (the `library_sync` facility). Builds
+/// the signed record under the lock, then PUTs it off the lock. `409` if sync is off / unconfigured.
+pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let Some(base) = crate::directory_sync::directory_url_from_env() else {
+        return (StatusCode::CONFLICT, "GAUGEWRIGHT_DIRECTORY_URL not set").into_response();
+    };
+    let put = wb.lock_unpoisoned().library_sync_signed_put();
+    let Some(put) = put else {
+        return (StatusCode::CONFLICT, "library sync is not active").into_response();
+    };
+    let published = tokio::task::spawn_blocking(move || {
+        crate::directory_sync::publish(&crate::net_http::HttpClient::new(), &base, &put)
+    })
+    .await;
+    match published {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "published": true }))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "publish task panicked").into_response(),
+    }
+}
+
+/// Pull the account state from the blind directory and merge it locally (the `library_sync`
+/// facility). Fetches off the lock, then merges under it. `409` if sync is off / unconfigured.
+pub async fn post_library_sync_pull(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let Some(base) = crate::directory_sync::directory_url_from_env() else {
+        return (StatusCode::CONFLICT, "GAUGEWRIGHT_DIRECTORY_URL not set").into_response();
+    };
+    let (active, root) = {
+        let wb = wb.lock_unpoisoned();
+        (wb.library_sync_active(), wb.library_sync_root())
+    };
+    if !active {
+        return (StatusCode::CONFLICT, "library sync is not active").into_response();
+    }
+    let fetched = tokio::task::spawn_blocking(move || {
+        crate::directory_sync::fetch(&crate::net_http::HttpClient::new(), &base, &root)
+    })
+    .await;
+    let entry = match fetched {
+        Ok(Ok(Some(e))) => e,
+        Ok(Ok(None)) => {
+            return (StatusCode::OK, Json(json!({ "found": false, "merged": 0 }))).into_response()
+        }
+        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "fetch task panicked").into_response()
+        }
+    };
+    match wb.lock_unpoisoned().library_sync_apply(&entry) {
+        Ok(merged) => (
+            StatusCode::OK,
+            Json(json!({ "found": true, "merged": merged })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e).into_response(),
+    }
 }
 
 /// Whether a first-run user must connect an LLM credential before the runtime
@@ -70,9 +133,13 @@ pub async fn get_onboarding_status() -> impl IntoResponse {
 
 // ---- devices (the trusted-devices registry) ------------------------------
 
-pub async fn get_devices(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+pub async fn get_devices(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    match wb.account_devices() {
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.account_devices_in(&scope) {
         Ok(devices) => (StatusCode::OK, Json(json!({ "devices": devices }))).into_response(),
         Err(e) => err_response(e),
     }
@@ -92,6 +159,7 @@ pub struct EnrollBody {
 /// follow-on; this records the device fact.
 pub async fn post_device(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Json(body): Json<EnrollBody>,
 ) -> impl IntoResponse {
     if body.id.trim().is_empty() {
@@ -105,7 +173,8 @@ pub async fn post_device(
         status: DeviceStatus::Active,
     };
     let mut wb = wb.lock_unpoisoned();
-    if let Err(e) = wb.upsert_account_device(&record) {
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    if let Err(e) = wb.upsert_account_device_in(&scope, &record) {
         return err_response(e);
     }
     (StatusCode::OK, Json(json!({ "device": record }))).into_response()
@@ -113,10 +182,12 @@ pub async fn post_device(
 
 pub async fn post_device_revoke(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let record = match wb.revoke_account_device(&id) {
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    let record = match wb.revoke_account_device_in(&scope, &id) {
         Ok(Some(record)) => record,
         Ok(None) => return (StatusCode::NOT_FOUND, "no such device").into_response(),
         Err(e) => return err_response(e),
@@ -126,9 +197,13 @@ pub async fn post_device_revoke(
 
 // ---- settings ------------------------------------------------------------
 
-pub async fn get_settings(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+pub async fn get_settings(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    match wb.account_settings() {
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.account_settings_in(&scope) {
         Ok(settings) => (StatusCode::OK, Json(json!({ "settings": settings }))).into_response(),
         Err(e) => err_response(e),
     }
@@ -141,6 +216,7 @@ pub struct SettingBody {
 
 pub async fn put_setting(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     Json(body): Json<SettingBody>,
 ) -> impl IntoResponse {
@@ -150,7 +226,8 @@ pub async fn put_setting(
         value: body.value,
     };
     let mut wb = wb.lock_unpoisoned();
-    if let Err(e) = wb.upsert_account_setting(&record) {
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    if let Err(e) = wb.upsert_account_setting_in(&scope, &record) {
         return err_response(e);
     }
     (StatusCode::OK, Json(json!({ "setting": record }))).into_response()
@@ -158,9 +235,13 @@ pub async fn put_setting(
 
 // ---- linked credentials (sealed; plaintext never returned) ---------------
 
-pub async fn get_credentials(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+pub async fn get_credentials(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    match wb.account_credential_providers() {
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.account_credential_providers_in(&scope) {
         Ok(provider_ids) => {
             // Providers + linked-flag only — never the token (sealed or otherwise).
             let providers: Vec<serde_json::Value> = provider_ids
@@ -182,6 +263,7 @@ pub struct LinkBody {
 /// Link a provider account: seal the OAuth token (`SEC-4`) and store the ciphertext.
 pub async fn post_credential(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Json(body): Json<LinkBody>,
 ) -> impl IntoResponse {
     if body.provider.trim().is_empty() || body.token.is_empty() {
@@ -192,12 +274,15 @@ pub async fn post_credential(
             .into_response();
     }
     let mut wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    // The seal is at-rest encryption keyed by the control-plane authority; the per-person
+    // access boundary is the scope (INV-1), so a person only ever reads their own credentials.
     let authority = wb.authority().as_str().to_string();
     let Some(sealed) = seal_token(&authority, &body.token) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "seal failed").into_response();
     };
     let provider = body.provider;
-    if let Err(e) = wb.upsert_account_credential(provider.clone(), sealed) {
+    if let Err(e) = wb.upsert_account_credential_in(&scope, provider.clone(), sealed) {
         return err_response(e);
     }
     // Advance the onboarding checklist (ADR 0075 Phase 2). Best-effort — the
@@ -212,10 +297,12 @@ pub async fn post_credential(
 
 pub async fn delete_credential(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Path(provider): Path<String>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err(e) = wb.tombstone_account_credential(provider.clone()) {
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    if let Err(e) = wb.tombstone_account_credential_in(&scope, provider.clone()) {
         return err_response(e);
     }
     (

@@ -89,19 +89,39 @@ fn fold<T>(map: &mut BTreeMap<String, T>, id: String, op: RecordOp, rec: T) {
     }
 }
 
+/// The store scope holding **one person's** account state (`ADR 0077`). The single-user desktop
+/// (and every internal, non-per-request caller) uses the fixed [`ACCOUNT_SCOPE`]; the hosted hub
+/// keys each person's devices/settings/credentials/facilities under `account::<root>` so
+/// authenticated callers are isolated (`INV-1`) and never share one scope. An empty `person`
+/// (solo / no session) collapses to [`ACCOUNT_SCOPE`], so the desktop path is unchanged.
+pub fn account_scope(person: &str) -> String {
+    if person.is_empty() {
+        ACCOUNT_SCOPE.to_string()
+    } else {
+        format!("{ACCOUNT_SCOPE}::{person}")
+    }
+}
+
 impl Account {
-    /// Rebuild by folding the `account` scope's records in position order.
+    /// Rebuild by folding the default [`ACCOUNT_SCOPE`] — the solo / single-user path.
     pub fn rebuild(store: &Store) -> Result<Account, AdmitError> {
+        Self::rebuild_in(store, ACCOUNT_SCOPE)
+    }
+
+    /// Rebuild **one person's** account by folding `scope`'s records in position order. Pass
+    /// [`ACCOUNT_SCOPE`] for the default tenant-of-one / desktop, or [`account_scope`]`(person)`
+    /// for a hosted person. Scope-isolated (`INV-1`).
+    pub fn rebuild_in(store: &Store, scope: &str) -> Result<Account, AdmitError> {
         let mut acct = Account::default();
-        for row in store.records(ACCOUNT_SCOPE, "device")? {
+        for row in store.records(scope, "device")? {
             let r: DeviceRecord = serde_json::from_str(&row)?;
             fold(&mut acct.devices, r.id.clone(), r.op, r);
         }
-        for row in store.records(ACCOUNT_SCOPE, "setting")? {
+        for row in store.records(scope, "setting")? {
             let r: SettingRecord = serde_json::from_str(&row)?;
             fold(&mut acct.settings, r.id.clone(), r.op, r);
         }
-        for row in store.records(ACCOUNT_SCOPE, "credential")? {
+        for row in store.records(scope, "credential")? {
             let r: CredentialRecord = serde_json::from_str(&row)?;
             fold(&mut acct.credentials, r.id.clone(), r.op, r);
         }
@@ -309,74 +329,138 @@ impl Workbench {
 
     /// Folded trusted-device records for the local account.
     pub fn account_devices(&self) -> Result<Vec<DeviceRecord>, AdmitError> {
-        Ok(Account::rebuild(self.store_ref())?
+        self.account_devices_in(ACCOUNT_SCOPE)
+    }
+
+    /// Trusted devices in `scope` (the caller's account, `ADR 0077`).
+    pub fn account_devices_in(&self, scope: &str) -> Result<Vec<DeviceRecord>, AdmitError> {
+        Ok(Account::rebuild_in(self.store_ref(), scope)?
             .devices
             .into_values()
             .collect())
     }
 
-    /// Folded settings for the local account.
+    /// Folded settings for the local account (default scope).
     pub fn account_settings(&self) -> Result<BTreeMap<String, String>, AdmitError> {
-        Ok(Account::rebuild(self.store_ref())?
+        self.account_settings_in(ACCOUNT_SCOPE)
+    }
+
+    /// Folded settings for the account in `scope` (the caller's account, `ADR 0077`).
+    pub fn account_settings_in(&self, scope: &str) -> Result<BTreeMap<String, String>, AdmitError> {
+        Ok(Account::rebuild_in(self.store_ref(), scope)?
             .settings
             .into_values()
             .map(|setting| (setting.id, setting.value))
             .collect())
     }
 
-    /// Provider ids linked as sealed local account credentials.
+    /// Provider ids linked as sealed local account credentials (default scope).
     pub fn account_credential_providers(&self) -> Result<Vec<String>, AdmitError> {
-        Ok(Account::rebuild(self.store_ref())?
+        self.account_credential_providers_in(ACCOUNT_SCOPE)
+    }
+
+    /// Provider ids linked in `scope` (the caller's account).
+    pub fn account_credential_providers_in(&self, scope: &str) -> Result<Vec<String>, AdmitError> {
+        Ok(Account::rebuild_in(self.store_ref(), scope)?
             .credentials
             .into_keys()
             .collect())
     }
 
-    /// Persist one local account record and publish the account change reference.
+    /// Persist one account record into the default [`ACCOUNT_SCOPE`] and publish the change ref
+    /// (solo / internal callers).
     fn write_account_record<T: serde::Serialize>(
         &mut self,
         kind: &str,
         id: &str,
         record: &T,
     ) -> Result<(), AdmitError> {
-        self.store_mut().append_record(
-            ACCOUNT_SCOPE,
-            kind,
-            &serde_json::to_string(record).unwrap(),
-        )?;
+        self.write_account_record_in(ACCOUNT_SCOPE, kind, id, record)
+    }
+
+    /// Persist one account record into `scope` (one person's account scope, `ADR 0077`) and
+    /// publish the change ref. `pub` so the per-request account routes write to the caller's
+    /// [`account_scope`] rather than the shared default.
+    pub fn write_account_record_in<T: serde::Serialize>(
+        &mut self,
+        scope: &str,
+        kind: &str,
+        id: &str,
+        record: &T,
+    ) -> Result<(), AdmitError> {
+        self.store_mut()
+            .append_record(scope, kind, &serde_json::to_string(record).unwrap())?;
         self.notify_library_changed("account", id, "upsert");
         Ok(())
     }
 
-    /// Enroll or update one trusted device record.
+    /// Enroll or update one trusted device record (default scope).
     pub fn upsert_account_device(&mut self, record: &DeviceRecord) -> Result<(), AdmitError> {
-        self.write_account_record("device", &record.id, record)
+        self.upsert_account_device_in(ACCOUNT_SCOPE, record)
     }
 
-    /// Mark one trusted device revoked, preserving its existing label/subkey metadata.
-    pub fn revoke_account_device(
+    /// Enroll or update one trusted device in `scope` (the caller's account).
+    pub fn upsert_account_device_in(
         &mut self,
+        scope: &str,
+        record: &DeviceRecord,
+    ) -> Result<(), AdmitError> {
+        self.write_account_record_in(scope, "device", &record.id, record)
+    }
+
+    /// Mark one trusted device revoked in `scope`, preserving its label/subkey metadata.
+    pub fn revoke_account_device_in(
+        &mut self,
+        scope: &str,
         device_id: &str,
     ) -> Result<Option<DeviceRecord>, AdmitError> {
-        let account = Account::rebuild(self.store_ref())?;
+        let account = Account::rebuild_in(self.store_ref(), scope)?;
         let Some(existing) = account.devices.get(device_id) else {
             return Ok(None);
         };
         let mut record = existing.clone();
         record.op = RecordOp::Upsert;
         record.status = DeviceStatus::Revoked;
-        self.write_account_record("device", &record.id.clone(), &record)?;
+        let id = record.id.clone();
+        self.write_account_record_in(scope, "device", &id, &record)?;
         Ok(Some(record))
     }
 
-    /// Persist one local account setting.
-    pub fn upsert_account_setting(&mut self, record: &SettingRecord) -> Result<(), AdmitError> {
-        self.write_account_record("setting", &record.id, record)
+    /// Mark one trusted device revoked (default scope).
+    pub fn revoke_account_device(
+        &mut self,
+        device_id: &str,
+    ) -> Result<Option<DeviceRecord>, AdmitError> {
+        self.revoke_account_device_in(ACCOUNT_SCOPE, device_id)
     }
 
-    /// Persist one sealed local account credential.
+    /// Persist one account setting (default scope).
+    pub fn upsert_account_setting(&mut self, record: &SettingRecord) -> Result<(), AdmitError> {
+        self.upsert_account_setting_in(ACCOUNT_SCOPE, record)
+    }
+
+    /// Persist one account setting in `scope` (the caller's account).
+    pub fn upsert_account_setting_in(
+        &mut self,
+        scope: &str,
+        record: &SettingRecord,
+    ) -> Result<(), AdmitError> {
+        self.write_account_record_in(scope, "setting", &record.id, record)
+    }
+
+    /// Persist one sealed account credential (default scope).
     pub fn upsert_account_credential(
         &mut self,
+        provider: String,
+        sealed_token: String,
+    ) -> Result<(), AdmitError> {
+        self.upsert_account_credential_in(ACCOUNT_SCOPE, provider, sealed_token)
+    }
+
+    /// Persist one sealed account credential in `scope` (the caller's account).
+    pub fn upsert_account_credential_in(
+        &mut self,
+        scope: &str,
         provider: String,
         sealed_token: String,
     ) -> Result<(), AdmitError> {
@@ -385,17 +469,95 @@ impl Workbench {
             op: RecordOp::Upsert,
             sealed_token,
         };
-        self.write_account_record("credential", &record.id, &record)
+        self.write_account_record_in(scope, "credential", &record.id, &record)
     }
 
-    /// Tombstone one local account credential.
+    /// Tombstone one account credential (default scope).
     pub fn tombstone_account_credential(&mut self, provider: String) -> Result<(), AdmitError> {
+        self.tombstone_account_credential_in(ACCOUNT_SCOPE, provider)
+    }
+
+    /// Tombstone one account credential in `scope` (the caller's account).
+    pub fn tombstone_account_credential_in(
+        &mut self,
+        scope: &str,
+        provider: String,
+    ) -> Result<(), AdmitError> {
         let record = CredentialRecord {
             id: provider,
             op: RecordOp::Tombstone,
             sealed_token: String::new(),
         };
-        self.write_account_record("credential", &record.id, &record)
+        self.write_account_record_in(scope, "credential", &record.id, &record)
+    }
+
+    // --- facilities + tenancy (ADR 0077) -------------------------------------
+
+    /// The account-level facilities in `scope` (the caller's account, `ADR 0077` §7) — the ones
+    /// that follow the person into every tenant (e.g. library sync).
+    pub fn account_facilities_in(
+        &self,
+        scope: &str,
+    ) -> Result<crate::facility::Facilities, AdmitError> {
+        crate::facility::Facilities::rebuild_in(self.store_ref(), scope)
+    }
+
+    /// The account-level facilities (default scope).
+    pub fn account_facilities(&self) -> Result<crate::facility::Facilities, AdmitError> {
+        self.account_facilities_in(ACCOUNT_SCOPE)
+    }
+
+    /// Attach or update one account-level facility in `scope` (the caller's account).
+    pub fn upsert_account_facility_in(
+        &mut self,
+        scope: &str,
+        record: &crate::facility::FacilityRecord,
+    ) -> Result<(), AdmitError> {
+        self.write_account_record_in(scope, crate::facility::FACILITY_KIND, &record.id, record)
+    }
+
+    /// Attach or update one account-level facility (default scope).
+    pub fn upsert_account_facility(
+        &mut self,
+        record: &crate::facility::FacilityRecord,
+    ) -> Result<(), AdmitError> {
+        self.upsert_account_facility_in(ACCOUNT_SCOPE, record)
+    }
+
+    /// Detach (tombstone) one account-level facility in `scope`, if present — future-only
+    /// revocation (`INV-18`). Returns the removed record, or `None`.
+    pub fn revoke_account_facility_in(
+        &mut self,
+        scope: &str,
+        id: &str,
+    ) -> Result<Option<crate::facility::FacilityRecord>, AdmitError> {
+        let facilities = crate::facility::Facilities::rebuild_in(self.store_ref(), scope)?;
+        let Some(existing) = facilities.get(id) else {
+            return Ok(None);
+        };
+        let mut record = existing.clone();
+        record.op = RecordOp::Tombstone;
+        let id = record.id.clone();
+        self.write_account_record_in(scope, crate::facility::FACILITY_KIND, &id, &record)?;
+        Ok(Some(record))
+    }
+
+    /// Detach (tombstone) one account-level facility (default scope).
+    pub fn revoke_account_facility(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<crate::facility::FacilityRecord>, AdmitError> {
+        self.revoke_account_facility_in(ACCOUNT_SCOPE, id)
+    }
+
+    /// The person's tenant switcher in `scope` (the caller's account, `ADR 0077` §9).
+    pub fn account_tenancy_in(&self, scope: &str) -> Result<crate::tenancy::Tenancy, AdmitError> {
+        crate::tenancy::Tenancy::rebuild_in(self.store_ref(), scope)
+    }
+
+    /// The person's tenant switcher (default scope). Empty on the solo desktop path.
+    pub fn account_tenancy(&self) -> Result<crate::tenancy::Tenancy, AdmitError> {
+        self.account_tenancy_in(ACCOUNT_SCOPE)
     }
 }
 
@@ -485,6 +647,42 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn account_scope_isolates_state_per_person() {
+        // ADR 0077: the hosted hub keys each person's account under account::<root>, so one
+        // person's devices/settings/credentials never fold into another's (INV-1). The empty
+        // person collapses to the shared default scope (desktop unchanged).
+        assert_eq!(account_scope(""), ACCOUNT_SCOPE);
+        assert_ne!(account_scope("alice"), account_scope("bob"));
+        assert_ne!(account_scope("alice"), ACCOUNT_SCOPE);
+
+        let mut s = store();
+        let setting = |v: &str| {
+            serde_json::to_string(&SettingRecord {
+                id: "theme".into(),
+                op: RecordOp::Upsert,
+                value: v.into(),
+            })
+            .unwrap()
+        };
+        s.append_record(&account_scope("alice"), "setting", &setting("dark"))
+            .unwrap();
+
+        // alice sees her setting; bob and the default scope see nothing.
+        assert_eq!(
+            Account::rebuild_in(&s, &account_scope("alice"))
+                .unwrap()
+                .settings
+                .len(),
+            1
+        );
+        assert!(Account::rebuild_in(&s, &account_scope("bob"))
+            .unwrap()
+            .settings
+            .is_empty());
+        assert!(Account::rebuild(&s).unwrap().settings.is_empty());
     }
 
     #[test]

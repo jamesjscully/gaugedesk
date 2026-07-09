@@ -11,6 +11,16 @@ use axum::response::IntoResponse;
 
 use crate::{identity, net_http, org, resource_store, throttle, Workbench};
 
+/// Whether this deployment is the hosted **web account** (`ADR 0077`) — the control-plane hub at
+/// `auth.gaugewright.com`. Set by `GAUGEWRIGHT_WEB_ACCOUNT=1`. In this mode the account/data routes
+/// require a valid session (no bootstrap-passthrough); the desktop/enterprise paths are unchanged.
+/// (The `gaugewright-ee` login shell reads the same env for its own provisioning hook.)
+pub fn web_account_mode() -> bool {
+    std::env::var("GAUGEWRIGHT_WEB_ACCOUNT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Which projects a request's caller may **see** in the nav/list projections (`ENTSEC-2`).
 /// This is the projection-visibility complement to the per-route [`Workbench::authorize_scope`]
 /// gate: the gate refuses *access* to another project's data; this stops another project even
@@ -216,6 +226,19 @@ impl Workbench {
         let org = org::Org::rebuild(self.store_ref())
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let authority = bearer.and_then(|t| idp.authenticate(t));
+        // Hosted web account (ADR 0077): the session — a verified id-token (header or the
+        // shared `.gaugewright.com` cookie) — **is** the authorization. Every request must carry
+        // one; there is **no bootstrap-passthrough** here, because the "directory" is per-person
+        // tenants, not the default org scope (so the `provisioned` check below is always false and
+        // would otherwise leave `/account/*` open to anonymous callers). Fail-closed (`INV-20`).
+        // The authenticated authority IS the person; per-person account-scope isolation is layered
+        // by the routes on top of this gate.
+        if web_account_mode() {
+            return authority.map(|a| a.as_str().to_string()).ok_or((
+                StatusCode::UNAUTHORIZED,
+                "authenticate to access your account",
+            ));
+        }
         let provisioned = org
             .members
             .values()
@@ -379,6 +402,21 @@ impl Workbench {
                 .map(|a| a.as_str().to_string())
                 .unwrap_or_else(|| "anonymous".to_string()),
             None => self.authority().as_str().to_string(),
+        }
+    }
+
+    /// The **account store scope** for a request (`ADR 0077`): in the hosted hub
+    /// ([`web_account_mode`]) the caller's own `account::<person>` scope (resolved from the session
+    /// bearer via [`actor`](Self::actor)), so authenticated people are isolated (`INV-1`);
+    /// otherwise the shared [`crate::account::ACCOUNT_SCOPE`] (desktop / single-user, unchanged).
+    /// The web-account gate ([`admit_data_request`](Self::admit_data_request)) guarantees a valid
+    /// session before the account routes run, so the resolved actor here is the authenticated
+    /// person. The account routes pass this to the `*_in(scope)` account methods.
+    pub fn account_scope_for(&self, bearer: Option<&str>) -> String {
+        if web_account_mode() {
+            crate::account::account_scope(&self.actor(bearer))
+        } else {
+            crate::account::ACCOUNT_SCOPE.to_string()
         }
     }
 

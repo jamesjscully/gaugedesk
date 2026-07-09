@@ -454,7 +454,9 @@ export function subscribe(
     onEvent: (ev: StreamEvent) => void,
     onOpen?: () => void,
 ): () => void {
-    const es = new EventSource(`${transport.base}/chats/${id}/events`);
+    // `withCredentials` sends the shared `.gaugewright.com` session cookie on the cross-origin
+    // stream (the Console → hub), so SSE authenticates like the fetch routes (ADR 0077).
+    const es = new EventSource(`${transport.base}/chats/${id}/events`, { withCredentials: true });
     if (onOpen) es.onopen = onOpen;
     es.onmessage = (m) => {
         try {
@@ -470,7 +472,7 @@ export function subscribeWorkspace(
     transport: WorkbenchTransport,
     onChange: (change: WorkspaceChange) => void,
 ): () => void {
-    const es = new EventSource(`${transport.base}/workspace/events`);
+    const es = new EventSource(`${transport.base}/workspace/events`, { withCredentials: true });
     es.onmessage = (m) => {
         try {
             const ev = JSON.parse(m.data) as {

@@ -18,6 +18,7 @@ import {
     bearer,
     clientRequestId,
     consumeCallbackToken,
+    startSessionRefresh,
     type ArchetypeId,
     describeFailure,
     type EngagementId,
@@ -106,6 +107,9 @@ const api = new WorkbenchControlPlane(controlPlaneBase());
 // no-op default (no header sent).
 consumeCallbackToken();
 api.setBearer(bearer());
+// Hosted Console (ADR 0077): keep the `.gaugewright.com` cookie session alive by pinging
+// `/auth/refresh` on a timer under the id-token's ~1h life. No-op on the loopback desktop.
+startSessionRefresh(controlPlaneBase());
 
 /** A message the human typed while a turn was in flight. Queued messages stack on
  *  top of the composer and drain in order when each turn settles. The `id` is a

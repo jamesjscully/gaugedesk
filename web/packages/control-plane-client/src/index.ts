@@ -2,6 +2,7 @@ export * from "./auth-session";
 export * from "./browser-route-json";
 export * from "./bridge";
 export * from "./control-plane-account";
+export * from "./control-plane-tenant";
 export * from "./control-plane-domain";
 export * from "./control-plane-embed";
 export * from "./control-plane-federation";

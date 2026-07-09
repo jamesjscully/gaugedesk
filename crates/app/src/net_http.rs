@@ -13,16 +13,42 @@ use std::time::Duration;
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use gaugewright_store::AdmitError;
 
-/// The bearer credential from the `Authorization: Bearer <token>` header, if present.
-/// `pub` so the extracted enterprise band (`gaugewright-ee`) and the private route
-/// lanes parse bearers exactly like the open routes.
+/// The name of the shared web-account session cookie (ADR 0077): the hosted hub sets it
+/// `Domain=.gaugewright.com` on login, so one sign-in authenticates the whole site.
+pub const SESSION_COOKIE: &str = "gw_session";
+
+/// The credential a request presents, from **either** the `Authorization: Bearer <token>`
+/// header **or** the [`SESSION_COOKIE`] cookie. `pub` so the extracted enterprise band
+/// (`gaugewright-ee`) and the private route lanes parse it exactly like the open routes.
+///
+/// The cookie fallback is what makes the hosted Console work: a browser cannot set an
+/// `Authorization` header on an `EventSource` (SSE) or a top-level navigation, but it *does*
+/// send cookies — so the shared `Domain=.gaugewright.com` session cookie authenticates the
+/// live streams and cross-subdomain requests. The header still wins when both are present
+/// (explicit programmatic clients, tests).
 pub fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
+    if let Some(tok) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        return Some(tok.trim());
+    }
+    session_cookie(headers)
+}
+
+/// The [`SESSION_COOKIE`] value from the `Cookie` header, if present and non-empty.
+pub fn session_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        if let Some(v) = part.trim().strip_prefix("gw_session=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 /// Liveness/readiness probe handler — a fixed 200 `{"ok":true}` once the router is serving.
@@ -89,6 +115,12 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        // The hosted Console is a cross-subdomain browser client (app.gaugewright.com →
+        // auth/api host) that authenticates with the shared `Domain=.gaugewright.com`
+        // session cookie (ADR 0077). Credentialed CORS is required for the browser to send
+        // that cookie and for SSE `withCredentials`. Safe here: the origin is a **pinned
+        // allowlist** (never wildcard), which is the one case credentials forbid.
+        .allow_credentials(true)
 }
 
 /// Neutral store-error → HTTP response formatting. `pub` so extracted private
@@ -161,6 +193,24 @@ impl HttpClient {
         }
     }
 
+    /// JSON `PUT`, returning `(status, body)`. A transport failure is `Err`; an HTTP error status
+    /// is `Ok` with that status (the caller inspects it). Used by the blind-directory publish
+    /// (`PUT /directory/:root`, ADR 0054).
+    pub fn put_json(&self, url: &str, body: &str) -> Result<(u16, String), String> {
+        match self
+            .agent
+            .put(url)
+            .set("Content-Type", "application/json")
+            .send_string(body)
+        {
+            Ok(resp) => Ok((resp.status(), resp.into_string().unwrap_or_default())),
+            Err(ureq::Error::Status(code, resp)) => {
+                Ok((code, resp.into_string().unwrap_or_default()))
+            }
+            Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+        }
+    }
+
     /// `application/x-www-form-urlencoded` POST (e.g. an OAuth2 token request), returning
     /// `(status, body)`.
     pub fn post_form(&self, url: &str, fields: &[(&str, &str)]) -> Result<(u16, String), String> {
@@ -207,5 +257,50 @@ impl HttpClient {
             }
             Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bearer, session_cookie};
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(name.clone(), HeaderValue::from_str(value).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn bearer_reads_the_authorization_header() {
+        let h = headers(&[(header::AUTHORIZATION, "Bearer abc.def.ghi")]);
+        assert_eq!(bearer(&h), Some("abc.def.ghi"));
+    }
+
+    #[test]
+    fn bearer_falls_back_to_the_session_cookie() {
+        // A browser SSE / navigation carries no Authorization header, only cookies.
+        let h = headers(&[(header::COOKIE, "other=1; gw_session=tok-123; theme=dark")]);
+        assert_eq!(bearer(&h), Some("tok-123"));
+        assert_eq!(session_cookie(&h), Some("tok-123"));
+    }
+
+    #[test]
+    fn the_authorization_header_wins_over_the_cookie() {
+        let h = headers(&[
+            (header::AUTHORIZATION, "Bearer header-tok"),
+            (header::COOKIE, "gw_session=cookie-tok"),
+        ]);
+        assert_eq!(bearer(&h), Some("header-tok"));
+    }
+
+    #[test]
+    fn no_credential_is_none_and_an_empty_cookie_is_ignored() {
+        assert_eq!(bearer(&HeaderMap::new()), None);
+        let h = headers(&[(header::COOKIE, "gw_session=; x=1")]);
+        assert_eq!(session_cookie(&h), None);
+        assert_eq!(bearer(&h), None);
     }
 }

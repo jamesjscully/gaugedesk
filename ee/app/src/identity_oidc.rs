@@ -403,7 +403,7 @@ pub fn exchange_code(
     pkce_verifier: &str,
     client_secret: Option<&str>,
     http: &impl HttpForm,
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     let mut fields = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -417,10 +417,47 @@ pub fn exchange_code(
     let body = http.post_form(token_endpoint, &fields)?;
     let doc: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid token response: {e}"))?;
-    doc.get("id_token")
+    let id_token = doc
+        .get("id_token")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .ok_or_else(|| "token response has no id_token".to_string())
+        .ok_or_else(|| "token response has no id_token".to_string())?;
+    // The refresh token (present only with `access_type=offline` on the consent grant, ADR 0077).
+    let refresh_token = doc
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Ok((id_token, refresh_token))
+}
+
+/// Redeem a **refresh token** for a fresh id-token (`grant_type=refresh_token`, ADR 0077) — the
+/// session-refresh leg. Presents the confidential-client secret when the OP requires it (Google).
+/// Returns the new id-token. Free of axum/IO except the injected [`HttpForm`], so it is
+/// mock-testable like [`exchange_code`].
+pub fn refresh_id_token(
+    token_endpoint: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    refresh_token: &str,
+    http: &impl HttpForm,
+) -> Result<String, String> {
+    let mut fields = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = client_secret {
+        fields.push(("client_secret", secret));
+    }
+    let body = http.post_form(token_endpoint, &fields)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid refresh response: {e}"))?;
+    doc.get("id_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .ok_or_else(|| "refresh response has no id_token".to_string())
 }
 
 /// A PKCE pair (RFC 7636) for the auth-code flow: a random `verifier` and its S256
@@ -464,9 +501,10 @@ pub fn authorize_url(
     scope: &str,
     state: &str,
     challenge: &str,
+    extra_params: &str,
 ) -> String {
     format!(
-        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256{extra_params}",
         pct(client_id),
         pct(redirect_uri),
         pct(scope),
@@ -787,7 +825,7 @@ JHmZgYDG5oeiHH3XvE7+GU3ekV0tajXPJ4/hHX7Y3fHB/fLZDDBkB+2hdg==
             response: r#"{"access_token":"at","id_token":"the.id.token","token_type":"Bearer"}"#
                 .to_string(),
         };
-        let id_token = exchange_code(
+        let (id_token, refresh) = exchange_code(
             "https://idp.example.com/token",
             "client-1",
             "http://localhost/cb",
@@ -798,6 +836,7 @@ JHmZgYDG5oeiHH3XvE7+GU3ekV0tajXPJ4/hHX7Y3fHB/fLZDDBkB+2hdg==
         )
         .expect("exchange");
         assert_eq!(id_token, "the.id.token");
+        assert!(refresh.is_none(), "no refresh_token in this response");
         // The PKCE auth-code grant was posted with the verifier (so an intercepted code is
         // useless without it).
         let seen = mock.seen.lock().unwrap();
@@ -816,6 +855,42 @@ JHmZgYDG5oeiHH3XvE7+GU3ekV0tajXPJ4/hHX7Y3fHB/fLZDDBkB+2hdg==
             response: r#"{"access_token":"at","token_type":"Bearer"}"#.to_string(),
         };
         assert!(exchange_code("u", "c", "r", "code", "v", None, &mock).is_err());
+    }
+
+    #[test]
+    fn exchange_code_captures_a_refresh_token_when_present() {
+        // An offline-access grant returns a refresh_token alongside the id_token (ADR 0077).
+        let mock = MockForm {
+            seen: std::sync::Mutex::new(vec![]),
+            response:
+                r#"{"id_token":"the.id.token","refresh_token":"rt-abc","token_type":"Bearer"}"#
+                    .to_string(),
+        };
+        let (id, rt) = exchange_code("u", "c", "r", "code", "v", None, &mock).expect("exchange");
+        assert_eq!(id, "the.id.token");
+        assert_eq!(rt.as_deref(), Some("rt-abc"));
+    }
+
+    #[test]
+    fn refresh_id_token_posts_the_refresh_grant_and_returns_a_fresh_id_token() {
+        let mock = MockForm {
+            seen: std::sync::Mutex::new(vec![]),
+            response: r#"{"id_token":"fresh.id.token","token_type":"Bearer"}"#.to_string(),
+        };
+        let tok = refresh_id_token(
+            "https://idp.example.com/token",
+            "client-1",
+            Some("the-secret"),
+            "rt-abc",
+            &mock,
+        )
+        .expect("refresh");
+        assert_eq!(tok, "fresh.id.token");
+        let seen = mock.seen.lock().unwrap();
+        let has = |k: &str, v: &str| seen.iter().any(|(a, b)| a == k && b == v);
+        assert!(has("grant_type", "refresh_token"));
+        assert!(has("refresh_token", "rt-abc"));
+        assert!(has("client_secret", "the-secret"));
     }
 
     #[test]
@@ -842,12 +917,14 @@ JHmZgYDG5oeiHH3XvE7+GU3ekV0tajXPJ4/hHX7Y3fHB/fLZDDBkB+2hdg==
             "openid email",
             "xyz",
             "CHAL",
+            "&access_type=offline",
         );
         assert!(url.contains("code_challenge=CHAL"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope=openid%20email")); // space encoded
         assert!(url.contains("redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb"));
+        assert!(url.ends_with("&access_type=offline")); // extra params appended
     }
 
     #[test]

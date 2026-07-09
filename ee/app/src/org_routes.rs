@@ -128,6 +128,9 @@ pub fn routes() -> Router<SharedWorkbench> {
         // back the verified id-token (the bearer the admin routes accept).
         .route("/auth/login", get(crate::auth_oidc::get_login))
         .route("/auth/callback", get(crate::auth_oidc::get_callback))
+        // Session refresh (ADR 0077): a still-valid session mints a fresh id-token cookie from the
+        // stored refresh token, so a hosted session outlives the ~1h id-token without re-login.
+        .route("/auth/refresh", get(crate::auth_oidc::get_refresh))
         // Security policy (M3 B15 / SEC-1/2/3): MFA, session, residency default.
         .route("/admin/security", get(get_security).post(post_security))
         // Archetype-approval policy (ADR 0063): the org default for whether adding an

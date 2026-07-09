@@ -123,3 +123,24 @@ export function beginLogin(controlPlaneBase: string): void {
 export function signOut(): void {
     setBearer(null);
 }
+
+/**
+ * Keep a hosted **cookie session** alive (ADR 0077 session refresh). The hub sets an HttpOnly
+ * `.gaugewright.com` session cookie carrying a ~1h id-token; `GET /auth/refresh` mints a fresh one
+ * from the stored refresh token **while the current session is still valid** (proactive — an expired
+ * cookie can't refresh itself). So the Console pings `/auth/refresh` on a timer well under the hour;
+ * the browser swaps in the new cookie, and a long-open tab never gets logged out mid-use.
+ *
+ * Fire-and-forget + credentialed (the HttpOnly cookie is not JS-readable). No-op unless `base` is a
+ * remote `https` hub (the hosted Console) — the loopback desktop has no cookie session. Returns a
+ * stop function. Safe when there is no `window`.
+ */
+export function startSessionRefresh(base: string, intervalMs = 45 * 60 * 1000): () => void {
+    if (typeof window === "undefined" || !base.startsWith("https://")) return () => {};
+    const tick = () => {
+        // Ignore the outcome: a 200 refreshed the cookie; a 401/404 just means re-login on next use.
+        void fetch(`${base}/auth/refresh`, { method: "GET", credentials: "include" }).catch(() => {});
+    };
+    const id = window.setInterval(tick, intervalMs);
+    return () => window.clearInterval(id);
+}

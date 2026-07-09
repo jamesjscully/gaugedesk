@@ -457,6 +457,24 @@ export class WorkbenchControlPlane {
         return federationClient.handoffData(this.routeJson(), project);
     }
 
+    // Account-level facilities + the tenant switcher (ADR 0077 §7/§9) — the hosted
+    // Console reads these; on the desktop the tenant list is empty (org-free solo).
+    accountFacilities(): Promise<accountClient.AccountFacility[]> {
+        return accountClient.accountFacilities(this.routeJson());
+    }
+
+    accountAttachFacility(input: accountClient.AttachFacilityInput): Promise<accountClient.AccountFacility> {
+        return accountClient.accountAttachFacility(this.routeJson(), input);
+    }
+
+    accountDetachFacility(id: string): Promise<void> {
+        return accountClient.accountDetachFacility(this.routeJson(), id);
+    }
+
+    accountTenants(): Promise<accountClient.AccountTenant[]> {
+        return accountClient.accountTenants(this.routeJson());
+    }
+
     accountDevices(): Promise<accountClient.AccountDevice[]> {
         return accountClient.accountDevices(this.routeJson());
     }
