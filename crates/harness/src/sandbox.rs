@@ -31,6 +31,7 @@
 //! [`SandboxPolicy::allow_unfiltered_egress`] (env
 //! `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`), mirroring `GAUGEWRIGHT_SANDBOX=0`.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Network posture (RF-B3, CORE-5). The policy is **deny-by-default**: a process
@@ -140,18 +141,23 @@ impl SandboxPolicy {
 }
 
 /// Whether the netns→proxy last-mile routing for [`Network::Filtered`] is wired
-/// **and verified non-bypassable on a real `slirp4netns`/`pasta` host**.
+/// **and verified non-bypassable on a real `pasta` host**.
 ///
-/// The enforcement heart — the host-filtering [`crate::egress_proxy`] and the
-/// whole policy/posture path — is built and tested. The remaining piece is
-/// attaching the userspace-net helper to the spawned bubblewrap process's netns
-/// and default-dropping every route except the proxy (the design of record is in
-/// ADR 0079). That attach cannot be verified without a `slirp4netns`/`pasta` host,
-/// and an *unverified* egress filter that silently leaks would be worse than
-/// honest isolation. So until it is landed and verified, this stays `false` and
-/// `Filtered` realizes **fail-closed to [`Network::Deny`]** (isolated) — see
-/// [`effective_network`]. Flip to `true` only together with the verified attach.
-pub const FILTERED_ROUTING_VERIFIED: bool = false;
+/// VERIFIED `true` (2026-07-09) on a `pasta` host by the gated end-to-end test
+/// [`crate::sni_proxy::tests::transparent_sni_egress_is_non_bypassable_end_to_end`]:
+/// the transparent SNI composition (`pasta` netns + `nft` default-drop + DNAT
+/// `tcp/443`→the host SNI proxy + `bwrap` fs-sandbox with no `--unshare-net`)
+/// blocks all direct egress — non-allowlisted SNI, raw IP, non-443, and even host
+/// **loopback services** (the map is accepted only on the proxy port) — while an
+/// in-sandbox `nft flush` cannot reopen it (no CAP_NET_ADMIN over pasta's netns).
+/// Functional acceptance: the agent runtime (`bun` `fetch`, what the shipped Pi is
+/// compiled with) reaches an allowlisted host through the sandbox, so `Filtered`
+/// enforces without breaking model access. `can_enforce_filtered()` still gates on
+/// `bwrap` + `pasta` being present, so a host lacking them keeps the open-by-default
+/// posture (no regression). Follow-up: vendor `pasta` into the bundle (SELFHOST-1)
+/// so enforcement is universal, not opportunistic. Residual (ADR 0079): DNS
+/// tunnelling, domain fronting, fragmented-ClientHello (fails closed).
+pub const FILTERED_ROUTING_VERIFIED: bool = true;
 
 /// Host capabilities that decide whether [`Network::Filtered`] can be *enforced*
 /// (CORE-5). Filtered needs a bubblewrap netns plus a rootless userspace-net
@@ -248,41 +254,177 @@ impl Sandbox for Bubblewrap {
         args: &[String],
         cwd: Option<&Path>,
     ) -> Option<Vec<String>> {
-        let mut v: Vec<String> = vec!["bwrap".into(), "--die-with-parent".into()];
-        // Read-only host, with a real writable /tmp and minimal /dev + /proc.
-        v.extend(["--ro-bind", "/", "/"].map(String::from));
-        v.extend(["--dev", "/dev"].map(String::from));
-        v.extend(["--proc", "/proc"].map(String::from));
-        v.extend(["--bind", "/tmp", "/tmp"].map(String::from));
-        for w in &policy.writable_roots {
-            v.push("--bind".into());
-            v.push(w.to_string_lossy().into_owned());
-            v.push(w.to_string_lossy().into_owned());
-        }
-        // After the writable binds, so a definition path nested in the worktree wins.
-        for r in &policy.read_only_roots {
-            v.push("--ro-bind".into());
-            v.push(r.to_string_lossy().into_owned());
-            v.push(r.to_string_lossy().into_owned());
-        }
         // Isolate the netns for both `Deny` (fully isolated) and `Filtered`
-        // (isolated, with the host-filtering egress proxy attached out-of-band as
-        // its sole outbound path — ADR 0079). Only the unfiltered `Allow` opt-in
-        // shares the host network. The Filtered→Deny fail-closed degrade
-        // ([`effective_network`]) produces the same `--unshare-net` argv, so an
-        // unenforceable filter is byte-for-byte an isolated run.
-        if policy.network != Network::Allow {
-            v.push("--unshare-net".into());
-        }
-        if let Some(cwd) = cwd {
-            v.push("--chdir".into());
-            v.push(cwd.to_string_lossy().into_owned());
-        }
-        v.push("--".into());
-        v.push(program.into());
-        v.extend(args.iter().cloned());
-        Some(v)
+        // (the honest current default while the transparent routing is unverified:
+        // `Filtered` degrades to `Deny` in [`effective_network`], so it must produce
+        // the same isolated argv). Only the unfiltered `Allow` opt-in shares the
+        // host network. When the transparent-egress composition owns the netns
+        // (pasta — see [`filtered_wrap`]), bwrap must NOT unshare, so it inherits
+        // pasta's netns; that path calls [`bwrap_fs_argv`] with `unshare_net=false`.
+        let unshare_net = policy.network != Network::Allow;
+        Some(bwrap_fs_argv(policy, program, args, cwd, unshare_net))
     }
+}
+
+/// Build the bubblewrap filesystem-sandbox argv for `program args…`. `unshare_net`
+/// controls the network namespace: `true` gives bwrap its own empty netns
+/// (`--unshare-net`, the isolated `Deny`/`Filtered`-degraded default); `false`
+/// leaves the netns bwrap is launched in intact — used by the transparent-egress
+/// composition, where pasta already owns a filtered netns and a second unshare
+/// would throw it away. The filesystem binds are identical either way.
+fn bwrap_fs_argv(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    unshare_net: bool,
+) -> Vec<String> {
+    let mut v: Vec<String> = vec!["bwrap".into(), "--die-with-parent".into()];
+    // Read-only host, with a real writable /tmp and minimal /dev + /proc.
+    v.extend(["--ro-bind", "/", "/"].map(String::from));
+    v.extend(["--dev", "/dev"].map(String::from));
+    v.extend(["--proc", "/proc"].map(String::from));
+    v.extend(["--bind", "/tmp", "/tmp"].map(String::from));
+    for w in &policy.writable_roots {
+        v.push("--bind".into());
+        v.push(w.to_string_lossy().into_owned());
+        v.push(w.to_string_lossy().into_owned());
+    }
+    // After the writable binds, so a definition path nested in the worktree wins.
+    for r in &policy.read_only_roots {
+        v.push("--ro-bind".into());
+        v.push(r.to_string_lossy().into_owned());
+        v.push(r.to_string_lossy().into_owned());
+    }
+    if unshare_net {
+        v.push("--unshare-net".into());
+    }
+    if let Some(cwd) = cwd {
+        v.push("--chdir".into());
+        v.push(cwd.to_string_lossy().into_owned());
+    }
+    v.push("--".into());
+    v.push(program.into());
+    v.extend(args.iter().cloned());
+    v
+}
+
+/// The IPv4 address pasta maps the host's loopback to inside the netns (the proxy,
+/// bound on host `127.0.0.1`, is reached here). Kept in sync with the
+/// `--map-host-loopback` value in [`filtered_wrap`].
+pub const HOST_LOOPBACK_MAP: &str = "169.254.1.1";
+
+/// The nftables ruleset applied **inside pasta's netns** to make the transparent
+/// SNI proxy the sole outbound path (CORE-5, ADR 0079). Verified non-bypassable on
+/// a real pasta host. Multi-line form (the one-line form fails nft's parser):
+///
+/// - `output` filter chain, `policy drop` — every packet is dropped unless a rule
+///   accepts it. `oif lo accept` keeps loopback (this also covers DNS to a
+///   loopback resolver like systemd-resolved's `127.0.0.53`, which pasta forwards);
+///   `ip daddr <map> tcp dport <proxy_port> accept` keeps traffic to the host-loopback
+///   map ONLY on the proxy port (where DNAT rewrites `tcp/443` to). Restricting to the
+///   proxy port is load-bearing: `<map>` maps to the host's whole loopback, so accepting
+///   *any* port there would let the agent reach unrelated host-loopback services (the
+///   control plane on `127.0.0.1:7878`, etc.) by dialing `<map>:<port>` directly.
+/// - `natout` nat chain — DNAT every `tcp dport 443` to the proxy at
+///   `<map>:<proxy_port>`. Port 80 and every other port/host have no accept rule,
+///   so they are dropped: direct egress by hostname OR by raw IP cannot leave.
+///
+/// DNS to a **non-loopback** resolver is allowed dynamically by the launcher script
+/// in [`filtered_wrap`] (it reads the netns resolver from `/etc/resolv.conf`), so
+/// this static ruleset stays resolver-address-independent.
+pub fn nft_ruleset(proxy_port: u16) -> String {
+    format!(
+        "table inet gw_egress {{\n\
+         \tchain output {{\n\
+         \t\ttype filter hook output priority 0; policy drop;\n\
+         \t\tmeta oif lo accept;\n\
+         \t\tip daddr {map} tcp dport {port} accept;\n\
+         \t}}\n\
+         \tchain natout {{\n\
+         \t\ttype nat hook output priority -100; policy accept;\n\
+         \t\ttcp dport 443 dnat ip to {map}:{port};\n\
+         \t}}\n\
+         }}\n",
+        map = HOST_LOOPBACK_MAP,
+        port = proxy_port,
+    )
+}
+
+/// The in-netns launcher script (run by `/bin/sh -c`): apply the nft ruleset from
+/// `$1`, permit DNS to the netns's own resolver (read live from `/etc/resolv.conf`,
+/// for the non-loopback-resolver case the `oif lo` rule doesn't already cover),
+/// then `exec` the wrapped argv (`$2 …`). Any nft failure aborts (`exit 1`) so a
+/// filter that did not apply NEVER runs the agent with open egress — fail closed.
+const FILTERED_LAUNCH_SCRIPT: &str = "\
+printf '%s' \"$1\" | nft -f - || exit 1
+ns=$(awk '/^nameserver/ { print $2; exit }' /etc/resolv.conf 2>/dev/null)
+if [ -n \"$ns\" ]; then
+  nft add rule inet gw_egress output ip daddr \"$ns\" udp dport 53 accept 2>/dev/null
+  nft add rule inet gw_egress output ip daddr \"$ns\" tcp dport 53 accept 2>/dev/null
+fi
+shift
+exec \"$@\"
+";
+
+/// Build the **transparent SNI egress** composition for [`Network::Filtered`]
+/// (CORE-5, ADR 0079): run the bubblewrap fs-sandbox inside a pasta-owned netns
+/// whose only outbound path is the host SNI proxy at `proxy_addr`.
+///
+/// Produces the argv:
+/// `pasta --config-net --ipv4-only --map-host-loopback <map> -- /bin/sh -c
+/// <script> sh <nft-ruleset> <bwrap-argv…>` where `<bwrap-argv…>` is the exact fs
+/// sandbox from [`bwrap_fs_argv`] **without** `--unshare-net` (pasta owns the
+/// netns). The nft ruleset (passed as a literal argv, applied via `nft -f -`
+/// inside the script) default-drops all egress except loopback and the proxy, and
+/// DNATs `tcp dport 443` to `<map>:<proxy_port>`.
+///
+/// The proxy itself is started and its lifetime owned by the caller (the sandboxed
+/// process must not outlive the checkpoint) — see
+/// [`crate::sni_proxy::SniProxyGuard`]. This only builds the argv; `proxy_addr` is
+/// the guard's bound address. `None` on a non-Linux target (Filtered is Linux-only;
+/// it fails closed to isolation elsewhere via [`effective_network`]).
+pub fn filtered_wrap(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    proxy_addr: SocketAddr,
+) -> Option<Vec<String>> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    // bwrap must NOT unshare the netns — pasta owns the filtered one.
+    let inner = bwrap_fs_argv(policy, program, args, cwd, false);
+    let rules = nft_ruleset(proxy_addr.port());
+    let mut v: Vec<String> = vec![
+        "pasta".into(),
+        "--config-net".into(),
+        "--ipv4-only".into(),
+        "--map-host-loopback".into(),
+        HOST_LOOPBACK_MAP.into(),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        FILTERED_LAUNCH_SCRIPT.into(),
+        // $0 for the script, then $1 = ruleset, then $2… = the wrapped argv.
+        "sh".into(),
+        rules,
+    ];
+    v.extend(inner);
+    Some(v)
+}
+
+/// Whether this host both *wants* and *can* run [`Network::Filtered`] as the
+/// transparent-egress composition right now — i.e. the effective posture resolves
+/// to `Filtered` (so [`FILTERED_ROUTING_VERIFIED`] is set and the caps are present)
+/// AND the userspace-net helper is pasta (the proven, implemented backend). The Pi
+/// bridge consults this to decide whether to start the SNI proxy and build
+/// [`filtered_wrap`]; everything else takes the isolated/unfiltered path unchanged.
+pub fn wants_transparent_egress(policy: &SandboxPolicy) -> bool {
+    let caps = detect_routing_caps();
+    effective_network(policy.network, caps) == Network::Filtered
+        && caps.userspace_net == Some("pasta")
 }
 
 /// macOS: Seatbelt via `sandbox-exec -p <SBPL>`. Allow-by-default, deny all

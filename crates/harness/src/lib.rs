@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod egress_proxy;
 pub mod sandbox;
+pub mod sni_proxy;
 pub mod testing;
 
 /// The host's egress decision for one tool effect, as the membrane would rule.

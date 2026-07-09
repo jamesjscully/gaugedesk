@@ -627,6 +627,12 @@ pub struct PiProcess {
     /// Bounded tail of Pi's stderr, filled by a background drain thread. Read on a
     /// failed/empty turn to surface the real provider error (see [`RpcTransport::stderr_tail`]).
     stderr_log: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The host-side transparent SNI egress proxy for [`Network::Filtered`]
+    /// (CORE-5, ADR 0079), present only when this process runs under the transparent
+    /// composition. Held here so the egress checkpoint lives exactly as long as the
+    /// sandboxed process: dropping/`shutdown`ing `PiProcess` drops this guard, which
+    /// tears the proxy down. `None` for every other posture.
+    _egress_proxy: Option<gaugewright_harness::sni_proxy::SniProxyGuard>,
 }
 
 impl PiProcess {
@@ -637,7 +643,36 @@ impl PiProcess {
         // definition surface is read-only at the kernel (ADR 0030). A backend that
         // can't wrap either fails closed or warns-and-runs (RF-B1) — that decision
         // lives in [`sandbox::wrap_or_refuse`].
+        //
+        // CORE-5 transparent egress (ADR 0079): when the posture resolves to
+        // `Filtered` and this host can enforce it (pasta + verified routing), the
+        // sandbox is composed inside a pasta-owned netns whose sole outbound path is
+        // a host SNI proxy. We start that proxy here and hold its guard on the
+        // `PiProcess`, so the checkpoint is up for every turn and torn down with the
+        // process. Every other posture takes the unchanged `wrap_or_refuse` path.
+        let mut egress_proxy = None;
         let mut cmd = match &config.sandbox {
+            Some(policy) if sandbox::wants_transparent_egress(policy) => {
+                let guard = gaugewright_harness::sni_proxy::SniProxyGuard::spawn(
+                    policy.allowed_hosts.clone(),
+                )?;
+                let argv =
+                    sandbox::filtered_wrap(policy, &config.program, &args, cwd, guard.addr())
+                        .ok_or_else(|| {
+                            io::Error::other(
+                        "transparent egress requested but its composition is unavailable here",
+                    )
+                        })?;
+                tracing::info!(
+                    proxy = %guard.addr(),
+                    allowed_hosts = policy.allowed_hosts.len(),
+                    "pi spawn: transparent SNI egress (pasta + nft + host proxy)"
+                );
+                egress_proxy = Some(guard);
+                let mut c = ProcCommand::new(&argv[0]);
+                c.args(&argv[1..]);
+                c
+            }
             Some(policy) => sandbox::wrap_or_refuse(policy, &config.program, &args, cwd)?,
             None => {
                 let mut c = ProcCommand::new(&config.program);
@@ -695,6 +730,7 @@ impl PiProcess {
             stdin,
             stdout,
             stderr_log,
+            _egress_proxy: egress_proxy,
         })
     }
 
