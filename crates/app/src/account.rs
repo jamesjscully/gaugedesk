@@ -412,17 +412,6 @@ impl Workbench {
             .collect())
     }
 
-    /// Persist one account record into the default [`ACCOUNT_SCOPE`] and publish the change ref
-    /// (solo / internal callers).
-    fn write_account_record<T: serde::Serialize>(
-        &mut self,
-        kind: &str,
-        id: &str,
-        record: &T,
-    ) -> Result<(), AdmitError> {
-        self.write_account_record_in(ACCOUNT_SCOPE, kind, id, record)
-    }
-
     /// Persist one account record into `scope` (one person's account scope, `ADR 0077`) and
     /// publish the change ref. `pub` so the per-request account routes write to the caller's
     /// [`account_scope`] rather than the shared default.
