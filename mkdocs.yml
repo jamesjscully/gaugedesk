@@ -8,9 +8,9 @@ site_dir: site
 
 theme:
   name: material
-  font:
-    text: Figtree
-    code: Inconsolata
+  # Brand fonts are self-hosted from docs/assets/brand.css. Disabling Material's
+  # loader avoids requesting Commit Mono from Google Fonts, where it is absent.
+  font: false
   palette:
     # Navy-led by default (matches the marketing site); light is a toggle.
     - scheme: slate

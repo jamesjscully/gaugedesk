@@ -47,8 +47,8 @@ const EMBED_THEME_CSS = `
   --accent: var(--gw-accent, #6aa3ff);
   --warn: var(--gw-warn, #e0a35a);
   --bad: var(--gw-bad, #e06a6a);
-  --ui: var(--gw-font, "Figtree", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
-  --mono: var(--gw-mono, "Inconsolata", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  --ui: var(--gw-font, "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+  --mono: var(--gw-mono, "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   display: block;
   height: 100%;
   background: var(--bg);
