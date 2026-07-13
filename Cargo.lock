@@ -2400,7 +2400,7 @@ dependencies = [
 [[package]]
 name = "whipplescript"
 version = "0.4.0"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=0ec9e1421d08a9912239be6f6fce50a5d0af7754#0ec9e1421d08a9912239be6f6fce50a5d0af7754"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=70be7e6107d3620e96752dc901aa55b200776b4a#70be7e6107d3620e96752dc901aa55b200776b4a"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2421,7 +2421,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-core"
 version = "0.4.0"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=0ec9e1421d08a9912239be6f6fce50a5d0af7754#0ec9e1421d08a9912239be6f6fce50a5d0af7754"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=70be7e6107d3620e96752dc901aa55b200776b4a#70be7e6107d3620e96752dc901aa55b200776b4a"
 dependencies = [
  "serde_json",
 ]
@@ -2429,7 +2429,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-kernel"
 version = "0.4.0"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=0ec9e1421d08a9912239be6f6fce50a5d0af7754#0ec9e1421d08a9912239be6f6fce50a5d0af7754"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=70be7e6107d3620e96752dc901aa55b200776b4a#70be7e6107d3620e96752dc901aa55b200776b4a"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2444,7 +2444,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-parser"
 version = "0.4.0"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=0ec9e1421d08a9912239be6f6fce50a5d0af7754#0ec9e1421d08a9912239be6f6fce50a5d0af7754"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=70be7e6107d3620e96752dc901aa55b200776b4a#70be7e6107d3620e96752dc901aa55b200776b4a"
 dependencies = [
  "serde_json",
  "whipplescript-core",
@@ -2453,7 +2453,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-store"
 version = "0.4.0"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=0ec9e1421d08a9912239be6f6fce50a5d0af7754#0ec9e1421d08a9912239be6f6fce50a5d0af7754"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=70be7e6107d3620e96752dc901aa55b200776b4a#70be7e6107d3620e96752dc901aa55b200776b4a"
 dependencies = [
  "rusqlite",
  "serde",

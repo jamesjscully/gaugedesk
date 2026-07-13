@@ -12,7 +12,7 @@ hex = "0.4"
 libc = "0.2"
 sha2 = "0.10"
 serde_json = "1"
-whipplescript = { git = "https://github.com/jamesjscully/whipplescript", rev = "0ec9e1421d08a9912239be6f6fce50a5d0af7754", default-features = false }
+whipplescript = { git = "https://github.com/jamesjscully/whipplescript", rev = "70be7e6107d3620e96752dc901aa55b200776b4a", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

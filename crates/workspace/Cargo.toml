@@ -10,7 +10,7 @@ license.workspace = true
 # sqlite stores — branches/cuts/merge/restore/text-merge all upstream; this
 # crate only adapts worktrees-on-disk and lifecycle policy. The immutable rev
 # is the public v0.4 projection used by the public GaugeDesk CI path.
-whipplescript-store = { git = "https://github.com/jamesjscully/whipplescript", rev = "0ec9e1421d08a9912239be6f6fce50a5d0af7754", features = ["native"] }
+whipplescript-store = { git = "https://github.com/jamesjscully/whipplescript", rev = "70be7e6107d3620e96752dc901aa55b200776b4a", features = ["native"] }
 # Store-file snapshots (VACUUM INTO) for export/fork, and the read-only
 # peek at pre-vcs legacy stores during migration. Same version whip's
 # native feature bundles, so cargo unifies them.
