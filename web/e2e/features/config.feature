@@ -1,13 +1,12 @@
 Feature: Archetype settings
 
-  As a user I can edit an archetype's config (the method its chats — and every
-  placement of it — inherit, ADR 0035); a valid config is parsed-then-saved, and
-  a malformed one is rejected at the boundary (never written).
+  GaugeDesk owns runtime selection; the WhippleScript package owns behavior and
+  tools. Invalid settings and attempts to put package policy here are rejected.
 
   Scenario: save a valid config
     Given the workbench is open
     When I open the config editor
-    And I set the config to "{\"model\":\"gpt-5.5\",\"policy\":{\"posture\":\"trust-by-default\"}}"
+    And I set the config to "{\"model\":\"gpt-5.5\"}"
     Then the config status shows "saved"
 
   Scenario: reject a malformed config with a plain-language message
@@ -15,3 +14,9 @@ Feature: Archetype settings
     When I open the config editor
     And I set the config to "{ not valid json"
     Then the config status shows "isn't valid"
+
+  Scenario: reject package authority in GaugeDesk runtime settings
+    Given the workbench is open
+    When I open the config editor
+    And I set the config to "{\"policy\":{\"block_tools\":[\"bash\"]}}"
+    Then the config status shows "package-owned"

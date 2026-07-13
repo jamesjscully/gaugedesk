@@ -1,7 +1,7 @@
 Feature: Multi-turn conversation
 
   An engagement is a persistent conversation, not one-shot tasks: it holds one
-  Pi thread across turns, so work accumulates and context carries.
+  WhippleScript thread across turns, so work accumulates and context carries.
 
   Scenario: work accumulates across turns
     Given a new engagement

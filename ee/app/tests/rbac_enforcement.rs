@@ -77,6 +77,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
         name: "Acme".into(),
         is_default: false,
         network_isolated: false,
+        run_purpose: None,
         deployment_mode: None,
     };
     let placement = InstanceRecord {

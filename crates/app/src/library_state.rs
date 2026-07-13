@@ -27,6 +27,31 @@ use crate::{
     DEFAULT_PLACEMENT, DEFAULT_PROJECT,
 };
 
+fn published_package_root(
+    instances_dir: &std::path::Path,
+    instance_id: &str,
+    version: u64,
+) -> std::path::PathBuf {
+    instances_dir
+        .join(instance_id)
+        .join("repo")
+        .join(gaugewright_boundary::definition::version_root(version))
+}
+
+fn published_package_ref(
+    instances_dir: &std::path::Path,
+    instance_id: &str,
+    version: u64,
+) -> std::io::Result<String> {
+    gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+        instances_dir,
+        instance_id,
+        version,
+    ))
+    .map(|package| package.version_ref().to_owned())
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 pub(crate) enum AgentDeleteError {
     DefaultAgent,
     NotFound,
@@ -51,6 +76,15 @@ pub(crate) enum BindPlacementError {
 pub(crate) enum UpgradePlacementError {
     PlacementNotFound,
     ArchetypeNotFound,
+    PackageUnavailable(String),
+    Conflict,
+    Workspace(String),
+}
+
+pub(crate) enum PublishArchetypeError {
+    NotFound,
+    InvalidPackage(String),
+    Workspace(String),
 }
 
 pub(crate) enum CreateArchetypeChatError {
@@ -84,6 +118,7 @@ pub(crate) enum ForkChatError {
     SourceNotLive,
     InstanceNotOpen,
     Create(String),
+    Continuity(String),
 }
 
 pub(crate) struct CreatedPairingRequest {
@@ -134,14 +169,182 @@ pub(crate) fn load_startup_library_state(
     }
     repair_legacy_default_instance(store, &library);
     ensure_default_project_and_placement(store, &mut library, instances_dir, providers)?;
-    let (instances, engagements, engagement_index) =
+    migrate_legacy_agent_packages(store, &mut library, instances_dir, providers)?;
+    let (instances, mut engagements, engagement_index) =
         open_startup_instances(&library, instances_dir, providers)?;
+    for engagement in engagements.values_mut() {
+        let _ = engagement.sync_from_main();
+    }
     Ok(StartupLibraryState {
         library,
         instances,
         engagements,
         engagement_index,
     })
+}
+
+fn migrate_legacy_agent_packages(
+    store: &mut Store,
+    library: &mut crate::library::Library,
+    instances_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+) -> std::io::Result<()> {
+    let agents = library.agents.values().cloned().collect::<Vec<_>>();
+    for mut agent in agents {
+        if agent.package_versions.contains_key(&agent.current_version) {
+            continue;
+        }
+        let workspace = provider_for(providers, &agent.instance_id)
+            .open_at(&instances_dir.join(&agent.instance_id));
+        let migration_id = library::gen_id("package-migration");
+        let engagement = workspace.create_engagement(&migration_id).map_err(io)?;
+        let result = (|| {
+            let legacy_system = engagement
+                .read_file(".pi/SYSTEM.md")
+                .unwrap_or_else(|_| crate::app_support::DEFAULT_AGENT_SYSTEM_MD.to_owned());
+            let legacy_instructions = engagement
+                .read_file("AGENTS.md")
+                .unwrap_or_else(|_| crate::app_support::DEFAULT_AGENT_AGENTS_MD.to_owned());
+            let persona = format!("{}\n\n{}", legacy_system.trim(), legacy_instructions.trim());
+            engagement
+                .write_file(".whipple/legacy-persona.md", &persona)
+                .map_err(io)?;
+            let capabilities = gaugewright_boundary::AgentConfig::from_json(&agent.config)
+                .unwrap_or_default()
+                .package_capabilities();
+            let draft_documents = gaugewright_boundary::definition::package_documents(
+                gaugewright_boundary::definition::DRAFT_ROOT,
+                &persona,
+                capabilities,
+            );
+            for version in 1..=agent.current_version {
+                let root = gaugewright_boundary::definition::version_root(version);
+                for (draft_path, body) in &draft_documents {
+                    let file = std::path::Path::new(draft_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| std::io::Error::other("invalid package document path"))?;
+                    engagement
+                        .write_file(&format!("{root}/{file}"), body)
+                        .map_err(io)?;
+                }
+            }
+            for (path, body) in &draft_documents {
+                engagement.write_file(path, body).map_err(io)?;
+            }
+            let package =
+                gaugewright_whip_runtime::AuthoredAgentPackage::load(engagement.path().join(
+                    gaugewright_boundary::definition::version_root(agent.current_version),
+                ))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let package_ref = package.version_ref().to_owned();
+            engagement
+                .commit_turn("migrate legacy method to WhippleScript package")
+                .map_err(io)?;
+            if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
+                return Err(std::io::Error::other(
+                    "legacy package migration conflicted with the archetype mainline",
+                ));
+            }
+            Ok(package_ref)
+        })();
+        let _ = workspace.remove_engagement(&migration_id);
+        let package_ref = result?;
+        for version in 1..=agent.current_version {
+            agent.package_versions.insert(version, package_ref.clone());
+        }
+        if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&agent.config) {
+            if let Some(object) = config.as_object_mut() {
+                object.remove("policy");
+                object.remove("tools");
+                agent.config = serde_json::to_string_pretty(object).unwrap_or_else(|_| "{}".into());
+            }
+        }
+        agent.op = RecordOp::Upsert;
+        store
+            .append_record(
+                LIBRARY_SCOPE,
+                "agent",
+                &serde_json::to_string(&agent).unwrap(),
+            )
+            .map_err(io)?;
+        library.apply_agent(agent);
+    }
+
+    let placements = library
+        .instances
+        .values()
+        .filter(|instance| instance.kind == InstanceKind::Using)
+        .cloned()
+        .collect::<Vec<_>>();
+    for placement in placements {
+        let Some(agent) = library.agents.get(&placement.agent_id) else {
+            continue;
+        };
+        let root = published_package_root(instances_dir, &placement.id, placement.version);
+        if gaugewright_whip_runtime::AuthoredAgentPackage::load(&root).is_ok() {
+            continue;
+        }
+        let workspace =
+            provider_for(providers, &placement.id).open_at(&instances_dir.join(&placement.id));
+        let migration_id = library::gen_id("placement-package-migration");
+        let engagement = workspace.create_engagement(&migration_id).map_err(io)?;
+        let source_root =
+            published_package_root(instances_dir, &agent.instance_id, placement.version);
+        let target_root = gaugewright_boundary::definition::version_root(placement.version);
+        let result = (|| {
+            for file in [
+                gaugewright_boundary::definition::MANIFEST_FILE,
+                gaugewright_boundary::definition::SOURCE_FILE,
+                gaugewright_boundary::definition::PERSONA_FILE,
+            ] {
+                let body = std::fs::read_to_string(source_root.join(file))?;
+                engagement
+                    .write_file(&format!("{target_root}/{file}"), &body)
+                    .map_err(io)?;
+            }
+            if let Ok(legacy_persona) = std::fs::read_to_string(
+                instances_dir
+                    .join(&agent.instance_id)
+                    .join("repo/.whipple/legacy-persona.md"),
+            ) {
+                engagement
+                    .write_file(".whipple/legacy-persona.md", &legacy_persona)
+                    .map_err(io)?;
+            }
+            let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(
+                engagement.path().join(&target_root),
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let expected = agent
+                .package_versions
+                .get(&placement.version)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "placement version has no package reference",
+                    )
+                })?;
+            if package.version_ref() != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "migrated placement package does not match the published reference",
+                ));
+            }
+            engagement
+                .commit_turn("install migrated WhippleScript package")
+                .map_err(io)?;
+            if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
+                return Err(std::io::Error::other(
+                    "placement package migration conflicted with its mainline",
+                ));
+            }
+            Ok(())
+        })();
+        let _ = workspace.remove_engagement(&migration_id);
+        result?;
+    }
+    Ok(())
 }
 
 fn repair_legacy_default_instance(store: &mut Store, library: &crate::library::Library) {
@@ -210,6 +413,7 @@ pub(crate) fn seed_default_agent(
     };
 
     seed_repo(DEFAULT_INSTANCE)?;
+    let package_ref = published_package_ref(instances_dir, DEFAULT_INSTANCE, 1)?;
     let inst_rec = InstanceRecord {
         id: DEFAULT_INSTANCE.into(),
         op: RecordOp::Upsert,
@@ -236,6 +440,7 @@ pub(crate) fn seed_default_agent(
         instance_id: DEFAULT_INSTANCE.into(),
         config: "{}".into(),
         current_version: 1,
+        package_versions: [(1, package_ref)].into_iter().collect(),
         auto_upgrade: false,
         forked_from: None,
     };
@@ -254,6 +459,7 @@ pub(crate) fn seed_default_agent(
         name: "Personal".into(),
         is_default: true,
         network_isolated: false,
+        run_purpose: None,
         deployment_mode: None,
     };
     store
@@ -265,7 +471,12 @@ pub(crate) fn seed_default_agent(
         .map_err(io)?;
     library.apply_project(proj);
 
-    seed_repo(DEFAULT_PLACEMENT)?;
+    let source = provider_for(providers, DEFAULT_INSTANCE)
+        .open_at(&instances_dir.join(DEFAULT_INSTANCE))
+        .peer_source();
+    provider_for(providers, DEFAULT_PLACEMENT)
+        .fork_from_at(&instances_dir.join(DEFAULT_PLACEMENT), &source)
+        .map_err(io)?;
     let placement = InstanceRecord {
         id: DEFAULT_PLACEMENT.into(),
         op: RecordOp::Upsert,
@@ -302,6 +513,7 @@ pub(crate) fn ensure_default_project_and_placement(
             name: "Personal".into(),
             is_default: true,
             network_isolated: false,
+            run_purpose: None,
             deployment_mode: None,
         };
         store
@@ -315,15 +527,12 @@ pub(crate) fn ensure_default_project_and_placement(
     }
     if !library.instances.contains_key(DEFAULT_PLACEMENT) {
         let dir = instances_dir.join(DEFAULT_PLACEMENT);
-        let inst = provider_for(providers, DEFAULT_PLACEMENT)
-            .init_at(&dir)
+        let source = provider_for(providers, DEFAULT_INSTANCE)
+            .open_at(&instances_dir.join(DEFAULT_INSTANCE))
+            .peer_source();
+        provider_for(providers, DEFAULT_PLACEMENT)
+            .fork_from_at(&dir, &source)
             .map_err(io)?;
-        let files = crate::app_support::default_agent_definition().seed_files();
-        let files: Vec<(&str, &str)> = files
-            .iter()
-            .map(|(path, content)| (path.as_str(), content.as_str()))
-            .collect();
-        inst.seed_main(&files).map_err(io)?;
         let placement = InstanceRecord {
             id: DEFAULT_PLACEMENT.into(),
             op: RecordOp::Upsert,
@@ -402,6 +611,10 @@ impl Workbench {
         self.library.chat_network_isolated(chat_id)
     }
 
+    pub(crate) fn library_chat_run_purpose(&self, chat_id: &str) -> Option<String> {
+        self.library.chat_run_purpose(chat_id).map(str::to_owned)
+    }
+
     pub(crate) fn library_has_instance_record(&self, id: &str) -> bool {
         self.library.instances.contains_key(id)
     }
@@ -422,12 +635,16 @@ impl Workbench {
     pub(crate) fn library_project_relocation_content_bundles(
         &self,
         project: &str,
-    ) -> Vec<(String, Vec<u8>)> {
+    ) -> Vec<(String, String, Vec<u8>)> {
         let mut out = Vec::new();
         for inst_rec in self.library.using_instances_of(project) {
             match self.instances.get(&inst_rec.id) {
                 Some(inst) => match inst.export() {
-                    Ok(export) => out.push((inst_rec.id.clone(), export.0)),
+                    Ok(export) => out.push((
+                        inst_rec.id.clone(),
+                        inst.export_format().to_string(),
+                        export.0,
+                    )),
                     Err(e) => {
                         tracing::warn!("handoff: cannot bundle instance {}: {e}", inst_rec.id)
                     }
@@ -801,6 +1018,17 @@ impl Workbench {
             .map(|agent| agent.config.clone())
     }
 
+    pub(crate) fn package_selection_for_chat(&self, chat_id: &str) -> Option<(u64, String)> {
+        let chat = self.library.chats.get(chat_id)?;
+        let instance = self.library.instances.get(&chat.instance_id)?;
+        let agent = self.library.agents.get(&instance.agent_id)?;
+        agent
+            .package_versions
+            .get(&instance.version)
+            .cloned()
+            .map(|package_ref| (instance.version, package_ref))
+    }
+
     pub(crate) fn update_agent_record(
         &mut self,
         id: &str,
@@ -953,12 +1181,14 @@ impl Workbench {
         name: Option<String>,
         network_isolated: Option<bool>,
         deployment_mode: Option<Placement>,
+        run_purpose: Option<Option<String>>,
     ) -> Option<ProjectRecord> {
         let existing = self.library.projects.get(id).cloned()?;
         let updated = ProjectRecord {
             name: name.unwrap_or_else(|| existing.name.clone()),
             network_isolated: network_isolated.unwrap_or(existing.network_isolated),
             deployment_mode: deployment_mode.or(existing.deployment_mode),
+            run_purpose: run_purpose.unwrap_or(existing.run_purpose),
             ..existing
         };
         self.write_project_record(updated.clone());
@@ -993,11 +1223,20 @@ impl Workbench {
         let inst_id = library::gen_id("inst");
         let dir = self.instances_dir().join(&inst_id);
         let provider = self.workspace_provider(&inst_id);
-        provider
+        let instance = provider
             .init_at(&dir)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
-        self.instances
-            .insert(inst_id.clone(), provider.open_at(&dir));
+        let files = crate::app_support::default_agent_definition().seed_files();
+        let files = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect::<Vec<_>>();
+        instance
+            .seed_main(&files)
+            .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
+        let package_ref = published_package_ref(&self.instances_dir(), &inst_id, 1)
+            .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
+        self.instances.insert(inst_id.clone(), instance);
         self.write_instance_record(InstanceRecord {
             id: inst_id.clone(),
             op: RecordOp::Upsert,
@@ -1015,6 +1254,7 @@ impl Workbench {
             instance_id: inst_id,
             config: "{}".into(),
             current_version: 1,
+            package_versions: [(1, package_ref)].into_iter().collect(),
             auto_upgrade: false,
             forked_from: None,
         });
@@ -1066,7 +1306,8 @@ impl Workbench {
             name: name.clone(),
             instance_id: new_inst,
             config: src.config.clone(),
-            current_version: 1,
+            current_version: src.current_version,
+            package_versions: src.package_versions.clone(),
             auto_upgrade: false,
             forked_from: Some(src.id.clone()),
         });
@@ -1101,9 +1342,17 @@ impl Workbench {
         let inst_id = inst_id.to_string();
         let dir = self.instances_dir().join(&inst_id);
         let provider = self.workspace_provider(&inst_id);
-        provider.init_at(&dir).map_err(|error| error.to_string())?;
-        self.instances
-            .insert(inst_id.clone(), provider.open_at(&dir));
+        let source = self
+            .library
+            .agents
+            .get(agent_id)
+            .and_then(|agent| self.instances.get(&agent.instance_id))
+            .map(|instance| instance.peer_source())
+            .ok_or_else(|| "archetype package source is not open".to_owned())?;
+        let instance = provider
+            .fork_from_at(&dir, &source)
+            .map_err(|error| error.to_string())?;
+        self.instances.insert(inst_id.clone(), instance);
         let version = self
             .library
             .agents
@@ -1170,18 +1419,85 @@ impl Workbench {
         Some(Admission::Active)
     }
 
+    fn freeze_archetype_draft(
+        &mut self,
+        instance_id: &str,
+        version: u64,
+    ) -> Result<String, PublishArchetypeError> {
+        let snapshot_chat = library::gen_id("package-freeze");
+        let instance = self
+            .instances
+            .get(instance_id)
+            .ok_or(PublishArchetypeError::NotFound)?;
+        let engagement = instance
+            .create_engagement(&snapshot_chat)
+            .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+        let draft = gaugewright_boundary::definition::DRAFT_ROOT;
+        let target = gaugewright_boundary::definition::version_root(version);
+        let result = (|| {
+            if engagement
+                .tree()
+                .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?
+                .iter()
+                .any(|entry| entry.path == target || entry.path.starts_with(&format!("{target}/")))
+            {
+                return Err(PublishArchetypeError::InvalidPackage(format!(
+                    "package version {version} is already frozen"
+                )));
+            }
+            for file in [
+                gaugewright_boundary::definition::MANIFEST_FILE,
+                gaugewright_boundary::definition::SOURCE_FILE,
+                gaugewright_boundary::definition::PERSONA_FILE,
+            ] {
+                let body = engagement
+                    .read_file(&format!("{draft}/{file}"))
+                    .map_err(|error| PublishArchetypeError::InvalidPackage(error.to_string()))?;
+                engagement
+                    .write_file(&format!("{target}/{file}"), &body)
+                    .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+            }
+            let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(
+                engagement.path().join(&target),
+            )
+            .map_err(PublishArchetypeError::InvalidPackage)?;
+            let package_ref = package.version_ref().to_owned();
+            engagement
+                .commit_turn(&format!("freeze archetype package version {version}"))
+                .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+            match engagement
+                .merge_into_main()
+                .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?
+            {
+                MergeOutcome::Clean => Ok(package_ref),
+                MergeOutcome::Conflict => Err(PublishArchetypeError::Workspace(
+                    "archetype draft changed while it was being published".to_owned(),
+                )),
+            }
+        })();
+        let _ = instance.remove_engagement(&snapshot_chat);
+        result
+    }
+
     pub(crate) fn publish_archetype_version(
         &mut self,
         id: &str,
         auto_upgrade: Option<bool>,
-    ) -> Option<(u64, u64)> {
-        let mut agent = self.library.agents.get(id).cloned()?;
+    ) -> Result<(u64, u64), PublishArchetypeError> {
+        let mut agent = self
+            .library
+            .agents
+            .get(id)
+            .cloned()
+            .ok_or(PublishArchetypeError::NotFound)?;
+        let new_version = agent.current_version + 1;
+        let package_ref = self.freeze_archetype_draft(&agent.instance_id, new_version)?;
         if let Some(auto_upgrade) = auto_upgrade {
             agent.auto_upgrade = auto_upgrade;
         }
         agent.op = RecordOp::Upsert;
-        agent.current_version += 1;
-        let new_version = agent.current_version;
+        agent.current_version = new_version;
+        agent.package_versions.insert(new_version, package_ref);
         let owner_auto = agent.auto_upgrade;
         self.write_agent_record(agent);
         let org_allows = crate::org::Org::rebuild(self.store_ref())
@@ -1189,7 +1505,7 @@ impl Workbench {
             .unwrap_or(false);
         let mut auto_upgraded = 0u64;
         if owner_auto && org_allows {
-            let behind: Vec<InstanceRecord> = self
+            let behind: Vec<String> = self
                 .library
                 .instances
                 .values()
@@ -1198,16 +1514,15 @@ impl Workbench {
                         && matches!(instance.kind, InstanceKind::Using)
                         && instance.version < new_version
                 })
-                .cloned()
+                .map(|instance| instance.id.clone())
                 .collect();
-            for mut placement in behind {
-                placement.op = RecordOp::Upsert;
-                placement.version = new_version;
-                self.write_instance_record(placement);
-                auto_upgraded += 1;
+            for placement in behind {
+                if self.upgrade_placement_version(&placement).is_ok() {
+                    auto_upgraded += 1;
+                }
             }
         }
-        Some((new_version, auto_upgraded))
+        Ok((new_version, auto_upgraded))
     }
 
     pub(crate) fn upgrade_placement_version(
@@ -1220,6 +1535,50 @@ impl Workbench {
         let Some(agent) = self.library.agents.get(&placement.agent_id).cloned() else {
             return Err(UpgradePlacementError::ArchetypeNotFound);
         };
+        let expected_ref = agent
+            .package_versions
+            .get(&agent.current_version)
+            .cloned()
+            .ok_or_else(|| {
+                UpgradePlacementError::PackageUnavailable(format!(
+                    "archetype version {} has no frozen package reference",
+                    agent.current_version
+                ))
+            })?;
+        let source = self
+            .instances
+            .get(&agent.instance_id)
+            .map(|instance| instance.peer_source())
+            .ok_or(UpgradePlacementError::ArchetypeNotFound)?;
+        let target = self
+            .instances
+            .get(id)
+            .ok_or(UpgradePlacementError::PlacementNotFound)?;
+        match target
+            .pull_from(&source)
+            .map_err(|error| UpgradePlacementError::Workspace(error.to_string()))?
+        {
+            MergeOutcome::Clean => {}
+            MergeOutcome::Conflict => return Err(UpgradePlacementError::Conflict),
+        }
+        let probe_id = library::gen_id("package-probe");
+        let probe = target
+            .create_engagement(&probe_id)
+            .map_err(|error| UpgradePlacementError::Workspace(error.to_string()))?;
+        let root = probe
+            .path()
+            .join(gaugewright_boundary::definition::version_root(
+                agent.current_version,
+            ));
+        let resolved = gaugewright_whip_runtime::AuthoredAgentPackage::load(root)
+            .map_err(UpgradePlacementError::PackageUnavailable);
+        let _ = target.remove_engagement(&probe_id);
+        let resolved = resolved?;
+        if resolved.version_ref() != expected_ref {
+            return Err(UpgradePlacementError::PackageUnavailable(
+                "placement package bytes do not match the published reference".to_owned(),
+            ));
+        }
         placement.op = RecordOp::Upsert;
         placement.version = agent.current_version;
         let version = placement.version;
@@ -1294,7 +1653,7 @@ impl Workbench {
             (src_eng.path().to_path_buf(), files)
         };
         let new_id = library::gen_id("chat");
-        let (new_eng, new_path) = {
+        let (new_eng, new_path, mode) = {
             let Some(inst) = self.instances.get(&inst_id) else {
                 return Err(ForkChatError::InstanceNotOpen);
             };
@@ -1306,16 +1665,72 @@ impl Workbench {
             }
             let _ = eng.commit_turn(&format!("forked from {id}"));
             let path = eng.path().to_path_buf();
-            (eng, path)
+            let mode = self
+                .library
+                .instances
+                .get(&inst_id)
+                .map(|instance| instance.kind.chat_mode())
+                .unwrap_or_default();
+            (eng, path, mode)
         };
-        // Continuity is harness state (its session sibling + path rebinds), so the
-        // fork clones it through the factory hook. The CONFIGURED REAL factory is
-        // called unconditionally — not `factory_for_turn()` — because today's copy
-        // happens regardless of fake mode, and a fake-mode fork of a previously-real
-        // chat must keep copying its session. Best-effort, exactly as before: a
-        // fork never fails on continuity.
-        let _ = gaugewright_pi_bridge::PiHarnessFactory
-            .clone_continuity(id, &new_id, &src_path, &new_path);
+        // Continuity belongs to WhippleScript even when the fake is active. A
+        // fork is not admitted unless the runtime gives the target a distinct,
+        // source-bound thread identity; file-only forks would silently forget
+        // the conversation they claim to clone.
+        let prompt_override = matches!(mode, crate::library::ChatMode::Edit)
+            .then(|| crate::engine::EDITOR_FRAMING.to_owned());
+        let package_selection = self.library.instances.get(&inst_id).and_then(|instance| {
+            self.library
+                .agents
+                .get(&instance.agent_id)
+                .and_then(|agent| {
+                    agent
+                        .package_versions
+                        .get(&instance.version)
+                        .cloned()
+                        .map(|package_ref| (instance.version, package_ref))
+                })
+        });
+        let source_package_root = package_selection.as_ref().map(|(version, _)| {
+            src_path.join(gaugewright_boundary::definition::version_root(*version))
+        });
+        let target_package_root = package_selection.as_ref().map(|(version, _)| {
+            new_path.join(gaugewright_boundary::definition::version_root(*version))
+        });
+        let package_version_ref = package_selection.map(|(_, package_ref)| package_ref);
+        let source_policy = self
+            .latest_whipple_policy(id)
+            .map_err(ForkChatError::Continuity)?;
+        let source_continuity = gaugewright_harness::HarnessContinuitySpec {
+            chat_id: id.to_owned(),
+            worktree: src_path,
+            mode,
+            package_root: source_package_root,
+            package_version_ref: package_version_ref.clone(),
+            system_prompt: prompt_override.clone(),
+            policy_epoch: source_policy.as_ref().map(|(epoch, _)| *epoch),
+            signed_policy_envelope: source_policy.as_ref().map(|(_, envelope)| envelope.clone()),
+        };
+        let target_continuity = gaugewright_harness::HarnessContinuitySpec {
+            chat_id: new_id.clone(),
+            worktree: new_path,
+            mode,
+            package_root: target_package_root,
+            package_version_ref,
+            system_prompt: prompt_override,
+            policy_epoch: source_policy.as_ref().map(|(epoch, _)| *epoch),
+            signed_policy_envelope: source_policy.map(|(_, envelope)| envelope),
+        };
+        let continuity = self
+            .whip_harness_factory()
+            .and_then(|factory| factory.clone_continuity(&source_continuity, &target_continuity));
+        if let Err(error) = continuity {
+            drop(new_eng);
+            if let Some(inst) = self.instances.get(&inst_id) {
+                let _ = inst.remove_engagement(&new_id);
+            }
+            return Err(ForkChatError::Continuity(error.to_string()));
+        }
         self.register_engagement(new_id.clone(), inst_id.clone(), new_eng);
         let title = format!("{} (fork)", src_chat.title);
         let rec = ChatRecord {
@@ -1347,11 +1762,11 @@ impl Workbench {
             return false;
         }
         // Capture the hosting instance before teardown drops the index entry, so we can
-        // purge its git objects after the engagement's branch is gone (SECAUD-6).
+        // purge its now-unreachable workspace blobs after the engagement line is gone (SECAUD-6).
         let inst_id = self.engagement_index.get(id).cloned();
         self.destroy_chat(id);
         self.crypto_erase_content(id);
-        // SECAUD-6: crypto-erase the git-blob workspace content too — `destroy_chat` removed
+        // SECAUD-6: erase the workspace payload too — `destroy_chat` removed
         // the engagement branch, so its unique objects are now unreachable; prune them so the
         // deleted chat's workspace content is unrecoverable, matching the store crypto-erasure.
         if let Some(inst) = inst_id.and_then(|iid| self.instances.get(&iid)) {
@@ -1367,7 +1782,15 @@ impl Workbench {
         Some(updated)
     }
 
-    fn library_chat_status(&self, chat_id: &str) -> (bool, bool) {
+    /// The nav-badge flags for a chat — the **badge** attention surface
+    /// (ADR 0082 §3): a signal the operator muted shows no dot either; `queue`
+    /// and `badge` both keep it (the task bar is the only thing `badge` drops).
+    fn library_chat_status(
+        &self,
+        chat_id: &str,
+        rules: &crate::attention::AttentionRules,
+    ) -> (bool, bool) {
+        use crate::attention::{Attention, Signal};
         if !self.engagement_index.contains_key(chat_id) {
             return (false, false);
         }
@@ -1377,8 +1800,10 @@ impl Workbench {
             .map(|merge| merge.phase)
             .unwrap_or(gaugewright_core::merge::MergePhase::Idle);
         (
-            phase == gaugewright_core::merge::MergePhase::Clean,
-            phase == gaugewright_core::merge::MergePhase::Repairing,
+            phase == gaugewright_core::merge::MergePhase::Clean
+                && rules.attention(Signal::Changes) != Attention::Mute,
+            phase == gaugewright_core::merge::MergePhase::Repairing
+                && rules.attention(Signal::Conflict) != Attention::Mute,
         )
     }
 
@@ -1386,6 +1811,7 @@ impl Workbench {
         &self,
         chat: &ChatRecord,
         chat_ws: &std::collections::BTreeMap<String, String>,
+        rules: &crate::attention::AttentionRules,
     ) -> serde_json::Value {
         let kind = self
             .library
@@ -1393,7 +1819,7 @@ impl Workbench {
             .get(&chat.instance_id)
             .map(|instance| instance.kind.chat_kind())
             .unwrap_or("work");
-        let (changes, conflict) = self.library_chat_status(&chat.id);
+        let (changes, conflict) = self.library_chat_status(&chat.id, rules);
         serde_json::json!({
             "id": chat.id,
             "title": chat.title,
@@ -1408,6 +1834,14 @@ impl Workbench {
 
     pub(crate) fn workspace_value(&self) -> serde_json::Value {
         let lib = &self.library;
+        // The operator's attention rules (ATTN-2) gate the badge flags below —
+        // parsed once per projection read, shared by every chat row.
+        let rules = crate::attention::AttentionRules::parse(
+            self.account_settings()
+                .ok()
+                .and_then(|s| s.get(crate::attention::ATTENTION_RULES_SETTING).cloned())
+                .as_deref(),
+        );
         let mut chat_ws: std::collections::BTreeMap<String, String> = Default::default();
         for workstream in lib.workstreams.values() {
             if let Ok(state) = self.store_ref().fold::<WorkstreamState>(&workstream.id) {
@@ -1428,7 +1862,7 @@ impl Workbench {
                     "is_default": agent.id == DEFAULT_AGENT,
                     "forked_from": agent.forked_from,
                     "forked_from_name": agent.forked_from.as_ref().and_then(|src| lib.agents.get(src).map(|source| source.name.clone())),
-                    "chats": lib.chats_in(&agent.instance_id).iter().map(|chat| self.library_chat_json(chat, &chat_ws)).collect::<Vec<_>>(),
+                    "chats": lib.chats_in(&agent.instance_id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
                     "workstreams": lib.workstreams_in(&agent.instance_id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                 })
             })
@@ -1485,7 +1919,7 @@ impl Workbench {
                             // APPROVE-1 (ADR 0064): a pending placement is approved-but-not-yet-accepted
                             // under an approval-required policy — the nav flags it so the owner can accept.
                             "pending": instance.admission == Admission::Pending,
-                            "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws)).collect::<Vec<_>>(),
+                            "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
                             "workstreams": lib.workstreams_in(&instance.id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                         })
                     })
@@ -1512,7 +1946,7 @@ impl Workbench {
                 let kind = inst
                     .map(|instance| instance.kind.chat_kind())
                     .unwrap_or("work");
-                let (changes, conflict) = self.library_chat_status(&chat.id);
+                let (changes, conflict) = self.library_chat_status(&chat.id, &rules);
                 serde_json::json!({
                     "id": chat.id,
                     "title": chat.title,
@@ -1610,7 +2044,7 @@ impl Workbench {
     }
 
     /// SEARCH-2 tier-3 walk for one chat: enumerate its live worktree (relative paths,
-    /// `.git` already skipped by [`ChatWorkspace::tree`]) and case-insensitively match the
+    /// provider metadata already skipped by [`ChatWorkspace::tree`]) and case-insensitively match the
     /// first file whose content contains `needle`, returning its path + a one-line snippet.
     /// Bounded per [`FILE_SEARCH_MAX_FILES`](Self::FILE_SEARCH_MAX_FILES) /
     /// [`FILE_SEARCH_MAX_BYTES`](Self::FILE_SEARCH_MAX_BYTES); binary files are skipped
@@ -1716,39 +2150,76 @@ impl Workbench {
             }
         }
 
-        // Review tasks: clean-merge chats awaiting keep/reject, current-first.
-        let mut reviews: Vec<(i64, serde_json::Value)> = Vec::new();
+        // Ask-typed chat tasks (ADR 0082 §2–3), current-first. Each chat raises
+        // its signals from durable lifecycle state (the projection owns no
+        // truth) and contributes at most one task: the highest-priority raised
+        // signal whose attention — under the operator's rules (ATTN-2) — is
+        // `Queue`. A muted/badged signal falls through to the next, so muting
+        // reviews does not silence an opted-in `reply` ping.
+        let rules = crate::attention::AttentionRules::parse(
+            self.account_settings()
+                .ok()
+                .and_then(|s| s.get(crate::attention::ATTENTION_RULES_SETTING).cloned())
+                .as_deref(),
+        );
+        let mut chat_tasks: Vec<(i64, serde_json::Value)> = Vec::new();
         for chat in self.library.chats.values() {
             if !self.engagement_index.contains_key(&chat.id) {
                 continue;
             }
-            let phase = self
+            let run_phase = self
                 .store
-                .fold::<MergeState>(&chat.id)
-                .map(|merge| merge.phase)
-                .unwrap_or(gaugewright_core::merge::MergePhase::Idle);
-            if phase == gaugewright_core::merge::MergePhase::Clean {
-                let agent = self
-                    .library
-                    .instances
-                    .get(&chat.instance_id)
-                    .and_then(|instance| self.library.agents.get(&instance.agent_id))
-                    .map(|agent| agent.name.clone())
-                    .unwrap_or_default();
-                reviews.push((
-                    chat.created_position,
-                    serde_json::json!({
-                        "id": chat.id,
-                        "title": chat.title,
-                        "agent": agent,
-                        "kind": "review",
-                        "assignee": assignee,
-                    }),
-                ));
-            }
+                .fold::<RunState>(&chat.id)
+                .map(|run| run.phase)
+                .ok();
+            let merge = self.store.fold::<MergeState>(&chat.id).ok();
+            let raised = |signal: crate::attention::Signal| -> bool {
+                use crate::attention::Signal;
+                match signal {
+                    Signal::Question => {
+                        run_phase == Some(gaugewright_core::run::RunPhase::AwaitingHuman)
+                    }
+                    Signal::Conflict => matches!(&merge, Some(m)
+                        if m.phase == gaugewright_core::merge::MergePhase::Rejected
+                            && m.workspace_outcome
+                                == gaugewright_core::merge::WorkspaceOutcome::Conflict),
+                    Signal::Changes => matches!(&merge, Some(m)
+                        if m.phase == gaugewright_core::merge::MergePhase::Clean),
+                    // "Settled and the human hasn't spoken since": the next user
+                    // message re-enters the run, clearing this by construction.
+                    Signal::TurnSettled => {
+                        run_phase == Some(gaugewright_core::run::RunPhase::Completed)
+                    }
+                }
+            };
+            let ask = crate::attention::Signal::ALL
+                .into_iter()
+                .find_map(|signal| {
+                    (raised(signal)
+                        && rules.attention(signal) == crate::attention::Attention::Queue)
+                        .then(|| signal.ask())
+                });
+            let Some(ask) = ask else { continue };
+            let agent = self
+                .library
+                .instances
+                .get(&chat.instance_id)
+                .and_then(|instance| self.library.agents.get(&instance.agent_id))
+                .map(|agent| agent.name.clone())
+                .unwrap_or_default();
+            chat_tasks.push((
+                chat.created_position,
+                serde_json::json!({
+                    "id": chat.id,
+                    "title": chat.title,
+                    "agent": agent,
+                    "kind": ask,
+                    "assignee": assignee,
+                }),
+            ));
         }
-        reviews.sort_by_key(|(position, _)| std::cmp::Reverse(*position));
-        tasks.extend(reviews.into_iter().map(|(_, task)| task));
+        chat_tasks.sort_by_key(|(position, _)| std::cmp::Reverse(*position));
+        tasks.extend(chat_tasks.into_iter().map(|(_, task)| task));
 
         serde_json::json!({ "tasks": tasks })
     }

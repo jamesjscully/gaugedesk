@@ -99,6 +99,11 @@ pub struct AgentRecord {
     /// available. Older records default to `1`.
     #[serde(default = "one")]
     pub current_version: u64,
+    /// Content-addressed WhippleScript package reference for every immutable
+    /// published version. The monotonic display version selects one exact ref;
+    /// mutable draft bytes never appear here.
+    #[serde(default)]
+    pub package_versions: BTreeMap<u64, String>,
     /// The **owner's** auto-upgrade preference (`UX-9`, [ADR 0063]): when set, placements of
     /// this archetype move to a newly-published version automatically — *but only where the
     /// hosting org also allows auto-updates* (`Org::allow_auto_upgrade`), else it falls back
@@ -106,7 +111,7 @@ pub struct AgentRecord {
     #[serde(default)]
     pub auto_upgrade: bool,
     /// The source archetype this one was **forked from** (`Some(agent_id)`), or `None` for an
-    /// original. A fork shares its source's git history, so it can later *pull* upstream
+    /// original. A fork shares its source's cut lineage, so it can later *pull* upstream
     /// improvements (ADR 0038). Older records default to `None`.
     #[serde(default)]
     pub forked_from: Option<String>,
@@ -141,6 +146,11 @@ pub struct ProjectRecord {
     /// Defaults to `false` (open) for older records.
     #[serde(default)]
     pub network_isolated: bool,
+    /// The admitted business purpose for runs in this project. Resources with
+    /// purpose tags may enter WhippleScript only when this value matches one of
+    /// their allowed purposes. `None` denies purpose-constrained resources.
+    #[serde(default)]
+    pub run_purpose: Option<String>,
     /// The project's **deployment mode** (`DEPLOY-1`, [ADR 0059](../../../specs/decisions/0059-deployment-topology-headless-control-plane-policy-gated-pairing.md)):
     /// the `(operator, attested)` [`Placement`] the consultant declares for engagements on
     /// this project — the boundary `declareCeiling` input. `None` ⇒ the local default
@@ -414,6 +424,15 @@ impl Library {
             .unwrap_or(false)
     }
 
+    pub fn chat_run_purpose(&self, chat_id: &str) -> Option<&str> {
+        self.chats
+            .get(chat_id)
+            .and_then(|chat| self.instances.get(&chat.instance_id))
+            .and_then(|instance| instance.project_id.as_deref())
+            .and_then(|project_id| self.projects.get(project_id))
+            .and_then(|project| project.run_purpose.as_deref())
+    }
+
     /// The project a chat belongs to (`ENTSEC-2`): chat → its instance → the instance's
     /// `project_id`. `None` for an edit/authoring chat (no project), or any unknown id — the
     /// per-project scope gate then does not apply (the route is governed by membership alone).
@@ -566,6 +585,7 @@ mod tests {
             instance_id: format!("inst-{id}"),
             config: "{}".into(),
             current_version: 1,
+            package_versions: BTreeMap::new(),
             auto_upgrade: false,
             forked_from: None,
         };
@@ -585,6 +605,7 @@ mod tests {
             name: "Locked".into(),
             is_default: false,
             network_isolated: true,
+            run_purpose: None,
             deployment_mode: None,
         });
         lib.apply_project(ProjectRecord {
@@ -593,6 +614,7 @@ mod tests {
             name: "Open".into(),
             is_default: false,
             network_isolated: false,
+            run_purpose: Some("support".to_owned()),
             deployment_mode: None,
         });
         let bind = |lib: &mut Library, inst: &str, project: Option<&str>| {
@@ -640,6 +662,8 @@ mod tests {
             !lib.chat_network_isolated("c-missing"),
             "unknown chat ⇒ open default"
         );
+        assert_eq!(lib.chat_run_purpose("c-open"), Some("support"));
+        assert_eq!(lib.chat_run_purpose("c-edit"), None);
     }
 
     #[test]
@@ -728,6 +752,7 @@ mod tests {
             name: "Default".into(),
             is_default: false,
             network_isolated: false,
+            run_purpose: None,
             deployment_mode: None,
         });
         assert_eq!(lib.deployment_mode_of("p-default"), Placement::local());
@@ -744,6 +769,7 @@ mod tests {
             name: "Attested".into(),
             is_default: false,
             network_isolated: false,
+            run_purpose: None,
             deployment_mode: Some(mode),
         });
         assert_eq!(lib.deployment_mode_of("p-attested"), mode);

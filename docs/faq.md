@@ -173,7 +173,10 @@ the words used here see the [glossary](concepts/glossary.md).
     override:
 
     === "macOS"
-        Right-click the app → **Open**.
+        **System Settings → Privacy &amp; Security → Open Anyway.** If macOS says
+        the app is *"damaged"* and shows no such button, run
+        `xattr -dr com.apple.quarantine /Applications/GaugeDesk.app` in Terminal,
+        then open it.
 
     === "Windows"
         At the SmartScreen prompt, choose **More info → Run anyway**.

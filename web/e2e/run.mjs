@@ -62,9 +62,13 @@ const env = {
     GW_E2E_ADMIN_APP: String(adminApp),
     // The built client talks to THIS run's control plane (overrides SOLO_CONTROL_PLANE).
     VITE_CP_BASE: `http://127.0.0.1:${alice}`,
-    // Skip the @live (real-Pi) scenarios under the standard fake-agent run.
-    GAUGEWRIGHT_FAKE_AGENT: process.env.GAUGEWRIGHT_FAKE_AGENT ?? "1",
 };
+if (process.env.GW_E2E_LIVE) {
+    // The live lane exercises the selected WhippleScript runtime and a real model.
+    delete env.GAUGEWRIGHT_FAKE_AGENT;
+} else {
+    env.GAUGEWRIGHT_FAKE_AGENT = process.env.GAUGEWRIGHT_FAKE_AGENT ?? "1";
+}
 
 console.log(
     `[e2e] ports → alice:${alice} bob:${bob} broker:${broker} preview:${preview} ` +
@@ -72,7 +76,7 @@ console.log(
 );
 
 const passthrough = process.argv.slice(2);
-// Default run skips the real-Pi @live scenarios; `GW_E2E_LIVE=1` runs only those.
+// Default run skips real-model @live scenarios; `GW_E2E_LIVE=1` runs only those.
 const grep = process.env.GW_E2E_LIVE ? ["--grep", "@live"] : ["--grep-invert", "@live"];
 
 // The standalone app workspaces (each its own npm workspace consuming the platform

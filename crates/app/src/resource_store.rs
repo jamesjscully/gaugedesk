@@ -258,6 +258,36 @@ pub fn granted_context(store: &Store, engagement: &str) -> Result<Vec<ResourceId
     Ok(out)
 }
 
+/// Translate WhippleScript's certified host-output flow signature back into
+/// GaugeDesk resource identities. `project` is the admitted workspace view and
+/// therefore expands to the currently granted context records; command, human,
+/// and turn-image capabilities are runtime inputs but not GaugeDesk data records.
+pub fn certified_output_reads(
+    store: &Store,
+    engagement: &str,
+    signature: &[gaugewright_harness::OutputFieldFlow],
+) -> Result<Vec<ResourceId>, AdmitError> {
+    let mut reads = BTreeSet::new();
+    let granted = granted_context(store, engagement)?;
+    for handle in signature.iter().flat_map(|field| field.read_handles.iter()) {
+        match handle.as_str() {
+            "project" => reads.extend(granted.iter().cloned()),
+            "command" | "human" | "turn_images" => {}
+            handle if handle.starts_with("resource:") => {
+                let id = ResourceId::new(handle.trim_start_matches("resource:"));
+                if granted.contains(&id) {
+                    reads.insert(id);
+                }
+            }
+            // A future WhippleScript data-bearing handle must never silently
+            // under-taint an output before GaugeDesk learns its product mapping.
+            // Conservatively inherit every granted context (fail closed).
+            _ => reads.extend(granted.iter().cloned()),
+        }
+    }
+    Ok(reads.into_iter().collect())
+}
+
 /// Durably record a turn's reads (engagement-scoped, `taint::EngagementReads`):
 /// each id is appended under the `read` kind. Folding dedups, so a re-read is
 /// harmless; the accumulation **survives** a later revoke/tombstone of the read
@@ -281,6 +311,34 @@ pub fn engagement_reads(store: &Store, engagement: &str) -> Result<EngagementRea
         reads.read(id);
     }
     Ok(reads)
+}
+
+/// The stakeholders of everything the engagement has read, **beyond `owner`** —
+/// the read-side taint guard the advancement policy consults (ATTN-3, ADR 0082
+/// §4). Non-empty means the turn's outputs carry someone else's stake and must
+/// never auto-advance. Fail-closed: a read whose owner can't be resolved (a
+/// tombstoned or unknown record) surfaces as `"<unresolved>"` rather than
+/// disappearing.
+pub fn external_read_stakeholders(
+    store: &Store,
+    engagement: &str,
+    owner: &str,
+) -> Result<Vec<String>, AdmitError> {
+    let reads = engagement_reads(store, engagement)?;
+    let owners: BTreeMap<String, Authority> = list(store, engagement)?
+        .into_iter()
+        .map(|r| (r.resource.id.as_str().to_string(), r.resource.owner))
+        .collect();
+    Ok(reads
+        .taint(|item| {
+            owners
+                .get(item)
+                .map(|a| a.as_str().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string())
+        })
+        .into_iter()
+        .filter(|a| a != owner)
+        .collect())
 }
 
 /// Mint/refresh the engagement's derived **output** resource from the durable,
@@ -1373,6 +1431,25 @@ mod tests {
         assert_eq!(
             out.stakeholders,
             BTreeSet::from([Authority::from("local-user"), Authority::from("client")])
+        );
+    }
+
+    #[test]
+    fn certified_project_flow_expands_to_granted_product_resources() {
+        let mut store = Store::open_in_memory().unwrap();
+        let eng = "engagement-1";
+        let context = mint_context(&mut store, eng, "client", "client-data", "c1").unwrap();
+        let signature = vec![gaugewright_harness::OutputFieldFlow {
+            field: "assistant_text".to_owned(),
+            read_handles: vec![
+                "project".to_owned(),
+                "command".to_owned(),
+                "human".to_owned(),
+            ],
+        }];
+        assert_eq!(
+            certified_output_reads(&store, eng, &signature).unwrap(),
+            vec![context.resource.id]
         );
     }
 

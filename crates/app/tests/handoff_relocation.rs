@@ -340,7 +340,7 @@ async fn relocation_carries_the_project_content_bytes_to_the_peer() {
     // The content bytes materialized on bob: the instance repo's `main` content and
     // the engagement branch's in-flight work both resolve on bob's disk.
     // NOTE: these on-disk assertions (`instances/<id>/repo`, `worktrees/<chat>`) are
-    // git-provider-specific coverage of the WorkspaceProvider seam — a future whip
+    // Provider-specific coverage of the WorkspaceProvider seam — the native
     // provider gets its own twin of this test rather than a change to this one.
     let repo = rb.path().join("instances").join("inst-acme").join("repo");
     assert_eq!(
@@ -501,7 +501,7 @@ async fn a_combined_invite_pairs_and_hands_off_in_one_accept() {
 async fn an_operator_run_is_gated_by_host_admission() {
     // FED-7 co-drive: the operator (alice) places a project-scoped run on the host (bob);
     // it lands in bob's admission queue until bob allows it, then executes (run-admission.qnt).
-    std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1"); // execute a stub turn, not a real Pi
+    std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1"); // stub turn, no real model/runtime
     let broker = start_broker().await;
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, _wb, _rb) = instance("bob", &broker);

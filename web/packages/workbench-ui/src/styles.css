@@ -157,6 +157,16 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .task-tab.task-issue:hover { border-color: var(--edge); }
 .task-tab.task-issue .task-kind { color: var(--accent); }
 .task-tab.task-issue .task-kind::before { background: var(--accent); }
+/* Ask tones (ADR 0082 §2): the verb chip's colour says what kind of decision the
+   pill wants — review keeps the default amber; a pending agent question reads
+   accent (conversational, not risky); a conflict reads bad (blocking). */
+.task-tab.task-answer .task-kind { color: var(--accent); }
+.task-tab.task-answer .task-kind::before { background: var(--accent); }
+.task-tab.task-repair .task-kind { color: var(--bad); }
+.task-tab.task-repair .task-kind::before { background: var(--bad); }
+/* An opted-in reply ping (ATTN-2) is cadence, not a decision — muted tone. */
+.task-tab.task-reply .task-kind { color: var(--muted); }
+.task-tab.task-reply .task-kind::before { background: var(--muted); }
 /* Cap the title: a chat auto-titled from its first message is a whole sentence;
    the queue must stay scannable, so each title is one ellipsised line. */
 .task-tab .task-title { max-width: 200px; min-width: 0; overflow: hidden;
@@ -187,6 +197,33 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 
 .filebody { white-space: pre-wrap; font-family: var(--mono); font-size: 12px;
     line-height: 1.45; margin: 0; color: var(--ink); }
+
+/* Rendered markdown (the View tab for .md files). Overrides the .filebody
+   plain-text posture: proportional type, document spacing; code spans/blocks
+   drop back to the mono treatment. */
+.filebody.markdown-body { white-space: normal; font-family: inherit; font-size: 13px;
+    line-height: 1.55; max-width: 72ch; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
+    margin: 0.9em 0 0.4em; line-height: 1.25; }
+.markdown-body h1 { font-size: 1.45em; } .markdown-body h2 { font-size: 1.25em; }
+.markdown-body h3 { font-size: 1.1em; }
+.markdown-body p, .markdown-body ul, .markdown-body ol, .markdown-body blockquote,
+.markdown-body table, .markdown-body pre { margin: 0.55em 0; }
+.markdown-body ul, .markdown-body ol { padding-left: 1.4em; }
+.markdown-body li { margin: 0.15em 0; }
+.markdown-body code { font-family: var(--mono); font-size: 0.92em;
+    background: var(--panel, rgba(127,127,127,.12)); padding: 0.1em 0.3em; border-radius: 3px; }
+.markdown-body pre { white-space: pre-wrap; font-family: var(--mono); font-size: 12px;
+    background: var(--panel, rgba(127,127,127,.12)); padding: 8px 10px; border-radius: 4px; }
+.markdown-body pre code { background: transparent; padding: 0; }
+.markdown-body blockquote { border-left: 3px solid var(--edge, rgba(127,127,127,.4));
+    padding-left: 10px; color: var(--muted, inherit); }
+.markdown-body table { border-collapse: collapse; }
+.markdown-body th, .markdown-body td { border: 1px solid var(--edge, rgba(127,127,127,.4));
+    padding: 3px 8px; }
+.markdown-body a { color: var(--accent); }
+.markdown-body hr { border: none; border-top: 1px solid var(--edge, rgba(127,127,127,.4));
+    margin: 1em 0; }
 
 /* --- Collapsible panels (legacy 13-chrome-ui.md §6) ---------------------------
    A collapsible panel is a flex column: just the scrollable body, with the collapse
@@ -283,6 +320,11 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .editor-head .editor-actions { margin-left: auto; display: inline-flex; gap: 6px; }
 .editor-head button.save { font-size: 11px; padding: 3px 9px;
     border-color: var(--accent); color: var(--accent); }
+.editor-head button.save:disabled { border-color: var(--edge); color: var(--muted);
+    opacity: 0.6; cursor: default; }
+.editor-head button.discard-draft { font-size: 11px; padding: 3px 9px;
+    color: var(--muted); }
+.editor-head button.discard-draft:hover { color: var(--ink); }
 .editor-text { flex: 1; width: 100%; min-height: 0; resize: none; background: var(--bg);
     color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; padding: 8px;
     font-family: var(--mono); font-size: 13px; line-height: 1.5; }
@@ -1192,3 +1234,16 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     background: none; border: none; color: var(--muted); cursor: pointer;
     text-decoration: underline; }
 .firstrun-later:hover { color: var(--ink); }
+
+/* The conflict fold (SUB-6): regions to resolve after a conflicted save. */
+.conflict-fold { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }
+.conflict-fold-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.conflict-fold-body { display: flex; flex-direction: column; gap: 8px; overflow: auto; }
+.fold-context { margin: 0; padding: 4px 8px; opacity: 0.65; white-space: pre-wrap; font-family: var(--mono, monospace); font-size: 12px; }
+.fold-region { border: 1px solid var(--accent, #b58900); border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.fold-option { border: 1px solid var(--border, #444); border-radius: 4px; padding: 6px; }
+.fold-option.picked { border-color: var(--accent, #b58900); }
+.fold-option pre { margin: 4px 0 0; white-space: pre-wrap; font-size: 12px; }
+.fold-option label { display: flex; gap: 6px; align-items: center; font-size: 12px; cursor: pointer; }
+.fold-custom summary { font-size: 12px; cursor: pointer; opacity: 0.8; }
+.fold-custom textarea { width: 100%; min-height: 60px; margin-top: 6px; }

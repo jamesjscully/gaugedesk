@@ -2,14 +2,15 @@
 # The functional-core / imperative-shell split (ADR 0004) is the crate boundary:
 # `core` is pure (reducers, no I/O), property-tested against the Quint models in
 # specs/models. The shell crates materialize non-determinism around it:
-# `store` (SQLite event log + admission), `workspace` (git instance/worktrees),
+# `store` (SQLite event log + admission), `workspace` (WhippleScript cuts/working sets),
 # `boundary` (egress membrane + .agent-config.json policy), `harness` (the
-# adapter-free runtime seam + OS sandbox), `pi-bridge` (drives `pi --mode rpc`),
-# and `app` (the engine orchestrator + axum control plane).
+# adapter-free runtime seam + OS sandbox), `whip-runtime` (the selected governed
+# runtime), `pi-bridge` (retired protocol/conformance corpus), and `app` (the
+# engine orchestrator + axum control plane).
 # See specs/implementation/backend-stack.md and mvp-plan.md.
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/app", "ee/app"]
+members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/whip-runtime", "crates/app", "ee/app"]
 # The Tauri desktop shell is its own workspace (needs system webkit/CLI to build);
 # excluded so `cargo test` over the backend stays self-contained.
 exclude = ["src-tauri"]

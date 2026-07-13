@@ -2,7 +2,7 @@
 Feature: Real agent end-to-end (opt-in)
 
   The cases where the real model's behavior drives the app: the agent actually
-  uses a tool to create a file. Opt-in only (real Pi, costs tokens, slow) —
+  uses a tool to create a file. Opt-in only (WhippleScript + real model, costs tokens, slow) —
   run with `npm run e2e:live`, excluded from the default suite.
 
   Scenario: the real agent creates the requested file

@@ -139,8 +139,8 @@ async fn two_authorities_pair_and_a_handle_crosses_and_admits_on_the_peer() {
 
 #[tokio::test]
 async fn owner_places_a_remote_run_and_admits_the_peers_observations() {
-    // The peer runs a real Pi turn unless told to mock (FED-4); this hermetic test
-    // uses the mock-LLM path (no Pi/OAuth in CI), exactly as the e2e suite does.
+    // The peer runs a real WhippleScript turn unless told to mock (FED-4); this
+    // hermetic test uses the mock-LLM path (no model/OAuth), like the e2e suite.
     std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1");
     let broker = start_broker().await;
     let (alice, _ra) = instance("alice", &broker);

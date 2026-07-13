@@ -39,7 +39,7 @@ describe("toolDetail — additive-only disclosure (no redundant restatement)", (
 
 describe("toolHeaderTarget — the collapsed line's target", () => {
     it("shows a search tool's pattern, not the directory the server picked", () => {
-        // Pi's grep emits {pattern, path}; the server's target extraction picks `path`
+        // grep emits {pattern, path}; the server's target extraction picks `path`
         // first (".") — recover the pattern so the line reads "Searched todo", not ".".
         expect(toolHeaderTarget("grep", '{"pattern":"todo","path":"."}', ".")).toBe("todo");
         expect(toolHeaderTarget("find", '{"pattern":"*.ts","path":"src"}', "src")).toBe("*.ts");

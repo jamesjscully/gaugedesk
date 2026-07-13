@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CatalogModel } from "./model-catalog.generated";
 import {
+    defaultOption,
     defaultVisibleKeys,
     isDefaultVisible,
     modelAcceptsImages,
@@ -31,6 +32,22 @@ describe("model-picker", () => {
     it("nothing linked → no pickable models, picker is just Default", () => {
         expect(pickableModels([], CAT)).toEqual([]);
         expect(modelOptions([], null, undefined, CAT).map((o) => o.label)).toEqual(["Default"]);
+    });
+
+    it("the default row is named after the engine's resolved default when known", () => {
+        // Known to the catalog → the display name; the value stays empty (no pin).
+        const named = defaultOption({ provider: "openai-codex", model: "gpt-5.5" }, CAT);
+        expect(named.label).toBe("GPT-5.5 (default)");
+        expect(named.id).toBe("");
+        expect(named.provider).toBe("");
+        // Absent from the catalog → the raw id still beats a blind "Default".
+        expect(defaultOption({ provider: "openai-codex", model: "gpt-9" }, CAT).label).toBe("gpt-9 (default)");
+        // Unknown / no default model → the blind fallback.
+        expect(defaultOption(null, CAT).label).toBe("Default");
+        expect(defaultOption({ provider: "openai", model: null }, CAT).label).toBe("Default");
+        // modelOptions threads it into the first row.
+        const labels = modelOptions([], null, undefined, CAT, { provider: "openai-codex", model: "gpt-5.5" });
+        expect(labels[0].label).toBe("GPT-5.5 (default)");
     });
 
     it("codex linked → its primary set plus the OpenAI set as secondary, all pinned to openai-codex", () => {

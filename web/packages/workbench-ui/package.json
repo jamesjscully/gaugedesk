@@ -9,6 +9,8 @@
     "@gaugewright/control-plane-client": "0.0.0",
     "@git-diff-view/solid": "^0.1.5",
     "@tauri-apps/plugin-dialog": "^2.7.1",
+    "micromark": "^4.0.2",
+    "micromark-extension-gfm": "^3.0.0",
     "qrcode-generator": "^2.0.4",
     "solid-js": "^1.9.0"
   },
@@ -31,6 +33,7 @@
     "./FacetBrowser": "./src/FacetBrowser.tsx",
     "./FreshnessBanner": "./src/FreshnessBanner.tsx",
     "./LoadError": "./src/LoadError.tsx",
+    "./MarkdownView": "./src/MarkdownView.tsx",
     "./MobileChat": "./src/MobileChat.tsx",
     "./MobileContent": "./src/MobileContent.tsx",
     "./MobileFiles": "./src/MobileFiles.tsx",

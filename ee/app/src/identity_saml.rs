@@ -9,14 +9,14 @@
 //! attack-prone code in SSO (signature-wrapping / XSW) and the one piece with no
 //! vetted, OpenSSL-free, pure-Rust library. Rather than hand-roll dangerous crypto or
 //! pull libxml2/OpenSSL into the Rust binary, the verification runs in a small
-//! **bun/node sidecar** built on a maintained SAML library (the same runtime we
-//! already vendor for Pi), exactly mirroring the Pi-bridge subprocess seam.
+//! **bun/node sidecar** built on a maintained SAML library, behind a narrow
+//! subprocess seam.
 //! The Rust core stays memory-safe and OpenSSL-free; correctness of the XSW-prone path
 //! lives in a maintained library.
 //!
 //! ## Trust boundary (fail-closed, `INV-20`)
 //!
-//! The sidecar is co-resident (loopback IPC, same trust as the Pi child) and is given
+//! The sidecar is co-resident (loopback IPC, same host trust) and is given
 //! the IdP's **public** signing certificate + the expected audience; it returns a
 //! `{subject, attributes}` verdict or a rejection. **Anything** that is not an
 //! explicit success — a non-zero exit, malformed output, `ok:false`, an empty subject,
@@ -38,7 +38,7 @@ use gaugewright_core::ids::AuthorityId;
 
 use gaugewright_app::identity::IdentityProvider;
 
-/// Resolve the verify-sidecar command (the `GAUGEWRIGHT_PI_BIN`-style env seam,
+/// Resolve the verify-sidecar command (an explicit env-override seam,
 /// SELFHOST). A packaged bundle vendors the sidecar (e.g. a bun-compiled binary) and
 /// points here via `GAUGEWRIGHT_SAML_SIDECAR`; the dev build falls back to running the
 /// script on `node` under the repo's `ee/sidecar/saml-verify/verify.mjs`. `None` when

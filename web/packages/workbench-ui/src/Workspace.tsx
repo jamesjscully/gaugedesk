@@ -8,12 +8,13 @@ import { createMemo, createResource, createSignal, For, Show } from "solid-js";
 import { useSession } from "./session-context";
 import { LoadError } from "./LoadError";
 
-const isProtected = (path: string) => path.startsWith("builder_only/") || path.includes("/builder_only/");
-
 // Config/plumbing artifacts (#6): dotfiles like `.agent-config.json` are
 // implementation, not the user's deliverable. Hidden from the Files list by
-// default — the review should surface the content the user cares about, not config.
-const isInternal = (path: string) => path.split("/").some((seg) => seg.startsWith("."));
+// default. The authored package draft is the deliverable in an edit chat, so it
+// is visible there even though it lives under `.whipple`.
+const isInternal = (path: string, editChat: boolean) =>
+    path.split("/").some((seg) => seg.startsWith("."))
+    && !(editChat && path.startsWith(".whipple/draft/"));
 
 export function Workspace() {
     const session = useSession();
@@ -22,9 +23,16 @@ export function Workspace() {
         ([id]) => (id ? session.api.getTree(id) : Promise.resolve([])),
     );
     const [showInternal, setShowInternal] = createSignal(false);
+    const editChat = () => session.chatKind() === "edit";
+    const isProtected = (path: string) =>
+        path.startsWith("builder_only/")
+        || path.includes("/builder_only/")
+        || path === ".agent-config.json"
+        || path.startsWith(".whipple/versions/")
+        || (!editChat() && path.startsWith(".whipple/"));
     const allFiles = () => (tree() ?? []).filter((e) => !e.isDir);
-    const files = () => (showInternal() ? allFiles() : allFiles().filter((e) => !isInternal(e.path)));
-    const hiddenCount = createMemo(() => allFiles().filter((e) => isInternal(e.path)).length);
+    const files = () => (showInternal() ? allFiles() : allFiles().filter((e) => !isInternal(e.path, editChat())));
+    const hiddenCount = createMemo(() => allFiles().filter((e) => isInternal(e.path, editChat())).length);
 
     return (
         <Show when={!tree.error} fallback={<LoadError what="the files" onRetry={() => void refetch()} />}>

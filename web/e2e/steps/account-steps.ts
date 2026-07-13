@@ -18,7 +18,7 @@ When("I link the {string} account with token {string}", async ({ page }, provide
     const link = page.locator(".account-panel .admin-invite");
     await link.locator("select").selectOption(provider);
     await page.locator("[data-account-token]").fill(token);
-    await link.locator("button").click();
+    await link.getByRole("button", { name: "link", exact: true }).click();
 });
 
 Then("{string} shows as a linked account", async ({ page }, provider: string) => {

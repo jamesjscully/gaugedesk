@@ -20,11 +20,13 @@ gaugewright-store = { path = "../store" }
 gaugewright-workspace = { path = "../workspace" }
 gaugewright-boundary = { path = "../boundary" }
 gaugewright-harness = { path = "../harness" }
-gaugewright-pi-bridge = { path = "../pi-bridge" }
 # The per-boundary WhippleScript tracker runtime (ADR 0075): embeds whip's
 # RuntimeKernel + WorkItemStore for the onboarding/issue surface projected into
 # the task bar.
 gaugewright-tracker = { path = "../tracker" }
+# Permanent GaugeDesk↔WhippleScript policy/runtime boundary (ADR 0080). This is
+# distinct from the transitional Harness/EgressGate adapter.
+gaugewright-whip-runtime = { path = "../whip-runtime" }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
@@ -64,6 +66,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 listenfd = "1"
 
 [dev-dependencies]
+gaugewright-pi-bridge = { path = "../pi-bridge" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"

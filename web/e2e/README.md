@@ -20,7 +20,7 @@ broker.sh            launches the rendezvous broker (federation scenarios)
   task → diff → keep flow is instant while the membrane/reducer path stays real.
   Excludes `@live`.
 - **Live suite** (`npm run e2e:live`) — opt-in. Runs only `@live` scenarios against
-  **real Pi** (the OpenAI codex endpoint via OAuth). Slow, costs tokens — for the
+  **WhippleScript with a real model** (the OpenAI Codex endpoint via OAuth). Slow, costs tokens — for the
   cases where the model's actual behavior drives the app (real tool-use → diff).
 
 Both manage their own servers via Playwright `webServer`. `run.mjs` resolves a free

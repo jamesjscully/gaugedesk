@@ -645,6 +645,55 @@ pub fn wrap_or_refuse(
     }
 }
 
+/// Wrap a short-lived governed command in the host OS sandbox, refusing every
+/// unwrapped fallback. Unlike [`wrap_or_refuse`], an empty protected surface or
+/// `GAUGEWRIGHT_SANDBOX=0` is not authority to execute outside containment:
+/// WhippleScript has admitted the command language, while GaugeDesk remains
+/// responsible for realizing its product workspace and network boundary.
+pub fn wrap_strict(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> std::io::Result<std::process::Command> {
+    let backend = detect();
+    wrap_strict_with(backend.as_ref(), policy, program, args, cwd)
+}
+
+fn wrap_strict_with(
+    backend: &dyn Sandbox,
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> std::io::Result<std::process::Command> {
+    let mut argv = backend.wrap(policy, program, args, cwd).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "sandbox backend '{}' cannot contain governed command execution; refusing to run",
+                backend.name()
+            ),
+        )
+    })?;
+    // Short-lived command authority must end when the foreground command ends.
+    // A private PID namespace makes bubblewrap reap/terminate any forked
+    // descendants with the namespace instead of leaving workspace-capable
+    // daemons behind after a tool result is returned.
+    if backend.name() == "bubblewrap" {
+        argv.insert(2, "--unshare-pid".to_owned());
+    }
+    tracing::info!(
+        backend = backend.name(),
+        network = ?policy.network,
+        read_only_roots = policy.read_only_roots.len(),
+        "governed command: sandboxed"
+    );
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    Ok(command)
+}
+
 /// May a spawn proceed *unsandboxed* under `policy` (RF-B1)? Fail closed when
 /// the policy re-imposes a read-only definition surface — that is the use-mode
 /// case where the OS sandbox is the load-bearing INV-24 enforcement, so running
@@ -940,6 +989,36 @@ mod tests {
             allow_unsandboxed(&unprotected, false),
             "edit mode (no protected surface) keeps the warn-and-run fallback"
         );
+    }
+
+    #[test]
+    fn governed_commands_never_accept_the_unsandboxed_fallback() {
+        let error = wrap_strict_with(
+            &NoSandbox,
+            &SandboxPolicy::new(vec!["/wt".into()]),
+            "/bin/sh",
+            &["-c".into(), "git status".into()],
+            Some(Path::new("/wt")),
+        )
+        .expect_err("governed command must fail closed without a sandbox");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("cannot contain governed command"));
+    }
+
+    #[test]
+    fn governed_bubblewrap_commands_own_a_short_lived_pid_namespace() {
+        let command = wrap_strict_with(
+            &Bubblewrap,
+            &SandboxPolicy::new(vec!["/wt".into()]),
+            "/bin/sh",
+            &["-c".into(), "git status".into()],
+            Some(Path::new("/wt")),
+        )
+        .expect("bubblewrap command");
+        let debug = format!("{command:?}");
+        assert!(debug.contains("--unshare-pid"));
     }
 
     #[test]

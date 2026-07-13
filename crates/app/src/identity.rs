@@ -15,6 +15,13 @@ use gaugewright_core::ids::AuthorityId;
 
 use crate::Workbench;
 
+/// The authority GaugeDesk authenticated for the current request. Product auth
+/// middleware places this in request extensions after verification; downstream
+/// runtime adapters may attribute actions to it but must never authenticate it
+/// again or substitute the workspace owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedActor(pub AuthorityId);
+
 impl Workbench {
     /// Apply the optional local authority override used by self-operated
     /// federation/dev deployments. Empty values are ignored so a mis-set env var

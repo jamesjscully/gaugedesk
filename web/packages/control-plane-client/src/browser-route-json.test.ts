@@ -15,14 +15,14 @@ afterEach(() => vi.unstubAllGlobals());
 describe("browserRouteJson error surfacing", () => {
     it("includes the server's `error` message from a JSON body", async () => {
         stubFetch(
-            new Response(JSON.stringify({ error: "no Pi runtime found" }), {
+            new Response(JSON.stringify({ error: "runtime unavailable" }), {
                 status: 502,
                 headers: { "content-type": "application/json" },
             }),
         );
         const json = browserRouteJson("http://cp");
         await expect(json("POST", "/account/oauth/openai-codex/start", {})).rejects.toThrow(
-            /502 no Pi runtime found/,
+            /502 runtime unavailable/,
         );
     });
 

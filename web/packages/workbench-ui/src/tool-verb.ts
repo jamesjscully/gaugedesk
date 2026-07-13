@@ -8,9 +8,9 @@
  * activity list (audit-activity.ts) so both speak one vocabulary.
  */
 /** The distinct tool *identities* the chat log filters on. The seven map onto
- *  Pi's built-in tool set (bash, write, edit, read, ls, grep, find — verified
- *  against @mariozechner/pi-coding-agent); any other tool a plugin/MCP server
- *  exposes folds to `other`. Aliases (str_replace→edit, cat→read, …) normalize so
+ *  the runtime tool set (bash, write, edit, read, ls, grep, find); any other tool
+ *  exposed by a package or external capability folds to `other`. Aliases
+ *  (str_replace→edit, cat→read, …) normalize so
  *  one filter row governs a tool regardless of which name the runtime emits. */
 export type ToolId = "bash" | "write" | "edit" | "read" | "ls" | "grep" | "find" | "other";
 

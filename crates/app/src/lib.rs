@@ -11,8 +11,10 @@
 
 pub mod account;
 pub mod account_routes;
+pub mod advancement;
 pub mod app_support;
 pub mod at_rest;
+pub mod attention;
 pub mod attestation_verifier;
 pub mod audit;
 pub mod boundary_keeper;
@@ -52,6 +54,7 @@ pub mod org;
 pub mod package_flow;
 pub mod package_routes;
 pub mod package_store;
+pub mod policy_compiler;
 pub mod project_credential_routes;
 pub mod remote_runtime;
 pub mod resource_store;
@@ -70,6 +73,7 @@ pub use app_support::{
     AttestationMode, DEFAULT_AGENT, DEFAULT_INSTANCE, DEFAULT_PLACEMENT, DEFAULT_PROJECT,
     LOCAL_AUTHORITY,
 };
+pub use gaugewright_whip_runtime::{AdmittedPolicyEpoch, PolicyAdmissionError, PolicyEpoch};
 pub use open_route_stack::open_control_plane;
 pub use open_runtime::{open_control_plane_root, open_serve};
 pub(crate) use workbench_state::build_workbench;

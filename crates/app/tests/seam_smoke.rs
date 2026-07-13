@@ -3,7 +3,7 @@
 //! `Box<dyn ChatWorkspace>` (constructed through the provider seam) and the
 //! runtime built by a registered `Arc<dyn HarnessFactory>` producing the
 //! neutral [`ScriptedHarness`]. The test itself carries zero Pi and zero
-//! git-format knowledge: it never touches a wire line, a repo path, or a ref
+//! provider-format knowledge: it never touches export bytes, a store path, or a line
 //! name — the template for a future adapter conformance run.
 
 use std::io;
@@ -19,7 +19,7 @@ use gaugewright_harness::{
     TurnOutcome,
 };
 use gaugewright_store::Store;
-use gaugewright_workspace::{GitWorkspaceProvider, WorkspaceProvider};
+use gaugewright_workspace::{WhippleWorkspaceProvider, WorkspaceProvider};
 
 /// The registered test factory: builds the neutral scripted harness from a
 /// [`HarnessSpec`] — the same construction seam the engine's selector serves.
@@ -58,7 +58,7 @@ impl HarnessFactory for NeutralScriptedFactory {
     fn credential_status(
         &self,
         _provider: &str,
-        _resolved_envs: &[(String, String)],
+        _capability: Option<&dyn gaugewright_harness::CredentialCapability>,
     ) -> CredentialProbe {
         CredentialProbe::Ready
     }
@@ -73,7 +73,7 @@ fn full_turn_runs_over_workspace_and_harness_trait_objects() {
     let tmp = tempfile::tempdir().unwrap();
 
     // Workspace side: constructed and used only through the seam.
-    let provider: Arc<dyn WorkspaceProvider> = Arc::new(GitWorkspaceProvider);
+    let provider: Arc<dyn WorkspaceProvider> = Arc::new(WhippleWorkspaceProvider);
     let workspace = provider.init_at(&tmp.path().join("inst")).unwrap();
     let chat = workspace.create_engagement("chat-1").unwrap();
 
@@ -89,10 +89,18 @@ fn full_turn_runs_over_workspace_and_harness_trait_objects() {
         chat_id: "chat-1".into(),
         worktree: chat.path().to_path_buf(),
         mode: ChatMode::Use,
+        package_root: None,
+        package_version_ref: None,
+        policy_epoch: None,
+        signed_policy_envelope: None,
+        provider_binding_ref: None,
+        credential_ref: None,
+        placement_ceiling_ref: None,
         provider: None,
         model: None,
         thinking: None,
         system_prompt: None,
+        credential_capability: None,
         credentials: Vec::new(),
         sandbox: SandboxPolicy::new(vec![chat.path().to_path_buf()]),
     };

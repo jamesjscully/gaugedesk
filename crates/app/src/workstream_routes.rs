@@ -36,12 +36,15 @@ pub struct MemberBody {
 }
 
 impl Workbench {
-    /// Re-home every workstream member's engagement onto its stream main from the folded
-    /// reducer membership (`WS-E`) — run after engagements reconcile from git on startup,
-    /// since git only knows the `main`-based worktree, not which workstream a chat joined.
+    /// Ensure every durable workstream has a native shared line, then re-home its
+    /// members from the folded reducer membership (`WS-E`). The ensure is what
+    /// reconstructs shared lines during one-time legacy workspace migration.
     pub fn restore_workstream_homing(&mut self) {
         let ws_ids = self.library_workstream_ids();
         for ws_id in ws_ids {
+            if let Some(record) = self.library_workstream(&ws_id) {
+                let _ = self.create_instance_workstream_ref(&record.instance_id, &ws_id);
+            }
             let members: Vec<String> = self
                 .store_ref()
                 .fold::<WorkstreamState>(&ws_id)
@@ -85,7 +88,7 @@ impl Workbench {
         self.set_live_engagement_target(chat_id, target);
     }
 
-    /// Create the git-side workstream reference under an open placement repo.
+    /// Create the native shared workstream line under an open placement workspace.
     pub fn create_workstream_ref(
         &self,
         instance_id: &str,
@@ -163,7 +166,7 @@ impl Workbench {
         let scope = format!("ws-merge-{workstream_id}");
         for command in [
             MergeCommand::StartMerge,
-            MergeCommand::GitClean,
+            MergeCommand::WorkspaceClean,
             MergeCommand::PolicyAdmit,
             MergeCommand::AdvanceStandingRef,
             MergeCommand::AdmitBoundaryIntegration,
@@ -353,9 +356,9 @@ pub async fn archive_workstream(
 // ---- POST /workstreams/:id/promote ---------------------------------------
 
 /// Promote a workstream's main into the placement mainline — the explicit,
-/// boundary-gated `advanced → integrated` hop. Performs the real git merge, then
+/// boundary-gated `advanced → integrated` hop. Performs the real workspace merge, then
 /// records it through the verified merge reducer (the boundary command gates the
-/// integrate, `MAINLINE_INTEGRATION_REQUIRES_BOUNDARY`). A git conflict leaves the
+/// integrate, `MAINLINE_INTEGRATION_REQUIRES_BOUNDARY`). A workspace conflict leaves the
 /// mainline untouched (`PARTIAL_MERGE_NOT_STANDING`) for repair.
 pub async fn promote_workstream(
     State(wb): State<SharedWorkbench>,

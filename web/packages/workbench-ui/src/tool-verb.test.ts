@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { friendlyToolVerb, toolGroup, toolId } from "./tool-verb";
 
 describe("toolId — normalize a tool name onto a filter identity", () => {
-    it("maps each Pi built-in to its own identity", () => {
+    it("maps each runtime tool to its own identity", () => {
         expect(toolId("bash")).toBe("bash");
         expect(toolId("write")).toBe("write");
         expect(toolId("edit")).toBe("edit");

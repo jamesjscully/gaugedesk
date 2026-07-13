@@ -1,7 +1,7 @@
 Feature: Message attachments
 
   The composer's paperclip clips file(s) to the message being composed: text files
-  inline into the turn, images ride along as native Pi image blocks (message-scoped,
+  inline into the turn, images ride along as native WhippleScript resources (message-scoped,
   no workspace ingest). It is distinct from the durable Files-bar upload (context).
 
   Scenario: attach a text file to a message

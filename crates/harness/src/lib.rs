@@ -8,7 +8,7 @@
 //! nothing here is adapter-specific.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -81,7 +81,77 @@ pub struct TurnOutcome {
     pub observations: Vec<Observation>,
     pub mediated_tool_calls: Vec<String>,
     pub pending_approvals: Vec<String>,
+    /// A labeled human question whose exact admitted turn remains suspended.
+    /// The admission shell authenticates the respondent before resumption.
+    pub pending_human: Option<HumanPrompt>,
+    /// Serialized values from the runtime's own published pointer schema.
+    /// These name authoritative evidence; they never contain evidence bodies.
+    pub runtime_evidence_pointers: Vec<String>,
+    /// Runtime-certified per-field resource dependencies for the host-visible
+    /// output projection. Empty only for legacy/test adapters that do not
+    /// publish an IFC signature.
+    pub output_flow_signature: Vec<OutputFieldFlow>,
+    /// Runtime-certified dynamic guarantee outcomes from the turn's guarantee
+    /// report (WhippleScript DR-0036 §2). Empty for adapters that publish no
+    /// report — consumers fall back to host-local truth (ADR 0082 §5).
+    pub guarantee_outcomes: Vec<GuaranteeOutcome>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputFieldFlow {
+    pub field: String,
+    pub read_handles: Vec<String>,
+}
+
+/// One dynamic guarantee outcome from the runtime's guarantee report
+/// (DR-0036 §2): a **named**, per-turn certified fact — `held` / `violated` /
+/// `not_evaluated`. Consumers match names; they never re-evaluate semantics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GuaranteeOutcome {
+    pub name: String,
+    pub outcome: String,
+    pub detail: String,
+}
+
+impl GuaranteeOutcome {
+    /// Parse a guarantee report's `dynamic` section. Total: an absent or
+    /// malformed section yields no outcomes — consumers fall back to local truth.
+    pub fn from_report(report: &serde_json::Value) -> Vec<Self> {
+        report
+            .get("dynamic")
+            .and_then(|d| d.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        Some(Self {
+                            name: entry.get("name")?.as_str()?.to_string(),
+                            outcome: entry.get("outcome")?.as_str()?.to_string(),
+                            detail: entry
+                                .get("detail")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Placement-neutral projection of a runtime-owned human interaction. It keeps
+/// the stable ask/evidence labels needed for audit while leaving authentication
+/// and user identity to the product shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanPrompt {
+    pub ask_ref: String,
+    pub question: String,
+    pub choices: Vec<String>,
+    pub freeform_allowed: bool,
+    pub label_ref: String,
+    pub evidence_ref: String,
 }
 
 /// The fixed `"image"` tag on an image content block. A one-variant enum so the
@@ -143,6 +213,12 @@ pub type InterruptHandle = Arc<dyn Fn() + Send + Sync>;
 /// turn → a neutral [`TurnOutcome`]. Pi is one adapter ([`PiProcess`]); Codex /
 /// Claude Code are future adapters — each only implements this trait.
 pub trait Harness: Send {
+    /// Refresh the GaugeDesk-authenticated actor for the next turn. Persistent
+    /// harnesses must not retain the actor from the turn that created them.
+    /// Adapters may use this only for attribution; authentication stays in the
+    /// product shell. The default is a no-op for runtimes without human input.
+    fn bind_authenticated_actor(&mut self, _actor_ref: &str) {}
+
     /// Deliver `prompt` (+ any native `images` for this turn), mediate every tool
     /// call through `gate`, stream each [`Observation`] to `sink`, and return the
     /// neutral outcome. `images` are model input only — never durable evidence.
@@ -204,24 +280,58 @@ pub struct HarnessSpec {
     /// guarantee any workspace impl must honor).
     pub worktree: PathBuf,
     pub mode: ChatMode,
+    /// Exact authored WhippleScript package directory selected by GaugeDesk for
+    /// a work chat. Edit chats select GaugeDesk's built-in editor package.
+    pub package_root: Option<PathBuf>,
+    /// Content-addressed WhippleScript package reference admitted at publish and
+    /// pinned by the placement. The runtime refuses different bytes at this path.
+    pub package_version_ref: Option<String>,
+    /// Immutable WhippleScript governance epoch and signed envelope compiled by
+    /// the product authority. Required by the real WhippleScript adapter; absent
+    /// only for test/legacy adapters that do not consume the host protocol.
+    pub policy_epoch: Option<u64>,
+    pub signed_policy_envelope: Option<String>,
+    /// Typed, non-secret resolver references carried durably by the host command.
+    pub provider_binding_ref: Option<String>,
+    pub credential_ref: Option<String>,
+    pub placement_ceiling_ref: Option<String>,
     /// Resolved by the shell (env ▸ config ▸ default). `None` leaves the
     /// adapter's own default resolution in force (the federation peer path
     /// deliberately keeps provider/model unset).
     pub provider: Option<String>,
     pub model: Option<String>,
     pub thinking: Option<String>,
-    /// `Some` in edit mode (the editor framing); `None` = the adapter discovers
-    /// the agent's own definition from the worktree (use-mode persona/config
-    /// discovery of the Pi-layout definition surface is an adapter obligation
-    /// until SUB-3).
+    /// `Some` in edit mode (the built-in editor package persona). Work chats
+    /// leave this unset because persona is immutable package content.
     pub system_prompt: Option<String>,
-    /// Resolved env pairs (nearest-scope-wins) — the shell delivers resolved
-    /// credentials, per ADR 0071 §1.
+    /// Reference-bound provider material for native governed runtimes. Secret
+    /// bytes are released only for the exact admitted `credential_ref`.
+    pub credential_capability: Option<Arc<dyn CredentialCapability>>,
+    /// Legacy Pi compatibility only. Foreground GaugeDesk turns leave this
+    /// empty; it retires with the Pi adapter.
     pub credentials: Vec<(String, String)>,
     /// The shell's sandbox POLICY (worktree writable, read-only definition
     /// surface in use mode, provider hosts, egress ack); the adapter EXTENDS it
     /// with adapter-private needs (e.g. Pi's session dir + `~/.pi`).
     pub sandbox: sandbox::SandboxPolicy,
+}
+
+/// Runtime continuity identity at a chat fork. This intentionally carries only
+/// package/context inputs; credentials, provider selection, and workspace
+/// authority are resolved afresh when the fork runs its first turn.
+#[derive(Clone, Debug)]
+pub struct HarnessContinuitySpec {
+    pub chat_id: String,
+    pub worktree: PathBuf,
+    pub mode: ChatMode,
+    pub package_root: Option<PathBuf>,
+    pub package_version_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    /// The already-published source policy epoch governing the continuity
+    /// transaction. A target compiles its own current policy before its first
+    /// turn; the fork itself remains attributable to this immutable source cut.
+    pub policy_epoch: Option<u64>,
+    pub signed_policy_envelope: Option<String>,
 }
 
 /// An adapter's answer to "is the runtime's own credential state ready for this
@@ -235,6 +345,52 @@ pub enum CredentialProbe {
     Ready,
     /// Nothing usable — the actionable, user-facing reason.
     Missing(String),
+}
+
+/// Provider material released by a GaugeDesk-owned credential capability.
+/// Fields are private and its `Debug` representation is redacted.
+#[derive(Clone)]
+pub struct CredentialMaterial {
+    secret: String,
+    account_id: Option<String>,
+}
+
+impl CredentialMaterial {
+    pub fn new(secret: impl Into<String>, account_id: Option<String>) -> Self {
+        Self {
+            secret: secret.into(),
+            account_id,
+        }
+    }
+
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
+    }
+}
+
+impl std::fmt::Debug for CredentialMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialMaterial")
+            .field("secret", &"[REDACTED]")
+            .field(
+                "account_id",
+                &self.account_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// A non-serializable capability over GaugeDesk-custodied provider material.
+/// Implementations reject every reference except the exact value returned by
+/// [`CredentialCapability::credential_ref`].
+pub trait CredentialCapability: Send + Sync + std::fmt::Debug {
+    fn credential_ref(&self) -> &str;
+    fn resolve(&self, credential_ref: &str) -> io::Result<CredentialMaterial>;
 }
 
 /// Constructs a [`Harness`] per chat from a resolved [`HarnessSpec`] — the
@@ -255,26 +411,24 @@ pub trait HarnessFactory: Send + Sync {
     fn reuse_across_turns(&self) -> bool {
         true
     }
-    /// Clone per-chat continuity state on chat fork (Pi: copy the session dir
-    /// beside the worktree and rebind absolute paths). The chat ids let an
-    /// id-keyed runtime serve the hook after a restart; a path-keyed impl
-    /// ignores them. Default: no continuity state.
+    /// Fork per-chat continuity state into a distinct runtime identity. Package
+    /// and prompt inputs are explicit; credentials and provider bindings are
+    /// deliberately absent and must be resolved afresh on the target's turn.
+    /// Default: no continuity state.
     fn clone_continuity(
         &self,
-        _src_chat: &str,
-        _dst_chat: &str,
-        _src_worktree: &Path,
-        _dst_worktree: &Path,
+        _source: &HarnessContinuitySpec,
+        _target: &HarnessContinuitySpec,
     ) -> io::Result<()> {
         Ok(())
     }
     /// Adapter-answerable credential probe: is the runtime's own credential
-    /// state ready for `provider`? `resolved_envs` are the shell-resolved
-    /// credential pairs, for adapters whose readiness depends on them.
+    /// state ready for `provider`? Native governed adapters receive only the
+    /// exact-reference capability selected for this turn.
     fn credential_status(
         &self,
         provider: &str,
-        resolved_envs: &[(String, String)],
+        capability: Option<&dyn CredentialCapability>,
     ) -> CredentialProbe;
 }
 

@@ -20,12 +20,41 @@ import {
     type FileEntry,
     type MergeAction,
     type MergePhase,
+    type MergePreviewResult,
+    type RegionResolution,
+    type SaveBase,
+    type SaveFileResult,
 } from "@gaugewright/control-plane-client";
 import { type Transcript } from "./transcript";
 
 export interface SessionApi {
     getFile(id: EngagementId, path: string): Promise<string>;
+    /** `getFile` plus the cut the read serves (SUB-6 §12) — the base a
+     *  cut-carrying save sends back. Optional: sessions without it fall
+     *  back to content-based bases. */
+    getFileWithCut?(
+        id: EngagementId,
+        path: string,
+    ): Promise<{ content: string; cut: string | null }>;
     putFile(id: EngagementId, path: string, content: string): Promise<void>;
+    /** Base-carrying save (SUB-6): merges concurrent changes through whip's
+     *  engine; a real divergence resolves to a structured conflict payload.
+     *  Fold-settled `resolutions` mint durable region memory. Optional —
+     *  sessions without it fall back to the legacy putFile. */
+    saveFile?(
+        id: EngagementId,
+        path: string,
+        content: string,
+        base: SaveBase,
+        resolutions?: RegionResolution[],
+    ): Promise<SaveFileResult>;
+    /** Read-only save preview (the live fold, §12.3). Optional. */
+    previewMerge?(
+        id: EngagementId,
+        path: string,
+        draft: string,
+        baseCut: string,
+    ): Promise<MergePreviewResult>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
     embedMyChats(): Promise<{ chat: string; title: string }[]>;
     /** The deployment's public embed config (EMBED-7 white-label). Optional: only a

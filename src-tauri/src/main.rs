@@ -38,29 +38,6 @@ fn main() {
         // `plugins.deep-link`), so the OS routes invite links to this app.
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
-            // Self-contained runtime (SELFHOST-1): a packaged bundle vendors Pi +
-            // git + the membrane plugin and points the control plane at them via
-            // the env seam (GAUGEWRIGHT_PI_BIN / GAUGEWRIGHT_GIT_BIN / GAUGEWRIGHT_PLUGIN_PATH).
-            // This MUST run *before* the control-plane thread spawns: `open_serve()` →
-            // `open_workbench()` runs git at startup (reconciling engagements), so
-            // git must already resolve to the vendored binary. A dev `tauri dev`
-            // run has no vendored payload — each var is set only when its file
-            // exists, otherwise the resolver falls back to PATH/cwd (the dev path).
-            if let Ok(resource_dir) = app.path().resource_dir() {
-                set_if_present(
-                    "GAUGEWRIGHT_PI_BIN",
-                    resource_dir.join("bin").join(exe("pi")),
-                );
-                set_if_present(
-                    "GAUGEWRIGHT_GIT_BIN",
-                    resource_dir.join("bin").join(exe("git")),
-                );
-                set_if_present(
-                    "GAUGEWRIGHT_PLUGIN_PATH",
-                    resource_dir.join("plugin").join("gaugewright-plugin.ts"),
-                );
-            }
-
             // Spawn-vs-connect (DEPLOY-5): the **solo** shell spawns a co-resident control
             // plane; an **enterprise** deployment that names an org control plane
             // (`GAUGEWRIGHT_ORG_CP`) skips the spawn — the webview connects to that org CP
@@ -69,7 +46,7 @@ fn main() {
             // ENTSEC-8 (ADR 0065) fail-loud guard: an enterprise/thin install pins
             // `GAUGEWRIGHT_REQUIRE_ORG_CP=1`. If it is set but no org CP is configured, refuse to
             // silently fall back to spawning a co-resident on-disk store (which would write the
-            // client's data — db, git repos, transcripts — onto the consultant's unmanaged
+            // client's data — db, workspaces, transcripts — onto the consultant's unmanaged
             // endpoint, the exact leak thin mode exists to prevent). Hard-exit with a clear
             // operator message instead of degrading open.
             let org_cp = std::env::var("GAUGEWRIGHT_ORG_CP").ok();
@@ -82,7 +59,7 @@ fn main() {
             match decision {
                 Some(bind) => {
                     // Start the control plane in the background before the window is
-                    // interactive. The store + git instance live under the OS app-data dir
+                    // interactive. Both stores live under the OS app-data dir
                     // (cwd `.gaugewright` in dev), resolved by the workspace crate.
                     std::thread::spawn(move || {
                         let root = open_control_plane_root();
@@ -202,28 +179,6 @@ async fn check_for_update(app: tauri::AppHandle) {
     }
     // Installed — relaunch into the new version.
     app.restart();
-}
-
-/// The OS-specific executable name (`pi` / `pi.exe`). Tauri can't tell us the
-/// target at runtime, so cfg picks it.
-fn exe(stem: &str) -> String {
-    #[cfg(windows)]
-    {
-        format!("{stem}.exe")
-    }
-    #[cfg(not(windows))]
-    {
-        stem.to_string()
-    }
-}
-
-/// Point an asset env var at a vendored path **only if it exists**, so a dev run
-/// (no vendored payload under `resource_dir`) cleanly falls back to the resolver's
-/// PATH/cwd default rather than naming a missing file.
-fn set_if_present(var: &str, path: std::path::PathBuf) {
-    if path.exists() {
-        std::env::set_var(var, path);
-    }
 }
 
 fn open_control_plane_root() -> std::path::PathBuf {

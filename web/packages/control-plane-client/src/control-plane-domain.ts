@@ -186,13 +186,15 @@ export function isWorkspaceRecord(v: unknown): v is WorkspaceChange["record"] {
 /** The kinds of task the top bar surfaces (ADR 0075 §5): a clean-merge chat
  *  awaiting keep/reject (`review`), or an onboarding checklist item from the
  *  per-boundary whip tracker (`issue`). */
-export type TaskKind = "review" | "issue";
+export type TaskKind = "review" | "answer" | "repair" | "reply" | "issue";
 
-/** One item in the human task queue (the top bar). `review` tasks come from
- *  chats awaiting a keep/reject; `issue` tasks come from the account-global whip
- *  tracker (onboarding). Note `id` is an {@link EngagementId} for `review` tasks
- *  but a whip work-item id (`WS-N`) for `issue` tasks — narrow on `kind` before
- *  treating it as an engagement. */
+/** One item in the human task queue (the top bar). The kind is the **ask** —
+ *  the verb the human is being asked to perform (ADR 0082 §2): `review` a clean
+ *  merge (keep/reject), `answer` the agent's pending question, `repair` a merge
+ *  conflict; `issue` tasks come from the account-global whip tracker
+ *  (onboarding). Note `id` is an {@link EngagementId} for chat asks but a whip
+ *  work-item id (`WS-N`) for `issue` tasks — narrow on `kind` before treating
+ *  it as an engagement. */
 export interface HumanTask {
     readonly id: string;
     readonly title: string;
@@ -307,6 +309,7 @@ export type RunPhase =
     | "Requested"
     | "Admitted"
     | "Running"
+    | "AwaitingHuman"
     | "Completed"
     | "Failed"
     | "Canceled";
@@ -321,6 +324,8 @@ export type RunCommand =
     | "RequestRun"
     | "AdmitRun"
     | "StartRun"
+    | "AwaitHuman"
+    | "ResumeRun"
     | "CompleteRun"
     | "FailRun"
     | "CancelRun"
@@ -532,7 +537,16 @@ export interface FileEntry {
 
 const isPhase = (v: unknown): v is RunPhase =>
     typeof v === "string" &&
-    ["Init", "Requested", "Admitted", "Running", "Completed", "Failed", "Canceled"].includes(v);
+    [
+        "Init",
+        "Requested",
+        "Admitted",
+        "Running",
+        "AwaitingHuman",
+        "Completed",
+        "Failed",
+        "Canceled",
+    ].includes(v);
 
 /** Parse a raw control-plane payload into the branded `RunState`. */
 export function parseRunState(raw: unknown): RunState {

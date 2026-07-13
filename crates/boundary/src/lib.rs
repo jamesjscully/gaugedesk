@@ -1,4 +1,4 @@
-//! gaugewright boundary — the egress membrane + `.agent-config.json` policy.
+//! gaugewright boundary — GaugeDesk-owned runtime selection and legacy policy.
 //!
 //! The host-side chokepoint every external effect passes through (`pi-rpc.md`,
 //! "Egress Mediation"). It is **not** a bypass: even trust-by-default mediates
@@ -8,8 +8,9 @@
 //! imperative policy gate that classifies an effect against the agent's declared
 //! policy before it executes.
 //!
-//! The policy is the original `.agent-config.json` `policy` block
-//! (read/write/execute/egress, `builder_only/**` hidden), adopted directly for M0.
+//! The legacy membrane remains for scripted-fake and retired-adapter conformance.
+//! Production package/tool authority is WhippleScript-owned (ADR 0081); new
+//! `.agent-config.json` writes contain only GaugeDesk runtime selection.
 
 use std::collections::BTreeSet;
 
@@ -26,18 +27,17 @@ pub enum AuthoringMode {
     Use,
 }
 
-/// The agent's **method-definition surface** — the Pi-native files that define the
-/// agent (ADR 0029). A write here is edit-authored (`INV-24`).
+/// The protected package/control surface. The WhippleScript package is editable
+/// only through an authenticated edit chat; `.agent-config.json` is
+/// GaugeDesk-owned provider/model selection and is never agent-authored.
 pub fn is_method_surface_path(path: &str) -> bool {
     let p = path.trim_start_matches("./");
-    p == ".agent-config.json"
-        || p == "AGENTS.md"
-        || p == "CLAUDE.md"
-        || p.starts_with(".pi/")
-        || p.contains("/.pi/")
-        || p.ends_with("/AGENTS.md")
-        || p.ends_with("/CLAUDE.md")
-        || p.ends_with("/.agent-config.json")
+    p.starts_with(".whipple/") || p.contains("/.whipple/")
+}
+
+pub fn is_control_surface_path(path: &str) -> bool {
+    let p = path.trim_start_matches("./");
+    p == ".agent-config.json" || p.ends_with("/.agent-config.json")
 }
 
 /// Pi's built-in file-mutating tools. This membrane gate gives a fast, clean
@@ -51,47 +51,201 @@ pub fn is_write_tool(tool: &str) -> bool {
     matches!(tool, "write" | "edit")
 }
 
-/// The agent **definition surface** — the one home of the on-disk layout that
-/// defines an agent (ADR 0029). Every Rust consumer (seeding, sandbox read-only
-/// roots, config reads) derives from these constants; the TS plugin and the web
-/// client keep cross-language copies annotated back to this module. The layout
-/// itself is Pi-native versioned product content and does not move until SUB-3
-/// — this module makes it one decision instead of scattered copies. Turn-time
-/// persona/config discovery of the layout is an adapter obligation until SUB-3
-/// (the Pi runtime discovers [`definition::SYSTEM_PATH`] from its cwd).
+/// The agent definition surface: a native authored WhippleScript package plus
+/// GaugeDesk-owned runtime selection. WhippleScript parses the package manifest,
+/// derives its tool surface from the capability registry, and binds all package
+/// bytes into the immutable version reference. GaugeDesk owns who may edit,
+/// publish, install, and select that reference.
 pub mod definition {
-    /// The agent's persona file.
-    pub const SYSTEM_PATH: &str = ".pi/SYSTEM.md";
-    /// The agent's working instructions/conventions file.
-    pub const INSTRUCTIONS_PATH: &str = "AGENTS.md";
-    /// The agent's model + policy config (the membrane's policy source).
+    pub const PACKAGE_ROOT: &str = ".whipple";
+    pub const DRAFT_ROOT: &str = ".whipple/draft";
+    pub const VERSIONS_ROOT: &str = ".whipple/versions";
+    pub const MANIFEST_FILE: &str = "package.json";
+    pub const SOURCE_FILE: &str = "method.whip";
+    pub const PERSONA_FILE: &str = "persona.md";
+    /// GaugeDesk-owned provider/model/thinking selection. Authentication and
+    /// credentials never enter the authored package.
     pub const CONFIG_PATH: &str = ".agent-config.json";
-    /// The roots re-imposed read-only over the worktree in use mode (INV-24,
-    /// ADR 0030): the whole definition surface, including the `.pi/` dir the
-    /// persona lives under and the notes file the layout reserves.
-    pub const READONLY_ROOTS: &[&str] = &[".pi", INSTRUCTIONS_PATH, "CLAUDE.md", CONFIG_PATH];
+    /// Package bytes are read-only in work chats. The OS sandbox is
+    /// defense-in-depth; WhippleScript package selection is the authority.
+    pub const READONLY_ROOTS: &[&str] = &[PACKAGE_ROOT];
+    pub const EDIT_READONLY_ROOTS: &[&str] = &[VERSIONS_ROOT];
+    /// GaugeDesk control files are never writable by a model, including in an
+    /// edit chat.
+    pub const CONTROL_READONLY_ROOTS: &[&str] = &[CONFIG_PATH];
 
-    /// The neutral agent definition. Today it is materialized as the Pi-native
-    /// file layout ([`AgentDefinition::seed_files`]); a future adapter
-    /// materializes the same type as its own package shape (SUB-3) — same
-    /// type, new materializer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PackageCapabilities {
+        pub workspace_read: bool,
+        pub workspace_write: bool,
+        pub command_run: bool,
+        pub human_ask: bool,
+    }
+
+    impl Default for PackageCapabilities {
+        fn default() -> Self {
+            Self {
+                workspace_read: true,
+                workspace_write: true,
+                command_run: true,
+                human_ask: true,
+            }
+        }
+    }
+
+    impl PackageCapabilities {
+        fn names(self) -> Vec<&'static str> {
+            let mut names = Vec::new();
+            if self.workspace_read {
+                names.push("workspace.read");
+            }
+            if self.workspace_write {
+                names.push("workspace.write");
+            }
+            if self.command_run {
+                names.push("command.run");
+            }
+            if self.human_ask {
+                names.push("human.ask");
+            }
+            names
+        }
+    }
+
+    pub fn package_paths(root: &str) -> [(String, &'static str); 3] {
+        [
+            (format!("{root}/{MANIFEST_FILE}"), DEFAULT_MANIFEST),
+            (format!("{root}/{SOURCE_FILE}"), DEFAULT_METHOD_SOURCE),
+            (format!("{root}/{PERSONA_FILE}"), ""),
+        ]
+    }
+
+    pub fn version_root(version: u64) -> String {
+        format!("{VERSIONS_ROOT}/{version}")
+    }
+
+    pub fn package_documents(
+        root: &str,
+        persona: &str,
+        capabilities: PackageCapabilities,
+    ) -> Vec<(String, String)> {
+        let names = capabilities.names();
+        let json_names = names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let manifest = format!(
+            "{{\n  \"schema\": \"whipplescript.agent_package.v0\",\n  \"source\": \"method.whip\",\n  \"workflow\": \"GaugeDeskMethod\",\n  \"agent\": \"assistant\",\n  \"system_prompt\": \"persona.md\",\n  \"capabilities\": [{json_names}],\n  \"max_steps\": 32\n}}\n"
+        );
+        let capability_list = format!("[{}]", json_names);
+        let requires = if names.is_empty() {
+            String::new()
+        } else {
+            format!(" requires {capability_list}")
+        };
+        let mut resources = String::new();
+        let mut grants = String::new();
+        if capabilities.workspace_read {
+            resources.push_str("file store project {\n  root \".\"\n  allow read [\"**\"]\n");
+            if capabilities.workspace_write {
+                resources.push_str("  allow write [\"**\"]\n");
+            }
+            resources.push_str("}\n\n");
+            grants.push_str("\n      with access to project {\n        read [\"**\"]\n");
+            if capabilities.workspace_write {
+                grants.push_str("        write [\"**\"]\n");
+            }
+            grants.push_str("      }");
+        }
+        if capabilities.command_run {
+            grants.push_str("\n      with access to command {\n        run\n      }");
+        }
+        if capabilities.human_ask {
+            grants.push_str("\n      with access to human {\n        ask\n      }");
+        }
+        let source = format!(
+            "{resources}workflow GaugeDeskMethod {{\n  agent assistant {{\n    provider owned\n    profile \"repo-writer\"\n    capacity 1\n    capabilities {capability_list}\n  }}\n\n  rule converse\n    when started\n  => {{\n    tell assistant{requires}{grants}\n      \"Run the selected GaugeDesk method.\"\n  }}\n}}\n"
+        );
+        vec![
+            (format!("{root}/{MANIFEST_FILE}"), manifest),
+            (format!("{root}/{SOURCE_FILE}"), source),
+            (format!("{root}/{PERSONA_FILE}"), persona.to_owned()),
+        ]
+    }
+
+    pub const DEFAULT_METHOD_SOURCE: &str = r#"file store project {
+  root "."
+  allow read ["**"]
+  allow write ["**"]
+}
+
+workflow GaugeDeskMethod {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+    capabilities ["workspace.read", "workspace.write", "command.run", "human.ask"]
+  }
+
+  rule converse
+    when started
+  => {
+    tell assistant requires ["workspace.read", "workspace.write", "command.run", "human.ask"]
+      with access to project {
+        read ["**"]
+        write ["**"]
+      }
+      with access to command {
+        run
+      }
+      with access to human {
+        ask
+      }
+      "Run the selected GaugeDesk method."
+  }
+}
+"#;
+
+    pub const DEFAULT_MANIFEST: &str = r#"{
+  "schema": "whipplescript.agent_package.v0",
+  "source": "method.whip",
+  "workflow": "GaugeDeskMethod",
+  "agent": "assistant",
+  "system_prompt": "persona.md",
+  "capabilities": [
+    "workspace.read",
+    "workspace.write",
+    "command.run",
+    "human.ask"
+  ],
+  "max_steps": 32
+}
+"#;
+
+    /// The neutral authored definition materialized as a native WhippleScript
+    /// agent package.
     pub struct AgentDefinition {
-        /// Persona ([`SYSTEM_PATH`] content).
+        /// Persona included in the package-owned system context.
         pub system: String,
-        /// Instructions ([`INSTRUCTIONS_PATH`] content).
+        /// Method conventions included in the same package-owned context.
         pub instructions: String,
-        /// Raw config body ([`CONFIG_PATH`]), when the definition carries one.
+        /// GaugeDesk runtime selection, when the definition carries one.
         pub config: Option<String>,
     }
 
     impl AgentDefinition {
-        /// The ONE layout choke point: the definition rendered as the files
-        /// seeded onto a fresh workspace mainline.
+        /// The one layout choke point for fresh archetype package source.
         pub fn seed_files(&self) -> Vec<(String, String)> {
-            let mut files = vec![
-                (SYSTEM_PATH.to_string(), self.system.clone()),
-                (INSTRUCTIONS_PATH.to_string(), self.instructions.clone()),
-            ];
+            let persona = format!("{}\n\n{}", self.system.trim(), self.instructions.trim());
+            let mut files = Vec::new();
+            for root in [DRAFT_ROOT.to_owned(), version_root(1)] {
+                files.extend(package_documents(
+                    &root,
+                    &persona,
+                    PackageCapabilities::default(),
+                ));
+            }
             if let Some(config) = &self.config {
                 files.push((CONFIG_PATH.to_string(), config.clone()));
             }
@@ -114,9 +268,9 @@ pub enum Posture {
     PolicyOnlyBlock,
 }
 
-/// The agent's declared policy — the file-level form of resource-access + the
-/// egress membrane. Unknown fields are ignored so the original richer file
-/// loads cleanly.
+/// GaugeDesk runtime selection plus retired policy fields retained solely for
+/// one-way migration and fake/adapter conformance. New settings writes reject
+/// `tools` and `policy`; production WhippleScript never consults them.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AgentConfig {
     /// Provider to pin (e.g. `openai-codex`). M0 defaults to the user's OAuth
@@ -125,13 +279,14 @@ pub struct AgentConfig {
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
-    /// Reasoning-effort level for this chat (Pi `--thinking`: off | minimal | low |
-    /// medium | high | xhigh). Unset → Pi's per-model default (LLM-1, ADR 0062).
+    /// Reasoning-effort level for this chat. Unset uses the provider default.
     #[serde(default)]
     pub thinking: Option<String>,
     #[serde(default)]
+    /// Retired package-tool selection, read only by the migration converter.
     pub tools: Vec<String>,
     #[serde(default)]
+    /// Retired GaugeDesk membrane policy, read only by migration/fake adapters.
     pub policy: Policy,
 }
 
@@ -157,6 +312,48 @@ impl AgentConfig {
     pub fn from_file(path: &std::path::Path) -> std::io::Result<Self> {
         let s = std::fs::read_to_string(path)?;
         Self::from_json(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    pub fn runtime_settings_from_json(s: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(s).map_err(|error| error.to_string())?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "runtime settings must be a JSON object".to_owned())?;
+        for retired in ["policy", "tools"] {
+            if object.contains_key(retired) {
+                return Err(format!(
+                    "`{retired}` is package-owned; edit `.whipple/draft/package.json` and `method.whip`"
+                ));
+            }
+        }
+        Self::from_json(s).map_err(|error| error.to_string())
+    }
+
+    /// One-way SUB-3 migration of the legacy tool-policy shape into the native
+    /// WhippleScript package capability registry. Network/provider authority is
+    /// deliberately absent: GaugeDesk project policy and the signed governance
+    /// envelope own those decisions.
+    pub fn package_capabilities(&self) -> definition::PackageCapabilities {
+        let admits = |names: &[&str]| {
+            let named = |set: &BTreeSet<String>| names.iter().any(|name| set.contains(*name));
+            let selected = self.tools.is_empty()
+                || names
+                    .iter()
+                    .any(|name| self.tools.iter().any(|tool| tool == name));
+            let posture_allows = match self.policy.posture {
+                Posture::PolicyOnlyBlock => named(&self.policy.allow_tools),
+                Posture::TrustByDefault | Posture::PromptOnRisk => selected,
+            };
+            posture_allows && !named(&self.policy.block_tools)
+        };
+        let workspace_write = admits(&["write", "edit"]);
+        definition::PackageCapabilities {
+            workspace_read: admits(&["read"]) || workspace_write,
+            workspace_write,
+            command_run: admits(&["bash", "command"]),
+            human_ask: admits(&["ask_human", "human"]),
+        }
     }
 }
 
@@ -233,6 +430,15 @@ impl Membrane {
         // An explicit block always wins — even trust-by-default cannot override it.
         if self.policy.block_tools.contains(&effect.tool) {
             return Decision::Block("tool blocked by policy");
+        }
+
+        if is_write_tool(&effect.tool)
+            && effect
+                .target
+                .as_deref()
+                .is_some_and(is_control_surface_path)
+        {
+            return Decision::Block("GaugeDesk runtime configuration is host-owned");
         }
 
         // INV-24: the method-definition surface is edit-authored. A write to it
@@ -344,7 +550,7 @@ mod tests {
         assert!(cfg.policy.allow_tools.contains("read"));
     }
 
-    // ── INV-24: method definition is edit-authored (ADR 0029) ──────────────────
+    // ── Native package/control ownership ───────────────────────────────────────
 
     fn edit(target: &str) -> Effect {
         Effect::in_workspace("edit").with_target(Some(target.to_string()))
@@ -354,12 +560,11 @@ mod tests {
     fn use_mode_blocks_writes_to_the_method_surface() {
         let m = Membrane::new(Policy::default()).with_mode(AuthoringMode::Use);
         for path in [
-            ".pi/SYSTEM.md",
-            "AGENTS.md",
+            ".whipple/draft/persona.md",
+            ".whipple/versions/1/method.whip",
             ".agent-config.json",
-            ".pi/extensions/x.ts",
-            "./AGENTS.md",
-            "/abs/wt/.pi/SYSTEM.md",
+            ".whipple/draft/skills/x.md",
+            "/abs/wt/.whipple/versions/2/package.json",
         ] {
             assert!(
                 matches!(m.classify(&edit(path)), Decision::Block(_)),
@@ -369,21 +574,27 @@ mod tests {
         // but use mode can still WRITE non-definition files (the actual work)…
         assert_eq!(m.classify(&edit("src/main.rs")), Decision::Allow);
         // …and can READ its own definition (read is not a write tool).
-        let read_sys = Effect::in_workspace("read").with_target(Some(".pi/SYSTEM.md".into()));
+        let read_sys =
+            Effect::in_workspace("read").with_target(Some(".whipple/draft/persona.md".into()));
         assert_eq!(m.classify(&read_sys), Decision::Allow);
+        assert_eq!(m.classify(&edit("AGENTS.md")), Decision::Allow);
     }
 
     #[test]
     fn edit_mode_may_write_the_method_surface() {
         let m = Membrane::new(Policy::default()).with_mode(AuthoringMode::Edit);
-        assert_eq!(m.classify(&edit(".pi/SYSTEM.md")), Decision::Allow);
-        assert_eq!(m.classify(&edit("AGENTS.md")), Decision::Allow);
-        assert_eq!(m.classify(&edit(".agent-config.json")), Decision::Allow);
+        assert_eq!(
+            m.classify(&edit(".whipple/draft/persona.md")),
+            Decision::Allow
+        );
+        assert!(matches!(
+            m.classify(&edit(".agent-config.json")),
+            Decision::Block(_)
+        ));
     }
 
-    /// The definition layout has exactly one choke point: `seed_files` renders
-    /// the neutral definition as the Pi-native layout, config included only
-    /// when the definition carries one.
+    /// The definition layout has exactly one choke point: a mutable draft plus
+    /// an immutable version-one package with identical authored bytes.
     #[test]
     fn seed_files_is_the_one_layout_choke_point() {
         let def = definition::AgentDefinition {
@@ -391,13 +602,22 @@ mod tests {
             instructions: "conventions".into(),
             config: None,
         };
-        assert_eq!(
-            def.seed_files(),
-            vec![
-                (".pi/SYSTEM.md".to_string(), "persona".to_string()),
-                ("AGENTS.md".to_string(), "conventions".to_string()),
-            ]
-        );
+        let seeded = def.seed_files();
+        assert_eq!(seeded.len(), 6);
+        for root in [
+            definition::DRAFT_ROOT.to_owned(),
+            definition::version_root(1),
+        ] {
+            assert!(seeded
+                .iter()
+                .any(|(path, _)| path == &format!("{root}/package.json")));
+            assert!(seeded
+                .iter()
+                .any(|(path, _)| path == &format!("{root}/method.whip")));
+            assert!(seeded.iter().any(|(path, body)| {
+                path == &format!("{root}/persona.md") && body == "persona\n\nconventions"
+            }));
+        }
 
         let with_config = definition::AgentDefinition {
             config: Some("{}".into()),
@@ -407,9 +627,12 @@ mod tests {
             with_config.seed_files().last(),
             Some(&(".agent-config.json".to_string(), "{}".to_string()))
         );
-        // every seeded file sits on the read-only definition surface
+        // every seeded file is either package-owned or GaugeDesk control.
         for (path, _) in with_config.seed_files() {
-            assert!(is_method_surface_path(&path), "{path} is on the surface");
+            assert!(
+                is_method_surface_path(&path) || is_control_surface_path(&path),
+                "{path} is on a protected surface"
+            );
         }
     }
 
@@ -424,8 +647,8 @@ mod tests {
             tool in prop::sample::select(vec!["read", "edit", "write", "ls", "grep"]),
             is_edit in any::<bool>(),
             // a path that is sometimes on the surface, sometimes not
-            surface in prop::sample::select(vec![".pi/SYSTEM.md", "AGENTS.md", ".agent-config.json",
-                                                 ".pi/extensions/a.ts", "src/lib.rs", "notes/x.md", "data.csv"]),
+            surface in prop::sample::select(vec![".whipple/draft/persona.md", "AGENTS.md", ".agent-config.json",
+                                                 ".whipple/versions/1/method.whip", "src/lib.rs", "notes/x.md", "data.csv"]),
         ) {
             let mode = if is_edit { AuthoringMode::Edit } else { AuthoringMode::Use };
             let m = Membrane::new(Policy::default()).with_mode(mode);

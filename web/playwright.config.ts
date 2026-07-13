@@ -30,7 +30,7 @@ export default defineConfig({
     testDir,
     fullyParallel: false, // one shared control plane; scenarios share its state
     workers: 1,
-    timeout: 60_000, // generous enough for the @live real-Pi turn
+    timeout: 60_000, // generous enough for an @live real-model WhippleScript turn
     expect: { timeout: 8_000 },
     reporter: [["list"]],
     use: {

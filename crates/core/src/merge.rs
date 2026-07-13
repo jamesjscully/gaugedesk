@@ -2,15 +2,15 @@
 //! from `specs/models/merge-lifecycle.qnt` (itself from the TLA+
 //! `WorkstreamMergeRepair`).
 //!
-//! Git reconciliation is automatic, but advancing the standing ref (`main` in M0)
-//! is **gated**: it happens only on a clean git merge AND an admitted policy (the
-//! human review — D1). A git conflict or a policy reject **isolates** the
+//! Workspace reconciliation is automatic, but advancing the standing line (`main`)
+//! is **gated**: it happens only on a clean substrate merge AND admitted policy. A
+//! workspace conflict or a policy reject **isolates** the
 //! engagement with a preserved candidate and a repair context; repair retries are
 //! idempotent (the ref advances at most once). A partial merge is never settled.
 //!
-//! The reducer is pure: the imperative shell runs git and surfaces the human's
-//! review, then issues `GitClean`/`GitConflict` and `PolicyAdmit`/`PolicyReject`.
-//! Discharges (`INV`-grade): standing-advance-requires-git-and-policy ·
+//! The reducer is pure: the imperative shell asks the workspace for a verdict and
+//! surfaces review, then issues `WorkspaceClean`/`WorkspaceConflict` and the policy
+//! command. Discharges (`INV`-grade): standing-advance-requires-workspace-and-policy ·
 //! rejected-preserves-repair-basis · partial-merge-never-standing ·
 //! repair-retry-idempotent · isolated-thread-not-current-without-repair ·
 //! mainline-integration-requires-boundary (`[M1]`).
@@ -32,7 +32,7 @@ pub enum MergePhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum GitOutcome {
+pub enum WorkspaceOutcome {
     Unknown,
     Success,
     Conflict,
@@ -56,7 +56,10 @@ pub enum ThreadState {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct MergeState {
     pub phase: MergePhase,
-    pub git_outcome: GitOutcome,
+    /// Serialized under the historical `git_outcome` field for replay and
+    /// mixed-client compatibility; its semantics are substrate-neutral.
+    #[serde(rename = "git_outcome")]
+    pub workspace_outcome: WorkspaceOutcome,
     pub policy_outcome: PolicyOutcome,
     pub candidate_preserved: bool,
     pub repair_context_created: bool,
@@ -72,7 +75,7 @@ impl Default for MergeState {
     fn default() -> Self {
         Self {
             phase: MergePhase::Idle,
-            git_outcome: GitOutcome::Unknown,
+            workspace_outcome: WorkspaceOutcome::Unknown,
             policy_outcome: PolicyOutcome::Unknown,
             candidate_preserved: false,
             repair_context_created: false,
@@ -90,15 +93,15 @@ impl Default for MergeState {
 pub enum MergeCommand {
     /// The engagement's work is committed; attempt to merge into the standing ref.
     StartMerge,
-    /// Shell ran git: a clean merge (no partial state exposed).
-    GitClean,
-    /// Shell ran git: a conflict (abort, isolate, preserve candidate).
-    GitConflict,
+    /// Workspace reports a clean merge (no partial state exposed).
+    WorkspaceClean,
+    /// Workspace reports a conflict (isolate and preserve the candidate).
+    WorkspaceConflict,
     /// The human reviewed the diff and admitted.
     PolicyAdmit,
     /// The human reviewed the diff and rejected.
     PolicyReject,
-    /// Advance the standing ref (`main`) — only on clean git + admitted policy.
+    /// Advance the standing line (`main`) — only on a clean workspace verdict + policy.
     AdvanceStandingRef,
     /// Submit a repair for an isolated engagement.
     SubmitRepair,
@@ -113,8 +116,11 @@ pub enum MergeCommand {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MergeEvent {
     MergeStarted,
-    GitCleaned,
-    GitConflicted,
+    /// Historical logs and clients retain the pre-SUB-2 event spelling.
+    #[serde(rename = "GitCleaned")]
+    WorkspaceCleaned,
+    #[serde(rename = "GitConflicted")]
+    WorkspaceConflicted,
     PolicyAdmitted,
     PolicyRejected,
     StandingRefAdvanced,
@@ -132,21 +138,21 @@ pub fn decide(state: &MergeState, command: MergeCommand) -> Result<Vec<MergeEven
     use MergePhase::*;
     match command {
         // Re-enters and resets the cycle: the merge is branch-vs-`main`,
-        // re-evaluated each turn. Only the transient `Merging` (git running) blocks.
+        // re-evaluated each turn. Only the transient `Merging` (substrate verdict pending) blocks.
         MergeCommand::StartMerge => match state.phase {
             Merging => reject("startMerge: a merge is already running"),
             _ => Ok(vec![MergeEvent::MergeStarted]),
         },
-        MergeCommand::GitClean => match state.phase {
-            Merging => Ok(vec![MergeEvent::GitCleaned]),
-            _ => reject("gitClean: not merging"),
+        MergeCommand::WorkspaceClean => match state.phase {
+            Merging => Ok(vec![MergeEvent::WorkspaceCleaned]),
+            _ => reject("workspaceClean: not merging"),
         },
-        MergeCommand::GitConflict => match state.phase {
-            Merging => Ok(vec![MergeEvent::GitConflicted]),
-            _ => reject("gitConflict: not merging"),
+        MergeCommand::WorkspaceConflict => match state.phase {
+            Merging => Ok(vec![MergeEvent::WorkspaceConflicted]),
+            _ => reject("workspaceConflict: not merging"),
         },
         MergeCommand::PolicyAdmit => {
-            if state.phase == Clean && state.git_outcome == GitOutcome::Success {
+            if state.phase == Clean && state.workspace_outcome == WorkspaceOutcome::Success {
                 Ok(vec![MergeEvent::PolicyAdmitted])
             } else {
                 reject("policyAdmit: not a clean merge awaiting review")
@@ -159,12 +165,12 @@ pub fn decide(state: &MergeState, command: MergeCommand) -> Result<Vec<MergeEven
         // STANDING_ADVANCE_REQUIRES_GIT_AND_POLICY + idempotent (≤ once).
         MergeCommand::AdvanceStandingRef => {
             let gated = state.phase == Clean
-                && state.git_outcome == GitOutcome::Success
+                && state.workspace_outcome == WorkspaceOutcome::Success
                 && state.policy_outcome == PolicyOutcome::Admitted;
             if gated && state.standing_advance_count == 0 {
                 Ok(vec![MergeEvent::StandingRefAdvanced])
             } else {
-                reject("advanceStandingRef: needs clean git + admitted policy, once")
+                reject("advanceStandingRef: needs clean workspace + admitted policy, once")
             }
         }
         MergeCommand::SubmitRepair => {
@@ -212,13 +218,13 @@ pub fn evolve(state: &MergeState, event: MergeEvent) -> MergeState {
                 ..MergeState::default()
             };
         }
-        MergeEvent::GitCleaned => {
+        MergeEvent::WorkspaceCleaned => {
             s.phase = P::Clean;
-            s.git_outcome = GitOutcome::Success;
+            s.workspace_outcome = WorkspaceOutcome::Success;
         }
-        MergeEvent::GitConflicted => {
+        MergeEvent::WorkspaceConflicted => {
             s.phase = P::Rejected;
-            s.git_outcome = GitOutcome::Conflict;
+            s.workspace_outcome = WorkspaceOutcome::Conflict;
             s.candidate_preserved = true;
             s.repair_context_created = true;
             s.thread_state = ThreadState::Isolated;
@@ -243,7 +249,7 @@ pub fn evolve(state: &MergeState, event: MergeEvent) -> MergeState {
         }
         MergeEvent::RepairRetried(key) => {
             s.retry_keys_used.insert(key);
-            s.git_outcome = GitOutcome::Success;
+            s.workspace_outcome = WorkspaceOutcome::Success;
             s.policy_outcome = PolicyOutcome::Admitted;
             s.standing_advanced = true;
             s.standing_advance_count += 1;
@@ -286,7 +292,7 @@ mod tests {
         use MergeCommand::*;
         let s = MergeState::default();
         let s = apply(&s, StartMerge);
-        let s = apply(&s, GitClean);
+        let s = apply(&s, WorkspaceClean);
         let s = apply(&s, PolicyAdmit);
         let s = apply(&s, AdvanceStandingRef);
         assert_eq!(s.phase, MergePhase::Advanced);
@@ -298,7 +304,7 @@ mod tests {
         use MergeCommand::*;
         let s = MergeState::default();
         let s = apply(&s, StartMerge);
-        let s = apply(&s, GitConflict);
+        let s = apply(&s, WorkspaceConflict);
         assert_eq!(s.phase, MergePhase::Rejected);
         assert!(s.candidate_preserved && s.thread_state == ThreadState::Isolated);
         let s = apply(&s, SubmitRepair);
@@ -312,7 +318,7 @@ mod tests {
         use MergeCommand::*;
         let s = MergeState::default();
         let s = apply(&s, StartMerge);
-        let s = apply(&s, GitClean);
+        let s = apply(&s, WorkspaceClean);
         let s = apply(&s, PolicyReject);
         assert_eq!(s.phase, MergePhase::Rejected);
         assert!(!s.standing_advanced && s.thread_state == ThreadState::Isolated);
@@ -323,8 +329,8 @@ mod tests {
         let key = prop_oneof![Just("k1".to_string()), Just("k2".to_string())];
         prop_oneof![
             Just(StartMerge),
-            Just(GitClean),
-            Just(GitConflict),
+            Just(WorkspaceClean),
+            Just(WorkspaceConflict),
             Just(PolicyAdmit),
             Just(PolicyReject),
             Just(AdvanceStandingRef),
@@ -344,7 +350,7 @@ mod tests {
                 s = apply(&s, c);
                 // STANDING_ADVANCE_REQUIRES_GIT_AND_POLICY
                 if s.standing_advanced {
-                    prop_assert_eq!(s.git_outcome, GitOutcome::Success);
+                    prop_assert_eq!(s.workspace_outcome, WorkspaceOutcome::Success);
                     prop_assert_eq!(s.policy_outcome, PolicyOutcome::Admitted);
                 }
                 // REJECTED_MERGE_PRESERVES_REPAIR_BASIS

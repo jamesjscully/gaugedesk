@@ -11,3 +11,4 @@ export * from "./control-plane-workbench";
 export * from "./project-home";
 export * from "./fork-tree";
 export * from "./projection-carriage";
+export * from "./remote-control-plane";

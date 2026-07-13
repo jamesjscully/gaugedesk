@@ -13,6 +13,8 @@ export interface SettingsMenuApi extends AccountPanelApi, DevicesModalApi {}
 export function SettingsMenu(props: {
     api: SettingsMenuApi;
     environment?: string;
+    /** Whether this runtime can complete the local Codex OAuth helper flow. */
+    codexLoginAvailable?: boolean;
     /** A monotonically increasing counter; each increment opens the Account panel.
      *  Lets another surface (e.g. an in-chat "no model" prompt) open settings. */
     openAccount?: Accessor<number>;
@@ -121,7 +123,11 @@ export function SettingsMenu(props: {
             </Show>
 
             <Show when={accountOpen()}>
-                <AccountPanel api={props.api} onClose={() => setAccountOpen(false)} />
+                <AccountPanel
+                    api={props.api}
+                    codexLoginAvailable={props.codexLoginAvailable}
+                    onClose={() => setAccountOpen(false)}
+                />
             </Show>
         </div>
     );

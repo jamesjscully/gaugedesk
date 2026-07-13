@@ -7,7 +7,7 @@
 //!
 //! Relocation is a two-phase commit over an unreliable link: ship the relocation
 //! **state**, then flip home. The relocation state is the full append-only **log**
-//! *and* the project's **content bytes** (its instances' git object graphs — the bytes
+//! *and* the project's **content bytes** (its instances' versioned-workspace exports — the bytes
 //! behind every relocated handle). The reducer encodes the safe ordering so that, in
 //! every reachable state:
 //! - `EXACTLY_ONE_HOME` — exactly one authority is home; never two (split-brain),
@@ -70,7 +70,7 @@ pub struct HandoffState {
     pub home: Home,
     /// The target has received the full append-only log.
     pub target_has_log: bool,
-    /// The target has received the project's content bytes (its instances' git object
+    /// The target has received the project's content bytes (its instances' workspace
     /// graphs — the bytes behind every relocated handle).
     pub target_has_content: bool,
     /// True once committed — used to assert commit terminality.

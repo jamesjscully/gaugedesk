@@ -8,29 +8,25 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use gaugewright_harness::{CredentialProbe, Harness, HarnessFactory, HarnessSpec};
-use gaugewright_pi_bridge::{PiHarnessFactory, ScriptedTransport};
+use gaugewright_harness::testing::{ScriptedHarness, ScriptedToolCall, ScriptedTurn};
+use gaugewright_harness::{CredentialProbe, Harness, HarnessFactory, HarnessSpec, Observation};
+use gaugewright_whip_runtime::WhipHarnessFactory;
 
 /// Select the factory for ONE turn. Consulted per turn, never cached at
-/// startup: tests flip `GAUGEWRIGHT_FAKE_AGENT` against a live workbench (the
-/// `fake_agent_env` guard), so the selection must track the env var turn by
-/// turn. `GAUGEWRIGHT_FAKE_AGENT` selects the scripted fake; otherwise the real
-/// Pi adapter runs. (A richer harness-kind selection policy is parked to
-/// SUB-1.)
-pub fn factory_for_turn() -> Arc<dyn HarnessFactory> {
+/// startup: tests flip `GAUGEWRIGHT_FAKE_AGENT` against a live workbench. The
+/// fake stays deterministic; every real local turn targets WhippleScript.
+pub fn factory_for_turn(whip: WhipHarnessFactory) -> Arc<dyn HarnessFactory> {
     if std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_ok() {
         Arc::new(ScriptedFakeFactory)
     } else {
-        Arc::new(PiHarnessFactory)
+        Arc::new(whip)
     }
 }
 
-/// The mock-LLM adapter (`GAUGEWRIGHT_FAKE_AGENT`): no Pi spawn, no model call.
-/// A fresh [`ScriptedTransport`] replays the canned Pi wire lines through the
-/// real streaming pipeline (membrane + reducers unchanged) every turn. The
-/// fixture stays deliberately Pi-shaped — swapping in a neutral scripted
-/// harness would risk transcript drift across the e2e suite, so that swap is
-/// SUB-1.
+/// The mock-LLM adapter (`GAUGEWRIGHT_FAKE_AGENT`): no runtime, no model call.
+/// A fresh neutral [`ScriptedHarness`] projects deterministic observations and
+/// tool calls through the real membrane every turn. No WhippleScript runtime or
+/// provider credential participates in the fake path (SUB-1).
 pub struct ScriptedFakeFactory;
 
 impl ScriptedFakeFactory {
@@ -54,6 +50,12 @@ impl ScriptedFakeFactory {
         if task.contains("[slow]") {
             std::thread::sleep(std::time::Duration::from_millis(3500));
         }
+        // A `[no-write]` task skips the note append — the deterministic **no-op
+        // turn** (a settled turn with an empty diff), so tests can drive the
+        // ATTN-1 auto-advance rule the same way `[slow]` drives the busy state.
+        if task.contains("[no-write]") {
+            return Ok(());
+        }
         let note = worktree.join("agent-note.txt");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -70,11 +72,13 @@ impl HarnessFactory for ScriptedFakeFactory {
         Self::KIND
     }
 
-    /// A fresh transport over the canned wire lines; the spec is ignored (the
-    /// fake needs no runtime config — its worktree side effects run in
+    /// A fresh neutral script; the spec is ignored (the fake needs no runtime
+    /// config — its worktree side effects run in
     /// [`Self::pre_turn`], outside the workbench lock).
     fn create(&self, _spec: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
-        Ok(Box::new(ScriptedTransport::new(fake_turn_lines())))
+        Ok(Box::new(ScriptedHarness::from_neutral_turns(vec![
+            fake_turn(),
+        ])))
     }
 
     /// Never cached: a scripted transport is one-shot, so caching it across
@@ -90,24 +94,39 @@ impl HarnessFactory for ScriptedFakeFactory {
     fn credential_status(
         &self,
         _provider: &str,
-        _resolved_envs: &[(String, String)],
+        _capability: Option<&dyn gaugewright_harness::CredentialCapability>,
     ) -> CredentialProbe {
         CredentialProbe::Ready
     }
 }
 
-/// The canned Pi event stream for the mock-LLM turn: a streamed text token, a
-/// `write` tool call (in-workspace), a `bash` tool call (so the membrane has an
-/// effect to rule on — mediated by default, blocked when policy blocks it),
-/// end-of-turn, and the final assistant text.
-fn fake_turn_lines() -> Vec<String> {
-    vec![
-        r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Wrote agent-note.txt."}}"#.into(),
-        r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"write","args":{"path":"agent-note.txt"}}"#.into(),
-        r#"{"type":"tool_execution_end","toolCallId":"t1","result":"wrote 1 file","isError":false}"#.into(),
-        r#"{"type":"tool_execution_start","toolCallId":"t2","toolName":"bash","args":{"command":"echo hi"}}"#.into(),
-        r#"{"type":"tool_execution_end","toolCallId":"t2","isError":false}"#.into(),
-        r#"{"type":"agent_end","messages":[]}"#.into(),
-        r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"Wrote agent-note.txt."}}"#.into(),
-    ]
+/// The neutral mock-LLM turn: one text observation, an in-workspace `write`,
+/// and a `bash` request for the membrane to allow/block/stage from real policy.
+fn fake_turn() -> ScriptedTurn {
+    ScriptedTurn {
+        assistant_text: "Wrote agent-note.txt.".into(),
+        observations: vec![Observation {
+            kind: "text",
+            detail: "Wrote agent-note.txt.".into(),
+            tool: None,
+        }],
+        tool_calls: vec![
+            ScriptedToolCall {
+                name: "write".into(),
+                call_id: "t1".into(),
+                target: Some("agent-note.txt".into()),
+                args: r#"{"path":"agent-note.txt"}"#.into(),
+                result: Some("wrote 1 file".into()),
+                ok: true,
+            },
+            ScriptedToolCall {
+                name: "bash".into(),
+                call_id: "t2".into(),
+                target: Some("echo hi".into()),
+                args: r#"{"command":"echo hi"}"#.into(),
+                result: None,
+                ok: true,
+            },
+        ],
+    }
 }

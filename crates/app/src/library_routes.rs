@@ -4,9 +4,8 @@
 //! creating a chat creates a worktree in the right instance and seeds its
 //! `.agent-config.json` from the agent's config.
 //!
-//! Delete is a **cascade** with one hard ordering rule: shut a chat's Pi session
-//! down **before** touching its worktree on disk, or the child process holds a
-//! deleted dir open.
+//! Delete is a **cascade** with one hard ordering rule: retire a chat's runtime
+//! session **before** touching its worktree on disk.
 
 use axum::{
     extract::{Path, Query, State},
@@ -21,7 +20,7 @@ use crate::library::{gen_id, ProjectRecord, RecordOp};
 use crate::library_state::{
     AgentDeleteError, BindPlacementError, BoundaryAcceptError, BoundaryAttestationInput,
     CreateArchetypeChatError, CreateArchetypeError, ForkArchetypeError, ForkChatError,
-    PullArchetypeError, UpgradePlacementError,
+    PublishArchetypeError, PullArchetypeError, UpgradePlacementError,
 };
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT};
 use gaugewright_store::AdmitError;
@@ -176,8 +175,8 @@ pub struct ForkArchetype {
     pub name: Option<String>,
 }
 
-/// Fork an archetype (ADR 0035/0038): copy its **method** (the Pi-native definition
-/// surface — `.pi/**`, `AGENTS.md`, …) and configuration into a fresh, independent
+/// Fork an archetype (ADR 0035/0038): copy its authored WhippleScript package
+/// history and GaugeDesk runtime selection into a fresh, independent
 /// archetype. Editing the fork never touches the source.
 ///
 /// **Owner-only.** Solo, the user owns every archetype, so this is always allowed;
@@ -292,7 +291,7 @@ pub async fn update_agent(
     Json(body): Json<UpdateAgent>,
 ) -> impl IntoResponse {
     if let Some(cfg) = &body.config {
-        if let Err(e) = gaugewright_boundary::AgentConfig::from_json(cfg) {
+        if let Err(e) = gaugewright_boundary::AgentConfig::runtime_settings_from_json(cfg) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("invalid agent config: {e}") })),
@@ -390,6 +389,7 @@ pub async fn create_project(
             name: body.name.clone(),
             is_default: false,
             network_isolated: false,
+            run_purpose: None,
             deployment_mode: None,
         },
     );
@@ -425,6 +425,20 @@ pub struct UpdateProject {
     /// the consultant declares as the engagement boundary ceiling. Omitted ⇒ unchanged.
     #[serde(default)]
     pub deployment_mode: Option<gaugewright_core::boundary_lifecycle::Placement>,
+    /// Business purpose admitted for runs in this project. Omitted means
+    /// unchanged; `null` revokes it; purpose-tagged resources fail closed when
+    /// none is set.
+    #[serde(default, deserialize_with = "deserialize_present_run_purpose")]
+    pub run_purpose: Option<Option<String>>,
+}
+
+fn deserialize_present_run_purpose<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 pub async fn update_project(
@@ -433,9 +447,13 @@ pub async fn update_project(
     Json(body): Json<UpdateProject>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let Some(updated) =
-        wb.update_project_record(&id, body.name, body.network_isolated, body.deployment_mode)
-    else {
+    let Some(updated) = wb.update_project_record(
+        &id,
+        body.name,
+        body.network_isolated,
+        body.deployment_mode,
+        body.run_purpose,
+    ) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such project" })),
@@ -449,6 +467,7 @@ pub async fn update_project(
             "name": updated.name,
             "network_isolated": updated.network_isolated,
             "deployment_mode": updated.deployment_mode,
+            "run_purpose": updated.run_purpose,
         })),
     )
         .into_response()
@@ -558,16 +577,24 @@ pub async fn post_publish_archetype(
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     match wb.publish_archetype_version(&id, body.auto_upgrade) {
-        Some((new_version, auto_upgraded)) => (
+        Ok((new_version, auto_upgraded)) => (
             StatusCode::OK,
             Json(json!({ "version": new_version, "auto_upgraded": auto_upgraded })),
         )
             .into_response(),
-        None => (
+        Err(PublishArchetypeError::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such archetype" })),
         )
             .into_response(),
+        Err(PublishArchetypeError::InvalidPackage(error)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": format!("invalid WhippleScript package: {error}") })),
+        )
+            .into_response(),
+        Err(PublishArchetypeError::Workspace(error)) => {
+            (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response()
+        }
     }
 }
 
@@ -611,6 +638,21 @@ pub async fn post_upgrade_placement(
         Err(UpgradePlacementError::ArchetypeNotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such archetype" })),
+        )
+            .into_response(),
+        Err(UpgradePlacementError::PackageUnavailable(error)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+        Err(UpgradePlacementError::Conflict) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "the placement conflicts with this package upgrade" })),
+        )
+            .into_response(),
+        Err(UpgradePlacementError::Workspace(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
         )
             .into_response(),
     }
@@ -710,8 +752,8 @@ pub async fn use_archetype(
 
 /// Fork a chat (ADR 0038): **clone the whole thread** into a new chat rooted on the
 /// **same** placement/archetype and kind, recording `forked_from`. The fork's worktree
-/// inherits the parent's files, and its Pi session is a copy of the parent's managed
-/// `<worktree>.pisession` — so the fork's agent remembers the parent's conversation.
+/// inherits the parent's files, and WhippleScript seeds a distinct target instance
+/// from the parent's exact durable thread position.
 pub async fn fork_chat(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
@@ -740,6 +782,11 @@ pub async fn fork_chat(
             .into_response(),
         Err(ForkChatError::Create(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+        Err(ForkChatError::Continuity(e)) => (
+            StatusCode::CONFLICT,
             Json(json!({ "error": e })),
         )
             .into_response(),
@@ -1042,6 +1089,7 @@ mod tests {
     //! These exercise only open routes (`/boundaries/*`, `/pairing-*`), so they
     //! compose the open control plane; the attested **operator** surface tests
     //! live with `gaugewright-cloud-attestation` (SPLIT-1).
+    use super::UpdateProject;
     use crate::{open_control_plane, Workbench, LOCAL_AUTHORITY};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1058,6 +1106,16 @@ mod tests {
     const PARTICIPANT_B: &str = "B";
     const MEASUREMENT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NONCE: &str = "challenge-1";
+
+    #[test]
+    fn project_run_purpose_distinguishes_omission_set_and_revocation() {
+        let omitted: UpdateProject = serde_json::from_str("{}").unwrap();
+        let set: UpdateProject = serde_json::from_str(r#"{"run_purpose":"support"}"#).unwrap();
+        let revoked: UpdateProject = serde_json::from_str(r#"{"run_purpose":null}"#).unwrap();
+        assert_eq!(omitted.run_purpose, None);
+        assert_eq!(set.run_purpose, Some(Some("support".to_owned())));
+        assert_eq!(revoked.run_purpose, Some(None));
+    }
 
     /// A router whose store has a boundary at `BID` proposed for {A,B} and
     /// ceiling-declared with the given attestation posture. The operator has

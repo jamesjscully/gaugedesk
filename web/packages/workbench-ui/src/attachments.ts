@@ -1,10 +1,10 @@
 /**
  * Message attachments (UX-14): the pure core behind the composer's paperclip.
  *
- * A picked file is either a **native image** (sent to Pi as an image content block),
+ * A picked file is either a **native image** (sent as a WhippleScript resource),
  * an **inline-able text file** (folded into the prompt text), or **not yet supported**
  * (PDF/Office/binary — `classifyAttachment` returns "unsupported"). `buildOutgoing`
- * assembles the turn the way Pi consumes it: text inlined into `message`, images in
+ * assembles the neutral turn shape: text inlined into `message`, images in
  * `images[]`, and only a byte-free `[attached image: …]` note left in the durable
  * text so the transcript is honest while base64 never enters the log (`INV-10`).
  *
@@ -22,7 +22,7 @@ export type Attachment =
     | { kind: "text"; name: string; text: string }
     | { kind: "image"; name: string; mimeType: string; data: string };
 
-/** Image types Pi accepts natively over RPC (`utils/clipboard-image.js`). */
+/** Image types the current WhippleScript host resource accepts natively. */
 export const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 /** Textual `application/*` mimes worth inlining. Matched EXACTLY — a substring test
@@ -53,7 +53,7 @@ export function classifyAttachment(f: { type: string; name: string }): "image" |
     return "unsupported";
 }
 
-/** Read a file's bytes as base64 (no data-URL prefix) — the shape Pi's ImageContent
+/** Read a file's bytes as base64 (no data-URL prefix) — the neutral `ImageContent`
  *  wants. Chunked so a large image doesn't blow `fromCharCode`'s argument stack. */
 export async function fileToBase64(f: Blob): Promise<string> {
     const bytes = new Uint8Array(await f.arrayBuffer());

@@ -29,7 +29,7 @@ describe("chat-model config IO", () => {
         expect(out.network).toBe("open"); // untouched
     });
 
-    it("writes the thinking level; empty clears it (Pi default), 'off' is stored", () => {
+    it("writes the reasoning level; empty clears it (provider default), 'off' is stored", () => {
         expect(JSON.parse(writeChatThinking("{}", "high")).thinking).toBe("high");
         expect(JSON.parse(writeChatThinking("{}", "off")).thinking).toBe("off"); // explicit no-thinking
         expect(JSON.parse(writeChatThinking('{"thinking":"high","model":"x"}', "")).thinking).toBeUndefined();

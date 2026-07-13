@@ -17,7 +17,10 @@ use futures::Stream;
 use gaugewright_boundary::definition::CONFIG_PATH;
 use gaugewright_core::merge::{MergeCommand, MergeState};
 use gaugewright_store::Store;
-use gaugewright_workspace::{ChatWorkspace, FileEntry, MergeOutcome, WorkspaceError};
+use gaugewright_workspace::{
+    ChatWorkspace, FileEntry, MergeOutcome, MergePreview, RegionResolution, SaveBase,
+    SaveFileOutcome, WorkspaceError,
+};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -130,8 +133,7 @@ impl Workbench {
 
     pub(crate) fn set_live_engagement_target(&mut self, chat_id: &str, target: impl Into<String>) {
         if let Some(eng) = self.engagements.get_mut(chat_id) {
-            // The git impl's re-home cannot fail (AM-4: the Result channel exists
-            // for impls that must re-home fail-closed).
+            // Re-home is fail-closed at the provider seam (AM-4).
             let _ = eng.set_target(&target.into());
         }
     }
@@ -182,6 +184,18 @@ impl Workbench {
     ) -> Result<String, gaugewright_store::AdmitError> {
         self.store_ref()
             .records(id, "transcript")
+            .map(|rows| format!("[{}]", rows.join(",")))
+    }
+
+    /// The engagement's governance audit records (ADR 0082 §4: every
+    /// auto-advance is durable evidence citing the rule it matched — audit,
+    /// not conversation, so it reads from here rather than the transcript).
+    pub(crate) fn engagement_audit_json(
+        &self,
+        id: &str,
+    ) -> Result<String, gaugewright_store::AdmitError> {
+        self.store_ref()
+            .records(id, "audit")
             .map(|rows| format!("[{}]", rows.join(",")))
     }
 
@@ -238,6 +252,29 @@ impl Workbench {
         self.engagements.get(chat_id).map(|eng| eng.read_file(path))
     }
 
+    /// The engagement's current cut — minted on demand so what the reader
+    /// just saw is always an addressable save base (cut-on-read).
+    pub fn engagement_current_cut(
+        &self,
+        chat_id: &str,
+    ) -> Option<Result<Option<String>, WorkspaceError>> {
+        self.engagements.get(chat_id).map(|eng| eng.current_cut())
+    }
+
+    /// Read-only preview of what a base-carrying save would do (the live
+    /// fold): region memory applies exactly as it would on the save.
+    pub fn engagement_merge_preview(
+        &self,
+        chat_id: &str,
+        path: &str,
+        draft: &str,
+        base_cut: &str,
+    ) -> Option<Result<Option<MergePreview>, WorkspaceError>> {
+        self.engagements
+            .get(chat_id)
+            .map(|eng| eng.merge_preview(path, draft, base_cut))
+    }
+
     pub(crate) fn write_engagement_file(
         &mut self,
         chat_id: &str,
@@ -259,6 +296,102 @@ impl Workbench {
             self.publish(chat_id, ev);
         }
         Some(result)
+    }
+
+    /// Base-carrying editor save (SUB-6): the merge engine is whip's
+    /// token-level three-way; this layer commits accepted outcomes and
+    /// records the evidence. A merged save says so in the conversation
+    /// (the fact), while the piece-level provenance lands on the AUDIT
+    /// plane (ADR 0082 posture — rationale is evidence, not chat). A
+    /// conflicted save commits nothing and returns the fold payload.
+    pub(crate) fn save_engagement_file_with_base(
+        &mut self,
+        chat_id: &str,
+        path: &str,
+        draft: &str,
+        base: SaveBase<'_>,
+        resolutions: &[RegionResolution],
+    ) -> Option<Result<SaveFileOutcome, WorkspaceError>> {
+        let eng = self.engagements.get(chat_id)?;
+        let outcome = match eng.save_file_with_base(path, draft, base, resolutions) {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+        match &outcome {
+            SaveFileOutcome::Written { .. } | SaveFileOutcome::Merged { .. } => {
+                // The save IS the cut (whip minted it); no separate commit.
+                let merged = matches!(&outcome, SaveFileOutcome::Merged { .. });
+                let ev = ServerEvent::Admitted {
+                    kind: "edit".into(),
+                    text: if merged {
+                        format!("edited {path} (merged with concurrent changes)")
+                    } else {
+                        format!("edited {path}")
+                    },
+                };
+                let _ = self
+                    .store_mut()
+                    .append_record(chat_id, "transcript", &ev.to_json());
+                self.publish(chat_id, ev);
+                if let SaveFileOutcome::Merged { pieces, .. } = &outcome {
+                    let _ = self.store_mut().append_record(
+                        chat_id,
+                        "audit",
+                        &serde_json::json!({
+                            "kind": "save_merged",
+                            "path": path,
+                            "algorithm": "text-merge/1",
+                            "pieces": pieces,
+                        })
+                        .to_string(),
+                    );
+                }
+                if !resolutions.is_empty() {
+                    // Settled regions became durable resolution memory:
+                    // that's rationale-grade evidence (ADR 0082 posture).
+                    let _ = self.store_mut().append_record(
+                        chat_id,
+                        "audit",
+                        &serde_json::json!({
+                            "kind": "region_resolutions_recorded",
+                            "path": path,
+                            "count": resolutions.len(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+            SaveFileOutcome::Conflicted { .. } => {}
+        }
+        Some(Ok(outcome))
+    }
+
+    fn authorize_file_edit(&self, chat_id: &str, path: &str) -> Result<(), &'static str> {
+        let normalized = path.trim_start_matches("./");
+        if gaugewright_boundary::is_control_surface_path(normalized) {
+            return Err("GaugeDesk runtime settings must be changed through Settings");
+        }
+        if normalized.starts_with(".whipple/versions/")
+            || normalized.contains("/.whipple/versions/")
+        {
+            return Err("published WhippleScript package versions are immutable");
+        }
+        if gaugewright_boundary::is_method_surface_path(normalized) {
+            let chat = self
+                .library
+                .chats
+                .get(chat_id)
+                .ok_or("no such engagement")?;
+            let instance = self
+                .library
+                .instances
+                .get(&chat.instance_id)
+                .ok_or("chat instance is unavailable")?;
+            if instance.kind != crate::library::InstanceKind::Authoring {
+                return Err("work chats cannot edit their installed WhippleScript package");
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn engagement_merge_state(
@@ -497,16 +630,15 @@ pub(crate) async fn get_config(
         .into_response()
 }
 
-/// Agent authoring: write the engagement's `.agent-config.json`. The body is
-/// **parsed** into the policy model first (parse-don't-validate at the boundary);
-/// a malformed config is rejected rather than persisted.
+/// Write GaugeDesk-owned provider/model/thinking selection. Package capabilities
+/// and IFC policy are rejected here; they live in the authored package/envelope.
 pub(crate) async fn put_config(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
     body: String,
 ) -> impl IntoResponse {
-    // Validate by parsing into the boundary's policy model before writing.
-    if let Err(e) = gaugewright_boundary::AgentConfig::from_json(&body) {
+    // Validate the host-owned subset before writing.
+    if let Err(e) = gaugewright_boundary::AgentConfig::runtime_settings_from_json(&body) {
         return (
             StatusCode::BAD_REQUEST,
             format!("invalid agent config: {e}"),
@@ -533,6 +665,24 @@ pub(crate) async fn get_transcript(
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     match wb.engagement_transcript_json(&id) {
+        Ok(body) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+/// The governance audit trail (ADR 0082 §4): why `main` moved without a
+/// human — rule citations that deliberately do NOT appear in the user's
+/// transcript.
+pub(crate) async fn get_audit(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.engagement_audit_json(&id) {
         Ok(body) => (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
@@ -579,15 +729,51 @@ pub(crate) async fn get_file(
         return (StatusCode::NOT_FOUND, "no such engagement").into_response();
     };
     match content {
-        Ok(content) => (StatusCode::OK, content).into_response(),
+        Ok(content) => {
+            // The cut the reader is looking at, minted on demand — the
+            // addressable base a cut-carrying save sends back (§12).
+            // Best-effort: an unreadable cut degrades to a plain body.
+            let cut = wb
+                .engagement_current_cut(&id)
+                .and_then(|result| result.ok())
+                .flatten();
+            let mut response = (StatusCode::OK, content).into_response();
+            if let Some(cut) = cut {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&cut) {
+                    response.headers_mut().insert("x-workspace-cut", value);
+                }
+            }
+            response.into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
     }
 }
 
+/// The base-carrying save body (SUB-6). `base_cut` names the state the
+/// editor loaded (the GET's `x-workspace-cut`); `base_content` is the
+/// pre-cut client's fallback (the body it loaded, resolved server-side).
+/// `resolutions` are fold-settled regions riding a resolve re-save —
+/// they mint durable region memory. With neither base (or a non-JSON
+/// plain-text body), the save is the legacy unconditional write.
+#[derive(Deserialize)]
+pub(crate) struct SaveFileBody {
+    content: String,
+    base_content: Option<String>,
+    base_cut: Option<String>,
+    #[serde(default)]
+    resolutions: Vec<RegionResolution>,
+}
+
 /// Save a worktree file (the editor's Edit mode) and commit it — the human's edit
 /// is a contribution to the engagement thread that rides the merge. Each save is a
-/// commit on the engagement branch, so git is the file's durable version history
+/// cut on the engagement line, so the workspace is the file's durable version history
 /// (surfaced via the Diff / promote-to-main surface), not a parallel store.
+///
+/// With `{content, base_content}` JSON, the save is base-carrying: concurrent
+/// changes merge through whip's token-level engine; real divergence returns
+/// 409 with the structured regions (`pieces`) and the file's `current` body
+/// (the re-save base) — nothing is written. A plain-text body (or JSON
+/// without `base_content`) keeps the legacy last-writer-wins behavior.
 pub(crate) async fn put_file(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
@@ -595,11 +781,123 @@ pub(crate) async fn put_file(
     body: String,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let Some(result) = wb.write_engagement_file(&id, &q.path, &body) else {
+    if let Err(reason) = wb.authorize_file_edit(&id, &q.path) {
+        return (StatusCode::FORBIDDEN, reason).into_response();
+    }
+    let parsed: Option<SaveFileBody> = serde_json::from_str(&body).ok();
+    let Some(SaveFileBody {
+        content,
+        base_content,
+        base_cut,
+        resolutions,
+    }) = parsed
+    else {
+        // Plain-text body: the legacy unconditional write.
+        let Some(result) = wb.write_engagement_file(&id, &q.path, &body) else {
+            return (StatusCode::NOT_FOUND, "no such engagement").into_response();
+        };
+        return match result {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "saved": true }))).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        };
+    };
+    let base = match (&base_cut, &base_content) {
+        (Some(cut), _) => Some(SaveBase::Cut(cut)),
+        (None, Some(body)) => Some(SaveBase::Content(body)),
+        (None, None) => None,
+    };
+    let Some(base) = base else {
+        let Some(result) = wb.write_engagement_file(&id, &q.path, &content) else {
+            return (StatusCode::NOT_FOUND, "no such engagement").into_response();
+        };
+        return match result {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "saved": true }))).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        };
+    };
+    let Some(result) =
+        wb.save_engagement_file_with_base(&id, &q.path, &content, base, &resolutions)
+    else {
         return (StatusCode::NOT_FOUND, "no such engagement").into_response();
     };
     match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "saved": true }))).into_response(),
+        Ok(SaveFileOutcome::Written { cut }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "saved": true, "cut": cut })),
+        )
+            .into_response(),
+        Ok(SaveFileOutcome::Merged {
+            cut,
+            content,
+            pieces,
+        }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "saved": true,
+                "merged": true,
+                "cut": cut,
+                "content": content,
+                "pieces": pieces,
+            })),
+        )
+            .into_response(),
+        Ok(SaveFileOutcome::Conflicted {
+            current,
+            current_cut,
+            pieces,
+        }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "conflict": true,
+                "current": current,
+                "current_cut": current_cut,
+                "pieces": pieces,
+            })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+/// The live fold's read-only twin (§12.3): what WOULD this draft do
+/// against the file as it stands? Nothing moves; region memory applies
+/// exactly as a save would apply it.
+#[derive(Deserialize)]
+pub(crate) struct MergePreviewBody {
+    path: String,
+    draft: String,
+    base_cut: String,
+}
+
+pub(crate) async fn post_merge_preview(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<MergePreviewBody>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let Some(result) = wb.engagement_merge_preview(&id, &body.path, &body.draft, &body.base_cut)
+    else {
+        return (StatusCode::NOT_FOUND, "no such engagement").into_response();
+    };
+    match result {
+        Ok(Some(preview)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "known_base": true,
+                "clean": preview.clean,
+                "merged": preview.merged,
+                "current_cut": preview.current_cut,
+                "pieces": preview.pieces,
+            })),
+        )
+            .into_response(),
+        // An unknown base cut is an honest miss (stale tab, foreign
+        // history): the client reloads rather than trusting a fold.
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "known_base": false })),
+        )
+            .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
     }
 }
@@ -690,18 +988,19 @@ pub(crate) async fn workspace_events(
 #[derive(Deserialize)]
 pub(crate) struct TaskBody {
     prompt: String,
-    /// Native image content blocks attached to this message (UX-14). Sent to Pi as
-    /// model input; never recorded in the durable transcript. Absent ⇒ a text turn.
+    /// Native image content blocks attached to this message (UX-14). Resolved by
+    /// WhippleScript as message-scoped model input; never recorded in the durable
+    /// transcript. Absent ⇒ a text turn.
     #[serde(default)]
     images: Vec<gaugewright_harness::ImageContent>,
 }
 
-/// Task an engagement: drive one real Pi turn in its worktree, streaming the
-/// operational events live (SSE) and returning the diff + output. Effects route
-/// through the membrane (`.agent-config.json` policy + the gaugewright Pi plugin).
+/// Task an engagement: drive one governed WhippleScript turn in its worktree,
+/// streaming operational events live (SSE) and returning the diff + output.
 pub(crate) async fn post_task(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     Json(body): Json<TaskBody>,
 ) -> impl IntoResponse {
     // Brief lock: confirm the engagement and grab its worktree, live sender, mode.
@@ -716,9 +1015,21 @@ pub(crate) async fn post_task(
     let wb2 = wb.clone();
     let task = body.prompt;
     let images = body.images;
+    let actor = actor.map(|axum::extract::Extension(actor)| actor.0);
     let id2 = id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        engine::run_engagement_turn(&wb2, &id2, &worktree, &sender, &task, &images, mode)
+        engine::run_engagement_turn(
+            &wb2,
+            &id2,
+            &worktree,
+            &sender,
+            engine::EngagementTurnInput {
+                task: &task,
+                images: &images,
+                mode,
+                authenticated_actor: actor.as_ref(),
+            },
+        )
     })
     .await;
 
@@ -769,10 +1080,9 @@ pub(crate) async fn post_stop(
 ) -> impl IntoResponse {
     match engine::running_turn_interrupt(&id) {
         Some(interrupt) => {
-            // The handle was captured at turn start (the default is `kill -KILL`
-            // on the runtime's pid — SIGKILL is reliable, Pi may ignore TERM
-            // mid-stream). The on-disk session persists, so only the in-memory
-            // turn is aborted.
+            // The handle was captured at turn start. WhippleScript records a
+            // cooperative cancellation request on an independent store
+            // connection, so durable thread state survives the interrupted turn.
             interrupt();
             (StatusCode::OK, Json(serde_json::json!({ "stopped": true }))).into_response()
         }

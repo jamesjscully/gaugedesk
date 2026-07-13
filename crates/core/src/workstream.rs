@@ -5,7 +5,7 @@
 //!
 //! This reducer owns only the part the per-contribution [`merge`](crate::merge) does not
 //! know about: the stream as a shared object, and its **membership** (which chats target
-//! it). The gated ref-advance itself is delegated to `merge.rs` (a clean-git + admitted-
+//! it). The gated line advance itself is delegated to `merge.rs` (a clean-workspace + admitted-
 //! policy advance, auto-admitted in-stream by the shell); the boundary-gated promotion to
 //! the placement mainline is `merge.rs`'s `advanced → integrated` hop; and the single-home
 //! guarantee is inherited from [`handoff`](crate::handoff) (`EXACTLY_ONE_HOME`).
@@ -19,7 +19,7 @@
 //!   ref never advances again (no member exists to contribute).
 //!
 //! `Contribute` is the admitted spine for the greedy auto-sync advance: the shell asks
-//! this reducer "may chat C advance stream S's main?" before doing the git push, so the
+//! this reducer "may chat C advance stream S's main?" before advancing the workspace line, so the
 //! decision to advance a standing ref is an admitted event (`INV-2`/`INV-4`), and the
 //! emitted `ContributionAdmitted { chat, by }` carries the driving authority — the
 //! attribution that makes a federated workstream's history legible (`WS-G`).

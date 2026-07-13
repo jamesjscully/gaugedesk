@@ -137,8 +137,8 @@ export async function unlinkProjectCredential(
     );
 }
 
-/** Codex OAuth (LLM-1, ADR 0062): whether a codex credential is present in Pi's
- *  store and until when (the token itself is never returned). */
+/** Codex OAuth (LLM-1, ADR 0062): whether a credential is present in
+ *  GaugeDesk's sealed account store and until when (the token is never returned). */
 export async function codexStatus(
     json: RouteJson,
 ): Promise<{ linked: boolean; expires: number | null; expired: boolean }> {
@@ -157,6 +157,19 @@ export async function codexStatus(
 export async function onboardingStatus(json: RouteJson): Promise<{ credentialRequired: boolean }> {
     const o = (await json("GET", "/account/onboarding-status")) as { credential_required?: boolean };
     return { credentialRequired: o.credential_required !== false };
+}
+
+/** The model a turn runs when the chat pins nothing (LLM-1): the engine's resolved
+ *  no-pin default. `model` is null when the resolved provider has no default model
+ *  (it then requires an explicit pin). Lets the picker name its "Default" row. */
+export async function defaultModel(
+    json: RouteJson,
+): Promise<{ provider: string; model: string | null }> {
+    const o = (await json("GET", "/account/default-model")) as {
+        provider?: string;
+        model?: string | null;
+    };
+    return { provider: o.provider ?? "", model: o.model ?? null };
 }
 
 /** Start the codex OAuth link; returns the authorize URL to open in a browser. The

@@ -7,11 +7,25 @@
  * link a provider, but the token is never read back (sealed server-side, SEC-4).
  */
 
-import { createResource, createSignal, For, Show, type JSX } from "solid-js";
+import { createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import type {
     AccountDevice,
     LinkedProvider,
 } from "@gaugewright/control-plane-client";
+import {
+    ADVANCEMENT_RULES_SETTING,
+    parseAdvancementScopes,
+    serializeAdvancementScopes,
+} from "./advancement";
+import {
+    ATTENTION_RULES_SETTING,
+    ATTENTION_SIGNALS,
+    parseAttentionRules,
+    serializeAttentionRules,
+    type AttentionLevel,
+    type AttentionSignal,
+} from "./attention";
+import { waitForCodexLink } from "./codex-link-poll";
 import {
     defaultVisibleKeys,
     ENABLED_MODELS_SETTING,
@@ -35,15 +49,20 @@ export interface AccountPanelApi {
     accountSetSetting(key: string, value: string): Promise<void>;
 }
 
-export function AccountPanel(props: { api: AccountPanelApi; onClose: () => void }): JSX.Element {
+export function AccountPanel(props: {
+    api: AccountPanelApi;
+    /** Whether this runtime can complete the local Codex OAuth helper flow. */
+    codexLoginAvailable?: boolean;
+    onClose: () => void;
+}): JSX.Element {
     const [tick, setTick] = createSignal(0);
     const refresh = () => setTick((t) => t + 1);
     const [status, setStatus] = createSignal("");
 
     const [credentials] = createResource(tick, () => props.api.accountCredentials());
     const [devices] = createResource(tick, () => props.api.accountDevices());
-    // Codex OAuth (LLM-1, ADR 0062): presence + expiry of the codex credential in Pi's
-    // store (the engine's default provider). `authUrl` holds the link as a manual
+    // Codex OAuth (LLM-1, ADR 0062): presence + expiry in GaugeDesk's sealed
+    // account store. `authUrl` holds the link as a manual
     // fallback if the popup is blocked.
     const [codex] = createResource(tick, () => props.api.codexStatus());
     const [authUrl, setAuthUrl] = createSignal("");
@@ -51,16 +70,46 @@ export function AccountPanel(props: { api: AccountPanelApi; onClose: () => void 
         const e = codex()?.expires;
         return e ? new Date(e).toLocaleDateString() : null;
     };
+    // The sign-in finishes in an external tab and the credential lands server-side,
+    // so after starting it we poll the status projection and update on our own —
+    // the manual refresh link stays only as the fallback for a very slow flow.
+    let disposed = false;
+    onCleanup(() => {
+        disposed = true;
+    });
+    let watchingLink = false;
     const linkCodex = async () => {
         setStatus("starting OpenAI sign-in…");
         setAuthUrl("");
+        // A re-sign-in starts with the old credential still linked, so completion
+        // is "the expiry changed", not "a credential exists" — baseline it here.
+        const baselineExpires = codex()?.expires ?? null;
         try {
             const { url } = await props.api.codexLoginStart();
             setAuthUrl(url);
             window.open(url, "_blank", "noopener,noreferrer");
-            setStatus("Finish the OpenAI sign-in in your browser, then Refresh.");
+            setStatus("finish the OpenAI sign-in in your browser — this panel updates by itself");
         } catch (e) {
             setStatus(`could not start sign-in: ${e instanceof Error ? e.message : String(e)}`);
+            return;
+        }
+        if (watchingLink) return; // a prior click's watcher is already at it
+        watchingLink = true;
+        try {
+            const linked = await waitForCodexLink(() => props.api.codexStatus(), {
+                baselineExpires,
+                cancelled: () => disposed,
+            });
+            if (disposed) return;
+            if (linked) {
+                setAuthUrl("");
+                setStatus("signed in ✓");
+                refresh();
+            } else {
+                setStatus("couldn't confirm the sign-in — finish it in the browser, then use refresh");
+            }
+        } finally {
+            watchingLink = false;
         }
     };
 
@@ -128,6 +177,45 @@ export function AccountPanel(props: { api: AccountPanelApi; onClose: () => void 
         }
     }
 
+    // --- advancement (ATTN-3, ADR 0082 §4): what auto-keeps without review ------------
+    // One comma-separated scopes field editing the single writes-within rule. Empty =
+    // everything holds (fail-closed). The unwaivable guards (config touch, external
+    // reads) live server-side and are stated, not configurable.
+    const advancementScopes = () =>
+        parseAdvancementScopes(modelSettings()?.[ADVANCEMENT_RULES_SETTING]).join(", ");
+    const [scopesDraft, setScopesDraft] = createSignal<string | null>(null);
+    async function saveAdvancementScopes() {
+        const draft = scopesDraft();
+        if (draft === null) return;
+        const scopes = draft.split(",").map((s) => s.trim()).filter(Boolean);
+        try {
+            await props.api.accountSetSetting(
+                ADVANCEMENT_RULES_SETTING,
+                serializeAdvancementScopes(scopes),
+            );
+            setScopesDraft(null);
+            refetchModelSettings();
+            setStatus(scopes.length ? "auto-keep scopes saved" : "auto-keep off — everything holds for review");
+        } catch (e) {
+            setStatus(`could not update auto-keep — ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+
+    // --- attention (ATTN-2, ADR 0082 §3): when a chat should ask for you --------------
+    // One row per signal, rendered from the shared schema; each change writes the
+    // whole (shallow) rules doc back to the account-settings KV the server's
+    // task-queue projection evaluates.
+    const attention = () => parseAttentionRules(modelSettings()?.[ATTENTION_RULES_SETTING]);
+    async function setAttention(signal: AttentionSignal, level: AttentionLevel) {
+        const next = { ...attention(), [signal]: level };
+        try {
+            await props.api.accountSetSetting(ATTENTION_RULES_SETTING, serializeAttentionRules(next));
+            refetchModelSettings();
+        } catch (e) {
+            setStatus(`could not update attention — ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+
     return (
         <div class="modal-overlay" onClick={() => props.onClose()}>
             <div
@@ -143,41 +231,43 @@ export function AccountPanel(props: { api: AccountPanelApi; onClose: () => void 
                     </button>
                 </div>
 
-                {/* OpenAI codex OAuth (LLM-1): the one-click sign-in for the default
-                    provider — the credential lands in Pi's own store, used by real turns. */}
-                <section class="admin-section" data-codex-oauth>
-                    <h4>OpenAI sign-in (codex)</h4>
-                    <p class="muted">
-                        Sign in with your OpenAI account so the agent can run on the codex
-                        endpoint — the default. No API key needed.
-                    </p>
-                    <div class="member-row" data-codex-status={codex()?.linked ? (codex()?.expired ? "expired" : "linked") : "none"}>
-                        <span>
-                            {codex()?.linked
-                                ? codex()?.expired
-                                    ? `signed in — expired${codexExpiry() ? ` (${codexExpiry()})` : ""}`
-                                    : `signed in${codexExpiry() ? ` — valid to ${codexExpiry()}` : ""}`
-                                : "not signed in"}
-                        </span>
-                        <Show when={codex()?.linked && !codex()?.expired}>
-                            <span class="badge">linked</span>
-                        </Show>
-                        <button type="button" class="tree-action" data-codex-signin onClick={linkCodex}>
-                            {codex()?.linked ? "re-sign in" : "Sign in with OpenAI"}
-                        </button>
-                    </div>
-                    <Show when={authUrl()}>
+                {/* This one-click flow starts a callback listener on the local machine, so it
+                    is only offered by runtimes that actually host that helper. */}
+                <Show when={props.codexLoginAvailable ?? true}>
+                    <section class="admin-section" data-codex-oauth>
+                        <h4>OpenAI sign-in (codex)</h4>
                         <p class="muted">
-                            If the browser didn't open,{" "}
-                            <a href={authUrl()} target="_blank" rel="noopener noreferrer">open the sign-in page</a>.
-                            {" "}When done,{" "}
-                            <button type="button" class="link-btn" data-codex-refresh onClick={refresh}>
-                                refresh
-                            </button>{" "}
-                            to confirm.
+                            Sign in with your OpenAI account so the agent can run on the codex
+                            endpoint — the default. No API key needed.
                         </p>
-                    </Show>
-                </section>
+                        <div class="member-row" data-codex-status={codex()?.linked ? (codex()?.expired ? "expired" : "linked") : "none"}>
+                            <span>
+                                {codex()?.linked
+                                    ? codex()?.expired
+                                        ? `signed in — expired${codexExpiry() ? ` (${codexExpiry()})` : ""}`
+                                        : `signed in${codexExpiry() ? ` — valid to ${codexExpiry()}` : ""}`
+                                    : "not signed in"}
+                            </span>
+                            <Show when={codex()?.linked && !codex()?.expired}>
+                                <span class="badge">linked</span>
+                            </Show>
+                            <button type="button" class="tree-action" data-codex-signin onClick={linkCodex}>
+                                {codex()?.linked ? "re-sign in" : "Sign in with OpenAI"}
+                            </button>
+                        </div>
+                        <Show when={authUrl()}>
+                            <p class="muted">
+                                If the browser didn't open,{" "}
+                                <a href={authUrl()} target="_blank" rel="noopener noreferrer">open the sign-in page</a>.
+                                {" "}When done,{" "}
+                                <button type="button" class="link-btn" data-codex-refresh onClick={refresh}>
+                                    refresh
+                                </button>{" "}
+                                to confirm.
+                            </p>
+                        </Show>
+                    </section>
+                </Show>
 
                 {/* Linked LLM accounts */}
                 <section class="admin-section">
@@ -265,6 +355,70 @@ export function AccountPanel(props: { api: AccountPanelApi; onClose: () => void 
                             </For>
                         </ul>
                     </Show>
+                </section>
+
+                {/* Attention (ATTN-2): when a chat should ask for you */}
+                <section class="admin-section" data-attention-settings>
+                    <h4>Attention</h4>
+                    <p class="muted">
+                        When a chat should ask for you. <strong>Task bar</strong> queues it
+                        up top; <strong>chat dot</strong> only marks the chat in the tree;
+                        <strong> quiet</strong> keeps it in the transcript.
+                    </p>
+                    <ul class="member-list">
+                        <For each={ATTENTION_SIGNALS}>
+                            {(m) => (
+                                <li class="member-row" data-attention-signal={m.signal}>
+                                    <span class="member-id" title={m.hint}>
+                                        {m.label}
+                                    </span>
+                                    <select
+                                        value={attention()[m.signal]}
+                                        onChange={(e) =>
+                                            void setAttention(
+                                                m.signal,
+                                                e.currentTarget.value as AttentionLevel,
+                                            )
+                                        }
+                                    >
+                                        <option value="queue">task bar</option>
+                                        <option value="badge">chat dot only</option>
+                                        <option value="mute">quiet</option>
+                                    </select>
+                                </li>
+                            )}
+                        </For>
+                    </ul>
+                </section>
+
+                {/* Advancement (ATTN-3): what auto-keeps without review */}
+                <section class="admin-section" data-advancement-settings>
+                    <h4>Auto-keep</h4>
+                    <p class="muted">
+                        Keep a turn's work into the shared copy automatically when it{" "}
+                        <em>only</em> touches these paths (comma-separated:{" "}
+                        <code>docs/**</code>, <code>*.md</code>, or an exact path). Empty =
+                        everything waits for your review. A change to the assistant's
+                        permissions, or a turn that read someone else's content, always
+                        waits — no scope can override that.
+                    </p>
+                    <div class="admin-invite">
+                        <input
+                            data-advancement-scopes
+                            placeholder="e.g. docs/**, *.md"
+                            value={scopesDraft() ?? advancementScopes()}
+                            onInput={(e) => setScopesDraft(e.currentTarget.value)}
+                            onKeyDown={(e) => e.key === "Enter" && void saveAdvancementScopes()}
+                        />
+                        <button
+                            type="button"
+                            class="tree-action"
+                            disabled={scopesDraft() === null}
+                            onClick={() => void saveAdvancementScopes()}
+                        >
+                            save
+                        </button>
+                    </div>
                 </section>
 
                 {/* Trusted devices */}

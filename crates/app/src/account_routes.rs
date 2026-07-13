@@ -59,9 +59,12 @@ pub fn routes() -> Router<SharedWorkbench> {
         // actually needs an LLM credential. False under the scripted fake agent
         // (dev/e2e), so the first-run overlay never blocks a no-credential test.
         .route("/account/onboarding-status", get(get_onboarding_status))
-        // OpenAI codex OAuth link (LLM-1, ADR 0062): status + start-the-flow. The
-        // credential lands in Pi's own auth store (read by the engine's default
-        // provider), distinct from the BYOK sealed credentials above.
+        // The resolved no-pin default (provider + model), so the composer picker
+        // can name its "Default" row instead of leaving it blind.
+        .route("/account/default-model", get(get_default_model))
+        // OpenAI Codex OAuth link (LLM-1, ADR 0062): GaugeDesk owns PKCE,
+        // refresh, and the seed-encrypted account credential. Runtimes receive
+        // only ephemeral resolved material.
         .route(
             "/account/oauth/openai-codex",
             get(codex_oauth::get_codex_status),
@@ -139,12 +142,36 @@ pub async fn post_library_sync_pull(State(wb): State<SharedWorkbench>) -> impl I
 /// can run a turn (ADR 0075 Phase 0). Mirrors the runtime selection in
 /// `harness_select::factory_for_turn`: the scripted fake agent (selected by
 /// `GAUGEWRIGHT_FAKE_AGENT`, used in dev/e2e) needs no credential, so the gate is
-/// off there; the real Pi runtime needs one, so it's on.
+/// off there; the real WhippleScript runtime needs one, so it's on.
 pub async fn get_onboarding_status() -> impl IntoResponse {
     let credential_required = std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_err();
     (
         StatusCode::OK,
         Json(json!({ "credential_required": credential_required })),
+    )
+        .into_response()
+}
+
+/// The model a turn runs when the chat pins nothing — the picker's "Default"
+/// row, named. Resolves exactly as a turn would: the host override / codex-OAuth
+/// provider precedence with an empty chat config, then that provider's own
+/// default model. `model` is null when the resolved provider has no default
+/// (it requires an explicit pin). Exposed so the picker can *name* the default
+/// instead of showing a blind "Default" (LLM-1, ADR 0062).
+pub async fn get_default_model() -> impl IntoResponse {
+    let provider = crate::engine::resolve_turn_provider(
+        std::env::var("GAUGEWRIGHT_MODEL_PROVIDER").ok(),
+        None,
+    );
+    let model = crate::engine::resolve_turn_model(std::env::var("GAUGEWRIGHT_MODEL").ok(), None)
+        .or_else(|| {
+            gaugewright_whip_runtime::native_provider_descriptor(&provider, None)
+                .ok()
+                .map(|d| d.model)
+        });
+    (
+        StatusCode::OK,
+        Json(json!({ "provider": provider, "model": model })),
     )
         .into_response()
 }

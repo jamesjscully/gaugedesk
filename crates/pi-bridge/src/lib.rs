@@ -25,10 +25,12 @@ pub mod protocol;
 /// The seam types live in `gaugewright-harness` (SUB-0); re-exported here at
 /// their pre-extraction paths so existing callers keep compiling unchanged.
 pub use gaugewright_harness::{
-    sandbox, AllowAllGate, EgressGate, GateDecision, Harness, Observation, RemoteHarness, ToolInfo,
-    TurnOutcome,
+    sandbox, AllowAllGate, EgressGate, GateDecision, Harness, HumanPrompt, Observation,
+    RemoteHarness, ToolInfo, TurnOutcome,
 };
-use gaugewright_harness::{ChatMode, CredentialProbe, HarnessFactory, HarnessSpec};
+use gaugewright_harness::{
+    ChatMode, CredentialProbe, HarnessContinuitySpec, HarnessFactory, HarnessSpec,
+};
 /// Native Pi image content block, re-exported for the engine + control plane that
 /// thread it from the HTTP task body into the turn.
 pub use protocol::ImageContent;
@@ -557,10 +559,8 @@ pub struct PiConfig {
     pub continue_session: bool,
 }
 
-/// Resolve the Pi executable (SELFHOST-1). A packaged desktop bundle vendors Pi
-/// and points here via `GAUGEWRIGHT_PI_BIN` (the Tauri shell sets it from the bundle's
-/// `resource_dir()`); the dev/test build leaves it unset and finds `pi` on PATH.
-/// Mirrors `gaugewright_app::control_plane_root()`'s env-override-then-default shape.
+/// Resolve the Pi executable for the retained conformance adapter. A manual
+/// test may override `GAUGEWRIGHT_PI_BIN`; otherwise it finds `pi` on PATH.
 fn resolve_pi_bin() -> String {
     pi_bin_from(std::env::var("GAUGEWRIGHT_PI_BIN").ok())
 }
@@ -886,7 +886,7 @@ impl HarnessFactory for PiHarnessFactory {
     fn credential_status(
         &self,
         provider: &str,
-        _resolved_envs: &[(String, String)],
+        _capability: Option<&dyn gaugewright_harness::CredentialCapability>,
     ) -> CredentialProbe {
         if pi_oauth_present() {
             CredentialProbe::Ready
@@ -906,11 +906,11 @@ impl HarnessFactory for PiHarnessFactory {
     /// and the rebind still runs over whatever was copied.
     fn clone_continuity(
         &self,
-        _src_chat: &str,
-        _dst_chat: &str,
-        src_worktree: &std::path::Path,
-        dst_worktree: &std::path::Path,
+        source: &HarnessContinuitySpec,
+        target: &HarnessContinuitySpec,
     ) -> io::Result<()> {
+        let src_worktree = &source.worktree;
+        let dst_worktree = &target.worktree;
         let src_session = std::path::PathBuf::from(format!("{}.pisession", src_worktree.display()));
         if src_session.is_dir() {
             let dst_session =
@@ -1002,11 +1002,8 @@ pub fn pi_config_from(
         ..Default::default()
     };
     // The plugin path must be absolute: Pi's cwd is the worktree, not ours. A
-    // packaged bundle vendors the plugin and points here via GAUGEWRIGHT_PLUGIN_PATH
-    // (SELFHOST-1); the dev build falls back to `plugin/gaugewright-plugin.ts` under
-    // the cwd. The bundle case is why the env seam exists — a packaged build has
-    // no `plugin/` under its arbitrary cwd, so the dev fallback alone would
-    // silently drop the membrane plugin.
+    // conformance run may override it; source-tree tests fall back to the
+    // retained historical plugin under `plugin/`.
     if let Some(plugin) = plugin_path_candidate(plugin_override, cwd) {
         if plugin.exists() {
             pc.extra_args = vec!["-e".into(), plugin.to_string_lossy().into_owned()];
@@ -1015,12 +1012,11 @@ pub fn pi_config_from(
     pc
 }
 
-/// Resolve the membrane plugin path (SELFHOST-1). A packaged desktop bundle vendors
-/// the plugin and points here via `GAUGEWRIGHT_PLUGIN_PATH` (set by the Tauri shell from
-/// `resource_dir()`); the dev build falls back to `plugin/gaugewright-plugin.ts` under the
-/// cwd. Pure candidate-selector (no filesystem) so it is unit-testable; the caller
-/// `.exists()`-guards before handing the path to Pi. (Moved verbatim from the
-/// engine when the turn path was routed through the factory.)
+/// Resolve the retained membrane plugin for a conformance run. An explicit
+/// `GAUGEWRIGHT_PLUGIN_PATH` wins; source-tree tests fall back to
+/// `plugin/gaugewright-plugin.ts` under the cwd. Pure candidate-selector (no
+/// filesystem) so it is unit-testable; the caller `.exists()`-guards before
+/// handing the path to Pi.
 fn plugin_path_candidate(
     override_var: Option<String>,
     cwd: Option<std::path::PathBuf>,
@@ -1301,7 +1297,7 @@ mod tests {
     // test) retired in favor of the factory (SUB-0 H5).
     #[test]
     fn plugin_path_prefers_override_then_cwd_relative_dev_fallback() {
-        // A bundle sets GAUGEWRIGHT_PLUGIN_PATH to the vendored plugin — taken verbatim.
+        // A conformance runner may point at an explicit plugin — taken verbatim.
         assert_eq!(
             plugin_path_candidate(
                 Some("/opt/gaugewright/plugin/gaugewright-plugin.ts".into()),
@@ -1353,10 +1349,18 @@ mod tests {
                 chat_id: "e1".into(),
                 worktree: wt.clone(),
                 mode: ChatMode::Use,
+                package_root: None,
+                package_version_ref: None,
+                policy_epoch: None,
+                signed_policy_envelope: None,
+                provider_binding_ref: None,
+                credential_ref: None,
+                placement_ceiling_ref: None,
                 provider: Some("openai-codex".into()),
                 model: Some("gpt-5.5".into()),
                 thinking: Some("low".into()),
                 system_prompt: None,
+                credential_capability: None,
                 credentials: vec![("OPENAI_API_KEY".into(), "sk-test-123".into())],
                 sandbox: sandbox::SandboxPolicy::new(vec![wt.clone()])
                     .read_only(vec![wt.join(".pi"), wt.join("AGENTS.md")])
@@ -1447,12 +1451,20 @@ mod tests {
                 chat_id: "e2".into(),
                 worktree: wt.clone(),
                 mode: ChatMode::Edit,
+                package_root: None,
+                package_version_ref: None,
+                policy_epoch: None,
+                signed_policy_envelope: None,
+                provider_binding_ref: None,
+                credential_ref: None,
+                placement_ceiling_ref: None,
                 // AM-9: the federation peer path keeps provider/model unset so
                 // Pi's own default resolution (the authed OAuth provider) holds.
                 provider: None,
                 model: None,
                 thinking: None,
                 system_prompt: Some("EDITOR PERSONA".into()),
+                credential_capability: None,
                 credentials: vec![],
                 sandbox: sandbox::SandboxPolicy::new(vec![wt.clone()]),
             };
@@ -1687,7 +1699,7 @@ mod tests {
         // Unset / empty → the PATH default `pi`.
         assert_eq!(pi_bin_from(None), "pi");
         assert_eq!(pi_bin_from(Some(String::new())), "pi");
-        // A non-empty GAUGEWRIGHT_PI_BIN (a bundle's vendored path) wins (SELFHOST-1).
+        // A non-empty conformance override wins.
         assert_eq!(
             pi_bin_from(Some("/opt/gaugewright/bin/pi".into())),
             "/opt/gaugewright/bin/pi"

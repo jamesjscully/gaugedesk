@@ -92,48 +92,6 @@ Given("a new engagement", async ({ page }) => {
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
-// A new engagement whose archetype's policy blocks `bash`. We place an archetype
-// on a fresh project, set the *placed* archetype's config to block bash (so the
-// chat — seeded from the archetype config at creation — inherits the block), then
-// open a work chat under that placement.
-Given("a new engagement whose archetype blocks bash", async ({ page }) => {
-    await page.goto("/");
-    const project = await placeArchetypeOnFreshProject(page);
-    const group = page.locator(`.tree-group[data-project]`, { hasText: project });
-    const placement = group.locator(".tree-subgroup[data-placement]").first();
-    // The placement's lineage carries the exact archetype id — configure *that*
-    // archetype (by id), not by name (names can collide across the shared state).
-    const archetypeId = await placement
-        // The lineage id rides on the `data-lineage-archetype` attribute; round 6
-        // moved it off a `.lineage` span onto `.node-label`, so match the attribute
-        // itself, not the (reworded) class around it.
-        .locator("[data-lineage-archetype]")
-        .first()
-        .getAttribute("data-lineage-archetype");
-
-    // Open that archetype's settings from the Library and block bash.
-    await page.locator(".facet", { hasText: "Library" }).click();
-    await page
-        .locator(`.tree-group[data-archetype="${archetypeId}"]`)
-        .locator(".tree-node.archetype")
-        .first()
-        .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: /^settings$/ }).click();
-    await expect(page.locator("[data-config-editor]")).toBeVisible();
-    // Block the shell via the plain form (round 5 #5): uncheck "let it run commands
-    // on the computer" instead of hand-writing the block_tools JSON.
-    await page.locator("[data-settings-shell]").uncheck();
-    await page.locator("[data-settings-save]").click();
-    await expect(page.locator("[data-config-status]").last()).toContainText("saved");
-    await page.getByRole("button", { name: "close", exact: true }).click();
-
-    // Now open a work chat under the placement — it seeds the blocking config.
-    await page.locator(".facet", { hasText: "Projects" }).click();
-    await group.locator(".tree-subgroup[data-placement] .action-row .create-btn").first().click();
-    await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
-    await expect(page.getByTestId("stream-ready")).toBeAttached();
-});
-
 // ---- tasking the agent ----
 
 When("I task the agent with {string}", async ({ page }, prompt: string) => {
@@ -142,7 +100,7 @@ When("I task the agent with {string}", async ({ page }, prompt: string) => {
     // a placeholder match silently fails in edit chats (round10:6).
     await page.locator(".composer input").fill(prompt);
     await page.getByRole("button", { name: "send", exact: true }).click();
-    // Fake agent returns instantly; a real (@live) turn can take ~20s. The turn's
+    // Fake agent returns instantly; a real-model (@live) turn can take ~20s. The turn's
     // completion shows on the chat-status badge reaching the terminal run phase.
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Completed", { timeout: 45_000 });
 });
@@ -800,12 +758,13 @@ When("I close the config editor", async ({ page }) => {
 // ---- context ingestion ----
 
 When("I attach the context folder {string}", async ({ page }, path: string) => {
-    await page.getByRole("button", { name: "Add files", exact: true }).click();
-    // Use the stable data hooks, not the placeholder/label copy: the fallback's
-    // wording is user-facing prose that gets reworded (it became "paste a folder
-    // location…"), so binding to text makes the step brittle.
-    await page.locator("[data-context-path]").fill(path);
-    await page.locator("[data-context-attach]").click();
+    // The browser build ingests context by uploading the picked folder's file
+    // *contents* (ENTSEC-5), not by a server-local path — browsers hide real paths.
+    // Playwright drives the hidden `webkitdirectory` input by handing it a real
+    // directory path, which it walks and uploads; `path` is that folder (its files,
+    // e.g. gaugewright-plugin.ts, are what downstream diff/context assertions look
+    // for). No `Add files` click is needed — the input is set programmatically.
+    await page.locator("[data-add-folder-input]").setInputFiles(path);
 });
 
 // ---- message attachments (composer paperclip, UX-14) ----
@@ -1117,20 +1076,12 @@ When("I reveal the internal files", async ({ page }) => {
     await page.locator("[data-show-internal]").click();
 });
 
-// Editing the assistant's settings file directly is flagged as a safety surface (#1).
-Then("the editor warns that this is the assistant's settings file", async ({ page }) => {
-    await expect(page.locator("[data-config-edit-warning]")).toBeVisible();
-});
-
-// Saving must not assert "saved" — an invalid config save is rejected, not committed.
-When("I try to save the file", async ({ page }) => {
-    await page.locator("[data-file-save]").click();
-});
-
-// Corrupt config JSON is blocked with a plain sentence, never persisted (#1).
-Then("the save is rejected with a plain-language message", async ({ page }) => {
-    await expect(page.locator("[data-edit-status]")).toContainText("isn't valid");
-    await expect(page.locator("[data-edit-status]")).not.toHaveText("saved");
+// Host runtime settings and frozen package versions are never editable through
+// the worktree surface. Settings owns the former; only an edit chat's package
+// draft owns authored behavior.
+Then("the selected file is read-only in the editor", async ({ page }) => {
+    await expect(page.locator("[data-file-readonly]")).toBeVisible();
+    await expect(page.locator("[data-file-save]")).toHaveCount(0);
 });
 
 // Split is illegible at the Content panel's default width, so it isn't offered (#2).
@@ -1176,7 +1127,7 @@ When("I open a chat by keyboard", async ({ page }) => {
 // The settings modal leads with a plain-language form, with the raw JSON demoted (#5).
 Then("the settings modal shows a plain-language form", async ({ page }) => {
     await expect(page.locator("[data-settings-form]")).toBeVisible();
-    await expect(page.locator("[data-settings-posture=ask]")).toBeVisible();
+    await expect(page.locator("[data-settings-model]")).toBeVisible();
     // The raw JSON is hidden until Advanced is expanded.
     await expect(page.locator("[data-config-text]")).toHaveCount(0);
 });
@@ -1636,7 +1587,9 @@ When("I open the fork tree for the first chat", async ({ page }) => {
 Then("the fork tree shows at least {int} chats", async ({ page }, n: number) => {
     await expect(page.locator("[data-fork-tree]")).toBeVisible();
     const nodes = page.locator("[data-fork-tree] [data-fork-node]");
-    expect(await nodes.count()).toBeGreaterThanOrEqual(n);
+    // The dialog shell mounts before its fork-forest resource resolves. Poll the
+    // rendered projection instead of sampling the transient empty shell once.
+    await expect.poll(() => nodes.count()).toBeGreaterThanOrEqual(n);
 });
 
 // ---- UX-11: cross-party output review (held output + provenance + consent) ----

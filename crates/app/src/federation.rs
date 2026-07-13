@@ -145,12 +145,24 @@ impl Workbench {
     /// Re-materialize a relocated instance from its handoff content bundle: lay
     /// its repo down under `instances/<id>`, register the instance, and rehydrate
     /// its engagement worktrees before the home commit lands.
-    pub fn materialize_instance(&mut self, inst_id: &str, bundle: &[u8]) -> std::io::Result<()> {
+    pub fn materialize_instance(
+        &mut self,
+        inst_id: &str,
+        format: &str,
+        bundle: &[u8],
+    ) -> std::io::Result<()> {
         let dir = self.root.join("instances").join(inst_id);
-        let inst = self
-            .workspace_provider(inst_id)
-            .from_export_at(&dir, bundle)
-            .map_err(io)?;
+        let provider = self.workspace_provider(inst_id);
+        if format != provider.export_format() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "workspace export format `{format}` is incompatible with `{}`",
+                    provider.export_format()
+                ),
+            ));
+        }
+        let inst = provider.from_export_at(&dir, bundle).map_err(io)?;
         for (chat_id, eng) in inst.reconcile_engagements().map_err(io)? {
             self.register_engagement(chat_id, inst_id.to_string(), eng);
         }
@@ -164,7 +176,7 @@ impl Workbench {
     pub(crate) fn project_relocation_content_bundles(
         &self,
         project: &str,
-    ) -> Vec<(String, Vec<u8>)> {
+    ) -> Vec<(String, String, Vec<u8>)> {
         self.library_project_relocation_content_bundles(project)
     }
 }
@@ -804,8 +816,8 @@ async fn send_crossing(
 // ----- Remote-run observations (Flow 1 / OBSERVATION-FEDERATION-1) -----------
 //
 // The owner *places a run on the peer*: it sends a RunReq over the cert-pinned TLS
-// leg; the peer executes a turn through the real pi-bridge turn machinery and
-// returns its [`Observation`](gaugewright_pi_bridge::Observation)s; the owner then
+// leg; the peer executes a turn through the configured GaugeDesk engine and
+// returns its [`Observation`](gaugewright_harness::Observation)s; the owner then
 // federates each one back through the relay seam and admits it as run evidence —
 // standing run truth only via the **owner's** RecordObservation admission (INV-4).
 
@@ -849,13 +861,9 @@ fn runtime_token(owner: &str, peer: &str) -> String {
     format!("gaugewright-runtime::{owner}->{peer}")
 }
 
-/// Execute one turn on the peer through the **real** pi-bridge turn machinery
-/// (`ScriptedTransport`, the same mock-LLM path the control plane's
-/// `GAUGEWRIGHT_FAKE_AGENT` mode uses): the prompt is woven into a scripted agent
-/// response so the observations are genuine `Observation` values flowing through
-/// the actual streaming pipeline — only the model is mocked, not the path. A real
-/// Pi/Codex runtime swaps in behind the same `Harness` seam (ADR 0031) with no
-/// change to the federation here.
+/// Execute one turn on the peer through its configured GaugeDesk engine. A peer
+/// with no registered instance may use the neutral scripted harness in explicit
+/// fake-agent mode; a real run without an instance fails closed.
 fn execute_peer_turn(
     wb: &SharedWorkbench,
     prompt: &str,
@@ -918,8 +926,8 @@ fn execute_peer_turn(
 /// Run the peer turn in a real, **persistent peer-side engagement** through the
 /// engine (FED-5b-3): create + register an engagement (a worktree off the peer's
 /// default instance), drive the turn with the full membrane / sandbox / run
-/// lifecycle (`run_engagement_turn` — fake under `GAUGEWRIGHT_FAKE_AGENT`, real Pi
-/// otherwise), and return the run's admitted-observation count + assistant text.
+/// lifecycle (`run_engagement_turn` — fake under `GAUGEWRIGHT_FAKE_AGENT`,
+/// WhippleScript otherwise), and return the run's admitted-observation count + assistant text.
 /// `None` when the peer has no instance (a minimal/test workbench) — the caller
 /// then falls back to the in-process turn.
 fn engine_peer_turn(wb: &SharedWorkbench, prompt: &str) -> Option<(u32, String)> {
@@ -939,9 +947,12 @@ fn engine_peer_turn(wb: &SharedWorkbench, prompt: &str) -> Option<(u32, String)>
         &eng_id,
         &worktree,
         &tx,
-        prompt,
-        &[], // remote/federated runs are text-only (no image attachments yet)
-        crate::library::ChatMode::Use,
+        crate::engine::EngagementTurnInput {
+            task: prompt,
+            images: &[], // remote/federated runs are text-only (no image attachments yet)
+            mode: crate::library::ChatMode::Use,
+            authenticated_actor: None,
+        },
     ) {
         Ok(r) => r.assistant_text,
         Err(e) => format!("remote runtime error: {e}"),
@@ -955,98 +966,40 @@ fn engine_peer_turn(wb: &SharedWorkbench, prompt: &str) -> Option<(u32, String)>
     Some((count, assistant))
 }
 
-/// Run one turn on the peer (FED-4). With `GAUGEWRIGHT_FAKE_AGENT` (CI / tests) the
-/// mock-LLM `ScriptedTransport` drives the real streaming pipeline deterministically;
-/// otherwise a **real Pi process** runs the turn on the peer's hardware/account —
-/// the genuine "remote runtime" the federation transport always implied. Either way
-/// the observations flow through the real `Harness` seam (ADR 0031).
-fn run_peer_outcome(prompt: &str, run_scope: &str) -> gaugewright_pi_bridge::TurnOutcome {
-    use gaugewright_pi_bridge::{AllowAllGate, Harness, ScriptedTransport};
+/// Run the no-instance fallback for a peer (FED-4). Explicit fake-agent mode uses
+/// the neutral scripted harness so CI can exercise the federation transport. A
+/// real peer must have a registered instance and therefore fails closed here.
+fn run_peer_outcome(prompt: &str, run_scope: &str) -> gaugewright_harness::TurnOutcome {
+    use gaugewright_harness::testing::{ScriptedHarness, ScriptedTurn};
+    use gaugewright_harness::{AllowAllGate, Harness, Observation, TurnOutcome};
 
     if std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_ok() {
         let text = format!("remote ran: {prompt}");
-        let q = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
-        let lines = vec![
-            r#"{"type":"agent_start"}"#.to_string(),
-            format!(r#"{{"type":"text_delta","delta":{}}}"#, q(&text)),
-            r#"{"type":"agent_end","messages":[]}"#.to_string(),
-            format!(
-                r#"{{"type":"response","command":"get_last_assistant_text","success":true,"data":{{"text":{}}}}}"#,
-                q(&text)
-            ),
-        ];
-        return ScriptedTransport::new(lines)
-            .run_turn(&AllowAllGate, prompt, &[], &mut |_| {})
-            .unwrap_or_default();
+        return ScriptedHarness::from_neutral_turns(vec![ScriptedTurn {
+            assistant_text: text.clone(),
+            observations: vec![Observation {
+                kind: "text",
+                detail: text,
+                tool: None,
+            }],
+            tool_calls: Vec::new(),
+        }])
+        .run_turn(&AllowAllGate, prompt, &[], &mut |_| {})
+        .unwrap_or_default();
     }
 
-    real_pi_outcome(prompt, run_scope).unwrap_or_else(|e| gaugewright_pi_bridge::TurnOutcome {
-        observations: vec![gaugewright_pi_bridge::Observation {
+    let reason = format!(
+        "remote run `{run_scope}` has no registered GaugeDesk instance; refusing an ungoverned runtime fallback"
+    );
+    TurnOutcome {
+        observations: vec![Observation {
             kind: "other",
-            detail: format!("remote runtime error: {e}"),
+            detail: reason.clone(),
             tool: None,
         }],
-        error: Some(format!("{e}")),
+        error: Some(reason),
         ..Default::default()
-    })
-}
-
-/// Spawn a real `pi --mode rpc` child on the peer and run one turn in a sandboxed
-/// per-run temp worktree (FED-4), through the same [`PiHarnessFactory`] the
-/// engine's turn path uses (SUB-0 deleted this file's private `PiConfig`
-/// assembly — the factory owns every real Pi spawn): the worktree is writable
-/// and the adapter extends the policy with its session dir + `~/.pi`; egress is
-/// isolated unless the operator acknowledges unfiltered egress (the per-host
-/// egress proxy is deferred infra, so reaching the model needs
-/// `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`). Provider/model are left unset
-/// (`None` in the spec) so Pi resolves the user's authed `openai-codex` OAuth
-/// endpoint (`pi-rpc.md` A6 — an explicit model can hit an unauthed azure
-/// endpoint).
-///
-/// This is the real runtime; a full peer-side *engagement* (worktree diff / keep /
-/// merge on the peer) layers on later behind the same seam. It is exercised outside
-/// CI (it needs Pi + OAuth + network); CI uses the `GAUGEWRIGHT_FAKE_AGENT` path above.
-///
-/// [`PiHarnessFactory`]: gaugewright_pi_bridge::PiHarnessFactory
-fn real_pi_outcome(
-    prompt: &str,
-    run_scope: &str,
-) -> std::io::Result<gaugewright_pi_bridge::TurnOutcome> {
-    use gaugewright_harness::{
-        sandbox::SandboxPolicy, AllowAllGate, ChatMode, HarnessFactory, HarnessSpec,
-    };
-    use gaugewright_pi_bridge::PiHarnessFactory;
-
-    let safe: String = run_scope
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let work = std::env::temp_dir().join(format!(
-        "gaugewright-remote-{}-{}",
-        std::process::id(),
-        safe
-    ));
-    std::fs::create_dir_all(&work)?;
-
-    let unfiltered = std::env::var("GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS").as_deref() == Ok("1");
-    let spec = HarnessSpec {
-        chat_id: format!("remote-{safe}"),
-        worktree: work.clone(),
-        mode: ChatMode::Use,
-        provider: None,
-        model: None,
-        thinking: None,
-        system_prompt: None,
-        credentials: Vec::new(),
-        // The shell's base policy: the temp worktree writable; the Pi factory
-        // extends it with its session dir and `~/.pi` (the extension that used
-        // to be assembled inline here).
-        sandbox: SandboxPolicy::new(vec![work]).allow_unfiltered_egress(unfiltered),
-    };
-    let mut proc = PiHarnessFactory.create(&spec)?;
-    let outcome = proc.run_turn(&AllowAllGate, prompt, &[], &mut |_| {})?;
-    let _ = proc.shutdown();
-    Ok(outcome)
+    }
 }
 
 /// The per-peer **runtime receiver** (REMOTE-RPC-1): park on the broker for run
@@ -2323,15 +2276,16 @@ struct HandoffLogRecord {
     payload: String,
 }
 
-/// One relocated instance's **content bytes** — a `git bundle` of its whole object
-/// graph (`main` + every `engagement/<id>` branch), re-materialized on the target as
-/// the instance repo behind the project's relocated handles. The bytes are opaque to
+/// One relocated instance's versioned-workspace export. The format tag prevents a
+/// mixed-substrate target from interpreting opaque bytes under the wrong provider.
+/// The bytes are opaque to
 /// the relay (`INV-14`); they re-derive no state (the log is authority, `INV-5`), they
 /// only place the content the log's handles point at. They land **before** the target's
 /// home commits (`STATE_BEFORE_HOME`, FED-6).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HandoffContentBundle {
     inst_id: String,
+    format: String,
     bundle: Vec<u8>,
 }
 
@@ -2467,15 +2421,18 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
     out
 }
 
-/// The origin's snapshot of a project's **content bytes**: one `git bundle` per
-/// using-instance bound into the project (its full object graph — `main` + every
-/// engagement branch). This is the bytes behind every relocated handle; the target
+/// The origin's snapshot of a project's content: one tagged, erasure-respecting
+/// workspace export per using-instance. This is the bytes behind every relocated handle; the target
 /// re-materializes each before its home commits (`STATE_BEFORE_HOME`, FED-6). An
 /// instance whose repo cannot be bundled is skipped (logged), not silently dropped.
 fn collect_project_content(wb: &Workbench, project: &str) -> Vec<HandoffContentBundle> {
     wb.project_relocation_content_bundles(project)
         .into_iter()
-        .map(|(inst_id, bundle)| HandoffContentBundle { inst_id, bundle })
+        .map(|(inst_id, format, bundle)| HandoffContentBundle {
+            inst_id,
+            format,
+            bundle,
+        })
         .collect()
 }
 
@@ -2715,7 +2672,7 @@ fn commit_incoming_handoff(
     // 2. Materialize the content bytes behind the project's handles BEFORE the home can
     //    commit (STATE_BEFORE_HOME). A bundle that will not lay down blocks the commit.
     for b in content {
-        if let Err(e) = guard.materialize_instance(&b.inst_id, &b.bundle) {
+        if let Err(e) = guard.materialize_instance(&b.inst_id, &b.format, &b.bundle) {
             tracing::warn!(
                 "handoff commit: materialize instance {} failed: {e:?}",
                 b.inst_id
@@ -4907,6 +4864,7 @@ mod handoff_routes_tests {
             name: "Acme".into(),
             is_default: false,
             network_isolated: false,
+            run_purpose: None,
             deployment_mode: Some(Placement {
                 operator: Operator::Counterparty,
                 attested: true,
@@ -5145,6 +5103,7 @@ mod run_place_floor_tests {
             name: project.into(),
             is_default: false,
             network_isolated: false,
+            run_purpose: None,
             deployment_mode: mode,
         });
         lib

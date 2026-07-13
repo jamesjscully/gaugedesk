@@ -2,7 +2,7 @@
 
 use crate::{federation, open_control_plane, open_workbench, LockUnpoisoned};
 
-/// Resolve the directory the open control plane roots its store + git instance in.
+/// Resolve the directory the open control plane roots its decision and workspace stores in.
 pub fn open_control_plane_root() -> std::path::PathBuf {
     if let Some(root) = std::env::var_os("GAUGEWRIGHT_ROOT") {
         return std::path::PathBuf::from(root);

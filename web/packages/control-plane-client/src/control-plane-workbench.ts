@@ -75,18 +75,21 @@ export async function getWorkspaceCarriage(
     return parseProjectionCarriage(raw, (v) => parseWorkspace(v));
 }
 
-/** The human task queue (top bar): onboarding issues + review-needed work.
- *  `review` ids are engagement ids; `issue` ids are whip work-item ids (`WS-N`),
- *  so we keep `id` a raw string here and narrow on `kind` at the use site. */
+/** The human task queue (top bar): onboarding issues + ask-typed chat tasks
+ *  (ADR 0082 §2 — `review`/`answer`/`repair`). Chat-ask ids are engagement ids;
+ *  `issue` ids are whip work-item ids (`WS-N`), so we keep `id` a raw string
+ *  here and narrow on `kind` at the use site. An unknown kind degrades to
+ *  `review` (the always-safe ask: it just opens the chat). */
 export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask[]> {
     const o = (await transport.json("GET", "/tasks")) as {
         tasks: { id: string; title: string; agent: string; kind: string; assignee?: string }[];
     };
+    const kinds = new Set(["review", "answer", "repair", "reply", "issue"]);
     return o.tasks.map((t) => ({
         id: t.id,
         title: t.title,
         agent: t.agent,
-        kind: t.kind === "issue" ? "issue" : "review",
+        kind: (kinds.has(t.kind) ? t.kind : "review") as HumanTask["kind"],
         assignee: t.assignee,
     }));
 }
@@ -564,6 +567,21 @@ export async function getFile(
     return res.text();
 }
 
+/**
+ * `getFile`, also reading the `x-workspace-cut` header — the recorded state
+ * this read serves (SUB-6 §12). A cut-carrying save sends it back as the
+ * three-way base; `cut` is null against servers that predate it.
+ */
+export async function getFileWithCut(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    path: string,
+): Promise<{ content: string; cut: string | null }> {
+    const res = await fetch(`${transport.base}/chats/${id}/file?path=${encodeURIComponent(path)}`);
+    if (!res.ok) throw new Error(`read ${path}: ${res.status}`);
+    return { content: await res.text(), cut: res.headers.get("x-workspace-cut") };
+}
+
 export async function putFile(
     transport: WorkbenchTransport,
     id: EngagementId,
@@ -575,6 +593,152 @@ export async function putFile(
         body: content,
     });
     if (!res.ok) throw new Error(`write ${path}: ${res.status}`);
+}
+
+/** One span of a merged/conflicted save (whip's text-merge piece surface). */
+export type MergePiece =
+    | { kind: "merged"; text: string; provenance: "base" | "ours" | "theirs" | "both" | "resolved" }
+    | { kind: "conflict"; base_text: string; ours_text: string; theirs_text: string };
+
+/** One fold-settled region riding a resolve re-save (§12.2): the exact
+ *  three texts the user saw plus the text they chose or authored. The
+ *  server records it as durable region-resolution memory. */
+export interface RegionResolution {
+    base_text: string;
+    ours_text: string;
+    theirs_text: string;
+    resolution_text: string;
+}
+
+/** The editor's save base: the cut it loaded (preferred; the GET header),
+ *  or the content it loaded (pre-cut fallback, resolved server-side). */
+export type SaveBase = { cut: string } | { content: string };
+
+export type SaveFileResult =
+    | { kind: "saved"; cut: string | null }
+    | { kind: "merged"; cut: string | null; content: string; pieces: MergePiece[] }
+    | { kind: "conflict"; current: string; currentCut: string | null; pieces: MergePiece[] };
+
+/**
+ * Base-carrying save (SUB-6): `base` names the state the editor loaded.
+ * Concurrent changes merge through whip's token-level engine server-side
+ * (region memory applies); a real divergence resolves to `conflict` with
+ * the structured regions and the file's current body + cut (the re-save
+ * base) — nothing written. `resolutions` are fold-settled regions riding
+ * a resolve re-save: they mint durable memory that pays forward.
+ */
+/** The JSON body a base-carrying save PUTs (shared by every transport). */
+export function saveFileBody(
+    content: string,
+    base: SaveBase,
+    resolutions: RegionResolution[] = [],
+): string {
+    const body: Record<string, unknown> = { content };
+    if ("cut" in base) body.base_cut = base.cut;
+    else body.base_content = base.content;
+    if (resolutions.length) body.resolutions = resolutions;
+    return JSON.stringify(body);
+}
+
+/** Decode a base-carrying save response (200 or 409) — shared by every
+ *  transport so desktop, embed, and remote agree on the wire shape. */
+export function decodeSaveFileResponse(status: number, payload: unknown): SaveFileResult {
+    if (status === 409) {
+        const conflict = payload as {
+            current: string;
+            current_cut?: string | null;
+            pieces: MergePiece[];
+        };
+        return {
+            kind: "conflict",
+            current: conflict.current,
+            currentCut: conflict.current_cut ?? null,
+            pieces: conflict.pieces,
+        };
+    }
+    const saved = payload as {
+        merged?: boolean;
+        cut?: string | null;
+        content?: string;
+        pieces?: MergePiece[];
+    };
+    if (saved.merged && typeof saved.content === "string") {
+        return {
+            kind: "merged",
+            cut: saved.cut ?? null,
+            content: saved.content,
+            pieces: saved.pieces ?? [],
+        };
+    }
+    return { kind: "saved", cut: saved.cut ?? null };
+}
+
+export async function saveFile(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    path: string,
+    content: string,
+    base: SaveBase,
+    resolutions: RegionResolution[] = [],
+): Promise<SaveFileResult> {
+    const res = await fetch(`${transport.base}/chats/${id}/file?path=${encodeURIComponent(path)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: saveFileBody(content, base, resolutions),
+    });
+    if (!res.ok && res.status !== 409) throw new Error(`write ${path}: ${res.status}`);
+    return decodeSaveFileResponse(res.status, await res.json());
+}
+
+/** The read-only preview of a base-carrying save (the live fold, §12.3). */
+export type MergePreviewResult =
+    | { knownBase: false }
+    | {
+          knownBase: true;
+          clean: boolean;
+          merged: string | null;
+          currentCut: string | null;
+          pieces: MergePiece[];
+      };
+
+/**
+ * What WOULD this draft do against the file as it stands? Nothing moves;
+ * region memory applies exactly as a save would apply it. `knownBase:
+ * false` means the base cut isn't recorded there (stale tab — reload).
+ */
+/** Decode a merge-preview response — shared by every transport. */
+export function decodePreviewResponse(payload: unknown): MergePreviewResult {
+    const preview = payload as {
+        known_base: boolean;
+        clean?: boolean;
+        merged?: string | null;
+        current_cut?: string | null;
+        pieces?: MergePiece[];
+    };
+    if (!preview.known_base) return { knownBase: false };
+    return {
+        knownBase: true,
+        clean: preview.clean ?? false,
+        merged: preview.merged ?? null,
+        currentCut: preview.current_cut ?? null,
+        pieces: preview.pieces ?? [],
+    };
+}
+
+export async function previewMerge(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    path: string,
+    draft: string,
+    baseCut: string,
+): Promise<MergePreviewResult> {
+    const res = await fetch(`${transport.base}/chats/${id}/merge-preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path, draft, base_cut: baseCut }),
+    });
+    if (!res.ok) throw new Error(`preview ${path}: ${res.status}`);
+    return decodePreviewResponse(await res.json());
 }
 
 export async function getConfig(transport: WorkbenchTransport, id: EngagementId): Promise<string> {
@@ -603,6 +767,31 @@ export async function ingestContext(
     path: string,
 ): Promise<number> {
     const o = (await transport.json("POST", `/chats/${id}/context`, { path })) as {
+        ingested: number;
+    };
+    return o.ingested;
+}
+
+/** One uploaded context file: a name and its text content (`ENTSEC-5`). */
+export interface UploadContextFile {
+    name: string;
+    content: string;
+}
+
+/**
+ * Upload context from the client's own files rather than a server-local path
+ * (`POST /chats/:id/context/upload`, `ENTSEC-5`). This is the browser's path-free
+ * ingest: a native picker hands us `File`s, we read their text and upload it —
+ * no absolute filesystem path (which browsers hide) is involved. Works in both
+ * solo and enterprise modes; enterprise *requires* it, since the server-path
+ * ingest is disabled there.
+ */
+export async function ingestContextUpload(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    files: UploadContextFile[],
+): Promise<number> {
+    const o = (await transport.json("POST", `/chats/${id}/context/upload`, { files })) as {
         ingested: number;
     };
     return o.ingested;

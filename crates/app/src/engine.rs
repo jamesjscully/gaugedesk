@@ -3,7 +3,7 @@
 //!
 //! This is the orchestrator the Phase-2 gate names: it creates an engagement
 //! worktree off the instance's `main`, admits the [[run]] lifecycle into the
-//! durable store, drives one [[runtime-session]] turn over Pi through the egress
+//! durable store, drives one [[runtime-session]] turn through the selected harness and egress
 //! membrane, auto-commits the worktree, and surfaces the diff + output. The
 //! durable truth (run events) lives in the store; the worktree holds the work;
 //! the membrane is the chokepoint for every effect.
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Test-only **conflict injection** (`UX-7`): when set, a completing turn's merge probe is
 /// forced to `Conflict`, driving the engagement into the isolated/repair-context path
 /// (`INV-24`) so a browser BDD can exercise conflict-repair without staging a real adversarial
-/// git conflict. Toggled by the `POST /test/force-conflict` route (gated by
+/// workspace conflict. Toggled by the `POST /test/force-conflict` route (gated by
 /// `GAUGEWRIGHT_TEST_RESET`); cleared by `POST /test/reset`. Inert in a normal run.
 static FORCE_MERGE_CONFLICT: AtomicBool = AtomicBool::new(false);
 
@@ -71,6 +71,7 @@ use tokio::sync::broadcast;
 
 use crate::harness_select::ScriptedFakeFactory;
 use crate::library::ChatMode;
+use crate::policy_compiler::PolicyCompilationInput;
 use crate::stream::ServerEvent;
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 
@@ -121,7 +122,7 @@ impl Workbench {
     /// The network egress posture for a chat, resolved through its project
     /// (see [`crate::library::Library::chat_network_isolated`]). Open by default;
     /// an explicit per-project opt-in isolates. Read by the engine when building
-    /// Pi's sandbox.
+    /// the selected harness's egress policy.
     pub fn chat_network_isolated(&self, chat_id: &str) -> bool {
         self.library_chat_network_isolated(chat_id)
     }
@@ -141,8 +142,8 @@ impl Workbench {
 /// so the model edits the agent rather than doing end-user work.
 pub const EDITOR_FRAMING: &str =
     "You are the editor: you improve THIS agent's own definition in the current workspace. \
-Its model and security policy live in `.agent-config.json`; its instructions live in `AGENTS.md`. \
-Edit those files to satisfy the request, then briefly explain what you changed. \
+Its authored WhippleScript package lives in `.whipple/draft`; frozen package versions are read-only. \
+Edit the draft persona, workflow, and capability registry to satisfy the request, then briefly explain what you changed. \
 Do not perform end-user tasks in edit mode — refine the agent itself.";
 
 /// Append a durable transcript record (admitted run evidence) to the engagement's
@@ -150,16 +151,66 @@ Do not perform end-user tasks in edit mode — refine the agent itself.";
 fn record_transcript(store: &mut Store, scope: &str, event: &ServerEvent) {
     let _ = store.append_record(scope, "transcript", &event.to_json());
 }
+
+const RUNTIME_EVIDENCE_POINTER_KIND: &str = "runtime_evidence_pointer";
+
+#[derive(serde::Serialize)]
+struct RuntimeEvidenceCrossing<'a> {
+    runtime: &'static str,
+    pointer: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_cut_ref: Option<WorkspaceCutRef<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceCutRef<'a> {
+    substrate: &'static str,
+    revision: &'a str,
+}
+
+/// Admit body-free WhippleScript pointers at most once. The record's assigned
+/// GaugeDesk scope position and the WhippleScript position inside `pointer`
+/// form the cross-store cut. The workspace revision is a WhippleScript-native
+/// manifest cut, not a commit in a second authority store.
+fn admit_runtime_evidence_pointers(
+    store: &mut Store,
+    scope: &str,
+    pointers: &[String],
+    workspace_revision: Option<&str>,
+) -> Result<Vec<i64>, AdmitError> {
+    use sha2::{Digest, Sha256};
+
+    let mut positions = Vec::with_capacity(pointers.len());
+    for pointer in pointers {
+        let key = format!(
+            "whip:pointer:{}",
+            hex::encode(Sha256::digest(pointer.as_bytes()))
+        );
+        let crossing = RuntimeEvidenceCrossing {
+            runtime: "whipplescript",
+            pointer,
+            workspace_cut_ref: workspace_revision.map(|revision| WorkspaceCutRef {
+                substrate: "whipplescript",
+                revision,
+            }),
+        };
+        let payload = serde_json::to_string(&crossing)?;
+        let (position, _) =
+            store.append_record_with_key(scope, &key, RUNTIME_EVIDENCE_POINTER_KIND, &payload)?;
+        positions.push(position);
+    }
+    Ok(positions)
+}
 use gaugewright_core::merge::{MergeCommand, MergePhase, MergeState};
 use gaugewright_core::run::{RunCommand, RunPhase, RunState};
 use gaugewright_harness::{
-    CredentialProbe, EgressGate, GateDecision, Harness, HarnessFactory, HarnessSpec, ImageContent,
-    InterruptHandle, Observation, TurnOutcome,
+    CredentialProbe, EgressGate, GateDecision, Harness, HarnessFactory, HarnessSpec, HumanPrompt,
+    ImageContent, InterruptHandle, Observation, TurnOutcome,
 };
 use gaugewright_store::{AdmitError, Store};
 use gaugewright_workspace::{ChatWorkspace, MergeOutcome};
 
-/// A membrane-backed egress gate: maps a Pi tool name to an [`Effect`] and asks
+/// A membrane-backed egress gate: maps a harness tool name to an [`Effect`] and asks
 /// the [`Membrane`] to rule. Tools known to leave the workspace (network) are
 /// classified as external; everything else as an in-workspace effect.
 pub struct MembraneGate {
@@ -213,9 +264,9 @@ fn default_external_tools() -> BTreeSet<String> {
         .collect()
 }
 
-/// The method-definition surface paths to make read-only for a turn (ADR 0030):
-/// in use mode, the surface files that exist in the worktree; in edit mode none
-/// (the editor edits the definition). These become sandbox `read_only_roots`.
+/// Defense-in-depth package/control roots: work chats protect all package bytes;
+/// edit chats protect frozen versions while leaving only the draft writable;
+/// GaugeDesk runtime selection is always protected.
 /// The egress hosts the model endpoint needs, by provider (RF-B3). This is the
 /// single deliberate network grant the bridge declares so a deny-by-default
 /// sandbox can still reach the model — every *other* destination (a `curl` to an
@@ -227,7 +278,10 @@ fn default_external_tools() -> BTreeSet<String> {
 /// only by a SERVE-2 deployment image to force its egress membrane) wins over the chat's
 /// `.agent-config.json` provider, which wins over the codex OAuth default. Pure (the env is read
 /// at the call site) so the precedence is unit-testable.
-fn resolve_turn_provider(host_override: Option<String>, config_provider: Option<String>) -> String {
+pub(crate) fn resolve_turn_provider(
+    host_override: Option<String>,
+    config_provider: Option<String>,
+) -> String {
     host_override
         .filter(|s| !s.is_empty())
         .or(config_provider.filter(|s| !s.is_empty()))
@@ -235,9 +289,9 @@ fn resolve_turn_provider(host_override: Option<String>, config_provider: Option<
 }
 
 /// Resolve a turn's model: a non-empty host override (`GAUGEWRIGHT_MODEL`) wins over the chat's
-/// configured model; `None` leaves Pi's per-provider default. Paired with
+/// configured model; `None` leaves the selected provider's default. Paired with
 /// [`resolve_turn_provider`] so a host that forces the provider can pin a compatible model.
-fn resolve_turn_model(
+pub(crate) fn resolve_turn_model(
     host_override: Option<String>,
     config_model: Option<String>,
 ) -> Option<String> {
@@ -269,45 +323,37 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
 ///
 /// - operator forced unfiltered egress (`GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`) ⇒
 ///   [`Network::Allow`] — the conscious unfiltered opt-in wins over everything;
-/// - the project isolates its network ⇒ [`Network::Deny`] (kernel-isolated);
-/// - a non-isolated project ⇒ [`Network::Filtered`] (egress ONLY to the model
-///   endpoints, via the host-filtering proxy) **when that filter can actually be
-///   enforced on this host** (`filtered_enforceable`, from
-///   [`RoutingCaps::can_enforce_filtered`]); otherwise it stays on the accepted
-///   open-by-default posture [`Network::Allow`] (unfiltered, with the *disclosed*
-///   lower ceiling — the 2026-06-17 product decision).
+/// - the project isolates its network ⇒ [`Network::Deny`];
+/// - a non-isolated project ⇒ [`Network::Filtered`], admitting only the resolved
+///   model endpoint.
 ///
-/// The last clause is deliberate: we do NOT request `Filtered` where it can't be
-/// enforced, because the harness fails an unenforceable `Filtered` closed to
-/// `Deny` (isolated), which would silently break out-of-box model access and
-/// reverse the open-by-default product decision. Instead, filtering **upgrades**
-/// the default automatically the moment a host can enforce it (bwrap + a rootless
-/// userspace-net helper + verified routing); until then the documented unfiltered
-/// ceiling stands. Isolation (`Deny`) and the conscious unfiltered opt-in (`Allow`)
-/// are always honored.
+/// WhippleScript owns the provider client, fixes its request URL from the admitted
+/// binding, and refuses redirects. It can therefore enforce the model-endpoint
+/// filter directly without depending on the legacy Pi subprocess/netns routing
+/// capability. Isolation (`Deny`) and the conscious unfiltered opt-in (`Allow`)
+/// remain GaugeDesk product-policy decisions.
 fn egress_posture(
     project_isolated: bool,
     forced_unfiltered: bool,
-    filtered_enforceable: bool,
 ) -> gaugewright_harness::sandbox::Network {
     use gaugewright_harness::sandbox::Network;
     if forced_unfiltered {
         Network::Allow
     } else if project_isolated {
         Network::Deny
-    } else if filtered_enforceable {
-        Network::Filtered
     } else {
-        Network::Allow
+        Network::Filtered
     }
 }
 
 fn method_surface_readonly_roots(worktree: &Path, mode: ChatMode) -> Vec<std::path::PathBuf> {
-    if !matches!(mode, ChatMode::Use) {
-        return Vec::new();
-    }
-    definition::READONLY_ROOTS
+    let package_roots = match mode {
+        ChatMode::Use => definition::READONLY_ROOTS,
+        ChatMode::Edit => definition::EDIT_READONLY_ROOTS,
+    };
+    package_roots
         .iter()
+        .chain(definition::CONTROL_READONLY_ROOTS.iter())
         .map(|s| worktree.join(s))
         .filter(|p| p.exists())
         .collect()
@@ -320,20 +366,26 @@ pub struct TaskResult {
     pub assistant_text: String,
     /// The engagement-branch-vs-`main` diff a reviewer sees.
     pub diff: String,
-    /// The turn's new revision id as its bare string (git: the auto-commit's
-    /// short hash), if the turn changed anything.
+    /// The turn's opaque WhippleScript cut id, if the turn changed anything.
     pub commit: Option<String>,
     /// The merge lifecycle phase after the turn: `Clean` (awaiting the human's
-    /// admit/reject of the diff) or `Rejected` (a git conflict → isolated).
+    /// admit/reject of the diff) or `Rejected` (a workspace conflict → isolated).
     pub merge_phase: MergePhase,
     pub mediated_tool_calls: Vec<String>,
     /// Effects the membrane blocked (the out-of-policy path).
     pub blocked_effects: Vec<String>,
     pub pending_approvals: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_human: Option<HumanPrompt>,
     /// The runtime/model error that failed this turn, if any — lets the client show
     /// an honest status immediately (the same text is also a durable transcript line).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The turn's certified dynamic guarantee outcomes (DR-0036 §2), matched by
+    /// name at settle by the advancement policy (ADR 0082 §5). Empty when the
+    /// runtime published no report — the local-truth path decides.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guarantee_outcomes: Vec<gaugewright_harness::GuaranteeOutcome>,
 }
 
 #[derive(Debug)]
@@ -367,12 +419,9 @@ impl std::fmt::Display for EngineError {
 
 /// Run one task turn against an existing engagement worktree.
 ///
-/// `transport` drives the engagement's Pi subprocess (real [`PiProcess`] in
-/// production, a scripted transport in tests); `gate` is the membrane. The run
+/// `harness` drives the engagement's selected runtime; `gate` is the membrane. The run
 /// lifecycle is admitted into `store` under `scope`; the runtime-session is
 /// seeded to `executing` and advanced by the turn.
-///
-/// [`PiProcess`]: gaugewright_pi_bridge::PiProcess
 pub fn run_task<G: EgressGate>(
     store: &mut Store,
     scope: &str,
@@ -417,13 +466,31 @@ pub fn run_task_streaming<G: EgressGate>(
     //    a fresh engagement begins from Init (requestRun); a subsequent turn
     //    re-enters from the prior run's terminal state (retryRun). Either way the
     //    run must be re-admitted before it can start (INV-11).
-    let begin = match store.fold::<RunState>(scope)?.phase {
-        RunPhase::Init => RunCommand::RequestRun,
-        _ => RunCommand::RetryRun, // a terminal prior run → next turn
-    };
-    store.admit::<RunState>(scope, begin)?;
-    store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
-    store.admit::<RunState>(scope, RunCommand::StartRun)?;
+    let initial_phase = store.fold::<RunState>(scope)?.phase;
+    let resuming_human = initial_phase == RunPhase::AwaitingHuman;
+    match initial_phase {
+        RunPhase::Init => {
+            store.admit::<RunState>(scope, RunCommand::RequestRun)?;
+            store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
+            store.admit::<RunState>(scope, RunCommand::StartRun)?;
+        }
+        RunPhase::Requested => {
+            store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
+            store.admit::<RunState>(scope, RunCommand::StartRun)?;
+        }
+        RunPhase::Admitted => {
+            store.admit::<RunState>(scope, RunCommand::StartRun)?;
+        }
+        RunPhase::Running => {}
+        // Delay the product transition until WhippleScript has admitted the
+        // correlated answer. A malformed/refused answer leaves the run waiting.
+        RunPhase::AwaitingHuman => {}
+        RunPhase::Completed | RunPhase::Failed | RunPhase::Canceled => {
+            store.admit::<RunState>(scope, RunCommand::RetryRun)?;
+            store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
+            store.admit::<RunState>(scope, RunCommand::StartRun)?;
+        }
+    }
 
     // Admit the user message as durable transcript evidence (turn-boundary). The
     // transcript records the **raw** task; mode framing is invisible context the
@@ -437,12 +504,15 @@ pub fn run_task_streaming<G: EgressGate>(
     );
 
     // 2. Drive one turn through the **harness** (ADR 0031) over the membrane. The
-    //    harness owns its protocol + session; the prompt is the raw task (the agent's
-    //    persona is its own `.pi/SYSTEM.md` in use mode, or the editor persona via
-    //    Pi's `--system-prompt` in edit mode — see `run_engagement_turn`, ADR 0029).
+    //    harness owns its protocol + session; the prompt is the raw task. Persona
+    //    comes from the selected authored package or separate editor package.
     let outcome: TurnOutcome = harness
         .run_turn(gate, task, images, sink)
         .map_err(EngineError::Harness)?;
+
+    if resuming_human {
+        store.admit::<RunState>(scope, RunCommand::ResumeRun)?;
+    }
 
     // 3a. Admit the runtime's execution evidence into the run (INV-4): each tool
     //     decision the membrane ruled on is an observation that becomes standing
@@ -451,12 +521,72 @@ pub fn run_task_streaming<G: EgressGate>(
         store.admit::<RunState>(scope, RunCommand::RecordObservation)?;
     }
 
+    if outcome.pending_human.is_some() {
+        admit_runtime_evidence_pointers(store, scope, &outcome.runtime_evidence_pointers, None)?;
+        store.admit::<RunState>(scope, RunCommand::AwaitHuman)?;
+        for obs in &outcome.observations {
+            if matches!(
+                obs.kind,
+                "egress" | "egress_staged" | "tool_result" | "egress_blocked"
+            ) {
+                record_transcript(store, scope, &ServerEvent::from_observation(obs));
+            }
+        }
+        record_transcript(
+            store,
+            scope,
+            &ServerEvent::Assistant {
+                text: outcome.assistant_text.clone(),
+            },
+        );
+        record_transcript(
+            store,
+            scope,
+            &ServerEvent::Admitted {
+                kind: "run".into(),
+                text: "run → AwaitingHuman".into(),
+            },
+        );
+        let merge_phase = store.fold::<MergeState>(scope)?.phase;
+        tracing::info!(
+            run_phase = ?RunPhase::AwaitingHuman,
+            ?merge_phase,
+            observations = outcome.observations.len(),
+            "engine.turn awaiting authenticated human"
+        );
+        return Ok(TaskResult {
+            run_phase: RunPhase::AwaitingHuman,
+            assistant_text: outcome.assistant_text,
+            diff: engagement.diff_against_main()?,
+            commit: None,
+            merge_phase,
+            mediated_tool_calls: outcome.mediated_tool_calls,
+            blocked_effects: outcome
+                .observations
+                .iter()
+                .filter(|observation| observation.kind == "egress_blocked")
+                .map(|observation| observation.detail.clone())
+                .collect(),
+            pending_approvals: outcome.pending_approvals,
+            pending_human: outcome.pending_human,
+            error: None,
+            // A suspended turn has no terminal receipt yet, hence no report.
+            guarantee_outcomes: Vec::new(),
+        });
+    }
+
     // 3b. Auto-commit the worktree (per-turn), then capture the reviewer's diff.
     let commit = engagement.commit_turn(task)?;
     let diff = engagement.diff_against_main()?;
+    admit_runtime_evidence_pointers(
+        store,
+        scope,
+        &outcome.runtime_evidence_pointers,
+        commit.as_ref().map(|commit| commit.0.as_str()),
+    )?;
 
     // 4. Map the turn outcome onto the run lifecycle: clean turn → completed,
-    //    a Pi/stream error → failed. Either way the events are durable facts.
+    //    a runtime/stream error → failed. Either way the events are durable facts.
     let run_phase = if outcome.error.is_none() {
         store.admit::<RunState>(scope, RunCommand::CompleteRun)?;
         RunPhase::Completed
@@ -470,13 +600,13 @@ pub fn run_task_streaming<G: EgressGate>(
     store.admit::<MergeState>(scope, MergeCommand::StartMerge)?;
     let probe = engagement.merge_probe()?;
     // UX-7: a test-only injection forces the conflict path (INV-24 isolate + repair context)
-    // so a browser BDD can drive conflict-repair without staging a real git conflict.
+    // so a browser BDD can drive conflict-repair without staging a real workspace conflict.
     let merge_cmd = if force_merge_conflict() {
-        MergeCommand::GitConflict
+        MergeCommand::WorkspaceConflict
     } else {
         match probe {
-            MergeOutcome::Clean => MergeCommand::GitClean,
-            MergeOutcome::Conflict => MergeCommand::GitConflict,
+            MergeOutcome::Clean => MergeCommand::WorkspaceClean,
+            MergeOutcome::Conflict => MergeCommand::WorkspaceConflict,
         }
     };
     let merge = store.admit::<MergeState>(scope, merge_cmd)?;
@@ -487,7 +617,12 @@ pub fn run_task_streaming<G: EgressGate>(
     //    owners of everything the engagement has read across turns — sound even after
     //    a read context is later revoked or tombstoned — so a later export/review
     //    gates on persisted handles, not a loose stakeholder set.
-    if let Ok(reads) = crate::resource_store::granted_context(store, scope) {
+    let output_reads = if outcome.output_flow_signature.is_empty() {
+        crate::resource_store::granted_context(store, scope)
+    } else {
+        crate::resource_store::certified_output_reads(store, scope, &outcome.output_flow_signature)
+    };
+    if let Ok(reads) = output_reads {
         let _ = crate::resource_store::record_reads(store, scope, &reads);
     }
     // The output is owned by the scope's authenticated owning authority
@@ -568,11 +703,13 @@ pub fn run_task_streaming<G: EgressGate>(
         run_phase,
         assistant_text: outcome.assistant_text,
         diff,
+        guarantee_outcomes: outcome.guarantee_outcomes,
         commit: commit.map(|c| c.0),
         merge_phase: merge.phase,
         mediated_tool_calls: outcome.mediated_tool_calls,
         blocked_effects,
         pending_approvals: outcome.pending_approvals,
+        pending_human: None,
         error: outcome.error,
     })
 }
@@ -605,11 +742,9 @@ pub struct RemoteTaskResult {
 /// ([`determine_scope_authority`](gaugewright_core::determine_scope_authority), MINT-1),
 /// not the hardcoded local constant.
 ///
-/// The single-process loopback shape ([`RemoteLoopbackHarness`]) and a real
-/// cross-machine relay attach behind the same seam with no rearchitecture
+/// The test-only single-process loopback harness and a real cross-machine relay
+/// attach behind the same neutral seam with no rearchitecture
 /// (`RENDEZVOUS-STUB-1`).
-///
-/// [`RemoteLoopbackHarness`]: gaugewright_pi_bridge::RemoteLoopbackHarness
 pub fn run_task_remote(
     store: &mut Store,
     scope: &str,
@@ -685,8 +820,8 @@ pub fn run_task_remote(
 }
 
 /// Fail-closed model-credential check (LLM-1, [ADR 0062]): does a usable credential
-/// resolve for `provider`? A **BYOK** provider needs its key linked (present in
-/// `credential_envs`, resolved from the account's `SEC-4`-sealed store); an **OAuth**
+/// resolve for `provider`? A **BYOK** provider needs its exact-reference
+/// capability resolved from the account's `SEC-4`-sealed store; an **OAuth**
 /// provider (`openai-codex`, …) authenticates via the runtime adapter's own store,
 /// which the turn's `factory` answers for ([`HarnessFactory::credential_status`]).
 /// The refusal POLICY — whether a turn runs — stays here; the adapter only reports
@@ -694,13 +829,13 @@ pub fn run_task_remote(
 /// run refuses up front instead of letting the runtime fail opaquely on a missing key.
 fn llm_credential_status(
     provider: &str,
-    credential_envs: &[(String, String)],
+    credential_capability: Option<&dyn gaugewright_harness::CredentialCapability>,
     factory: &dyn HarnessFactory,
 ) -> Result<(), String> {
-    // BYOK: a provider with a linked-key env mapping — the one provider → env map,
-    // [`crate::account::provider_env_var`] — needs its key resolved into the turn env.
-    if let Some(var) = crate::account::provider_env_var(provider) {
-        return if credential_envs.iter().any(|(k, _)| k == var) {
+    // BYOK providers require an exact-reference GaugeDesk capability. Secret
+    // bytes remain sealed until WhippleScript admits that reference.
+    if crate::account::provider_env_var(provider).is_some() {
+        return if credential_capability.is_some() {
             Ok(())
         } else {
             Err(format!(
@@ -714,17 +849,11 @@ fn llm_credential_status(
         // secret names and provider routing live in the private managed-service host. The
         // open engine only requires a neutral readiness signal from that host.
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => {
-            let get = |k: &str| -> Option<String> {
-                credential_envs
-                    .iter()
-                    .find(|(kk, _)| kk == k)
-                    .map(|(_, v)| v.clone())
-                    .or_else(|| std::env::var(k).ok())
-            };
+            let get = |k: &str| std::env::var(k).ok();
             host_managed_model_status(provider, &get)
         }
         // OAuth providers authenticate via the adapter's own auth store.
-        _ => match factory.credential_status(provider, credential_envs) {
+        _ => match factory.credential_status(provider, credential_capability) {
             CredentialProbe::Ready => Ok(()),
             CredentialProbe::Missing(reason) => Err(reason),
         },
@@ -769,6 +898,46 @@ fn record_precheck_failure(
     reason: String,
     code: &str,
 ) -> Result<TaskResult, String> {
+    let current = store
+        .fold::<RunState>(scope)
+        .map_err(|e| format!("{e:?}"))?
+        .phase;
+    if current == RunPhase::AwaitingHuman {
+        // Credential availability is product policy, not an answer to the
+        // suspended ask. Keep the exact epoch live so the authenticated user can
+        // retry after fixing credentials; do not convert suspension into failure.
+        record_transcript(
+            store,
+            scope,
+            &ServerEvent::User {
+                text: task.to_string(),
+            },
+        );
+        record_transcript(
+            store,
+            scope,
+            &ServerEvent::Error {
+                reason: reason.clone(),
+                code: Some(code.to_string()),
+            },
+        );
+        return Ok(TaskResult {
+            run_phase: RunPhase::AwaitingHuman,
+            assistant_text: String::new(),
+            diff: String::new(),
+            commit: None,
+            merge_phase: store
+                .fold::<MergeState>(scope)
+                .map_err(|e| format!("{e:?}"))?
+                .phase,
+            mediated_tool_calls: Vec::new(),
+            blocked_effects: Vec::new(),
+            pending_approvals: Vec::new(),
+            pending_human: None,
+            error: Some(reason),
+            guarantee_outcomes: Vec::new(),
+        });
+    }
     // The run starts then immediately fails on the gate — the same lifecycle a turn
     // that reaches the harness and errors admits (RequestRun→AdmitRun→StartRun→FailRun),
     // minus the observations no turn produced.
@@ -814,7 +983,9 @@ fn record_precheck_failure(
         mediated_tool_calls: Vec::new(),
         blocked_effects: Vec::new(),
         pending_approvals: Vec::new(),
+        pending_human: None,
         error: Some(reason),
+        guarantee_outcomes: Vec::new(),
     })
 }
 
@@ -823,41 +994,68 @@ fn record_precheck_failure(
 /// credentials, provider/model, fail-closed precheck, base sandbox) into a
 /// [`HarnessSpec`]; the runtime itself is constructed by the factory the
 /// per-turn selector picks ([`crate::harness_select::factory_for_turn`] — the
-/// real Pi adapter, or the scripted fake under `GAUGEWRIGHT_FAKE_AGENT`).
+/// real WhippleScript adapter, or the scripted fake under `GAUGEWRIGHT_FAKE_AGENT`).
 /// Returns the turn result, or a human-readable error (the model endpoint may
 /// be unauthenticated/offline).
 ///
 /// Blocking: holds the workbench lock for the turn (local single-user MVP). SSE
 /// subscribers already hold their receivers, so the live stream is unaffected.
+pub struct EngagementTurnInput<'a> {
+    pub task: &'a str,
+    pub images: &'a [ImageContent],
+    pub mode: ChatMode,
+    pub authenticated_actor: Option<&'a gaugewright_core::ids::AuthorityId>,
+}
+
 pub fn run_engagement_turn(
     wb: &SharedWorkbench,
     id: &str,
     worktree: &Path,
     sender: &broadcast::Sender<ServerEvent>,
-    task: &str,
-    images: &[ImageContent],
-    mode: ChatMode,
+    input: EngagementTurnInput<'_>,
 ) -> Result<TaskResult, String> {
+    let EngagementTurnInput {
+        task,
+        images,
+        mode,
+        authenticated_actor,
+    } = input;
     let config =
         AgentConfig::from_file(&worktree.join(definition::CONFIG_PATH)).unwrap_or_default();
     let gate = MembraneGate::new(&config, default_external_tools()).with_mode(mode);
 
-    // A linked provider account (ACCT-1) is injected into the runtime so it is actually
-    // used: resolve the operator's sealed credentials to provider env vars now (no lock
-    // is held here), and add them to the Pi env below. Empty when nothing is linked.
-    // Nearest-scope-wins (LLM-2, ADR 0062): a credential pinned in *this chat's project*
-    // overrides the account default per provider.
-    let credential_envs: Vec<(String, String)> = {
+    // GaugeDesk keeps credential custody. The selected provider material is
+    // resolved later into one exact-reference in-memory capability; the turn no
+    // longer receives an ambient environment-shaped secret vector.
+    let (whip_factory, actor, package_selection) = {
         let g = wb.lock_unpoisoned();
-        g.resolved_credential_envs_for_chat(id)
+        let factory = g
+            .whip_harness_factory()
+            .map_err(|error| error.to_string())?;
+        (
+            factory,
+            authenticated_actor
+                .cloned()
+                .unwrap_or_else(|| g.authority().clone()),
+            g.package_selection_for_chat(id),
+        )
     };
 
-    // The agent's persona is a Pi-native method resource (ADR 0029), not something
-    // gaugewright prepends to the prompt:
-    //   - use mode: no override — Pi discovers the agent's own `.pi/SYSTEM.md` +
-    //     `AGENTS.md` from the worktree;
-    //   - edit mode: the editor persona is passed as Pi's `--system-prompt`, so it
-    //     *replaces* the agent's own SYSTEM.md for the authoring turn.
+    let (package_root, package_version_ref) = match mode {
+        ChatMode::Edit => (None, None),
+        ChatMode::Use => package_selection
+            .map(|(version, package_ref)| {
+                (
+                    Some(worktree.join(gaugewright_boundary::definition::version_root(version))),
+                    Some(package_ref),
+                )
+            })
+            .unwrap_or((None, None)),
+    };
+
+    // Persona is package content (ADR 0081), never host runtime configuration:
+    // work chats select the placement's exact authored package; edit chats
+    // select GaugeDesk's separate editor package.
     let system_prompt: Option<String> = match mode {
         ChatMode::Edit => Some(EDITOR_FRAMING.to_string()),
         ChatMode::Use => None,
@@ -866,9 +1064,9 @@ pub fn run_engagement_turn(
     // The one harness decision point (SUB-0): which adapter drives this turn.
     // Consulted per turn — tests flip `GAUGEWRIGHT_FAKE_AGENT` against a live
     // workbench, so the selection must never be cached at startup.
-    let factory = crate::harness_select::factory_for_turn();
+    let factory = crate::harness_select::factory_for_turn(whip_factory);
 
-    // Mock-LLM mode: no Pi spawn, no model call. The scripted fake drives the
+    // Mock-LLM mode: no WhippleScript runtime, no model call. The scripted fake drives the
     // exact same turn loop (membrane + reducers unchanged); its pre-turn side
     // effects — the `[slow]` hold and the note append — run here, in the
     // blocking pool BEFORE any lock is taken (see `ScriptedFakeFactory::pre_turn`).
@@ -882,14 +1080,32 @@ pub fn run_engagement_turn(
             chat_id: id.to_string(),
             worktree: worktree.to_path_buf(),
             mode,
+            package_root: package_root.clone(),
+            package_version_ref: package_version_ref.clone(),
+            policy_epoch: None,
+            signed_policy_envelope: None,
+            provider_binding_ref: None,
+            credential_ref: None,
+            placement_ceiling_ref: None,
             provider: None,
             model: None,
             thinking: None,
             system_prompt,
-            credentials: credential_envs,
+            credential_capability: None,
+            credentials: Vec::new(),
             sandbox: gaugewright_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()]),
         };
-        drive_persistent_turn(wb, id, &gate, task, images, sender, factory.as_ref(), &spec)?
+        drive_persistent_turn(
+            wb,
+            id,
+            &gate,
+            task,
+            images,
+            sender,
+            factory.as_ref(),
+            &spec,
+            actor.as_str(),
+        )?
     } else {
         // Resolve the turn's provider/model. A **deployment host** (SERVE-2 hosted embed)
         // forces every turn through its egress membrane by setting `GAUGEWRIGHT_MODEL_PROVIDER`
@@ -903,15 +1119,50 @@ pub fn run_engagement_turn(
             std::env::var("GAUGEWRIGHT_MODEL_PROVIDER").ok(),
             config.provider.clone(),
         );
+        let credential_ref = wb.lock_unpoisoned().credential_ref_for_chat(id, &provider);
+        let credential_capability = if provider == "openai-codex" {
+            match crate::codex_oauth::resolve_runtime_credential(wb) {
+                Ok(Some(credential)) => Some(crate::account::resolved_credential_capability(
+                    credential_ref.clone(),
+                    credential.access,
+                    Some(credential.account_id),
+                )),
+                Ok(None) => None,
+                Err(reason) => {
+                    let _ = sender.send(ServerEvent::Error {
+                        reason: reason.clone(),
+                        code: Some("credential_refresh_failed".into()),
+                    });
+                    let mut workbench = wb.lock_unpoisoned();
+                    return record_precheck_failure(
+                        &mut workbench.store,
+                        id,
+                        task,
+                        reason,
+                        "credential_refresh_failed",
+                    );
+                }
+            }
+        } else {
+            wb.lock_unpoisoned()
+                .credential_capability_for_chat(id, &provider)
+        };
         let model = resolve_turn_model(
             std::env::var("GAUGEWRIGHT_MODEL").ok(),
             config.model.clone(),
         );
+        let provider_descriptor =
+            gaugewright_whip_runtime::native_provider_descriptor(&provider, model.as_deref())
+                .map_err(|error| error.to_string())?;
         // Fail closed (LLM-1, ADR 0062): refuse a real run when no model credential resolves for
         // the resolved provider. Record it as a durable, coded failure turn so the chat log
         // shows *why* with an actionable "open settings" affordance — not just a status line —
-        // then return the same Failed shape an in-turn failure returns (never let Pi fail opaquely).
-        if let Err(reason) = llm_credential_status(&provider, &credential_envs, factory.as_ref()) {
+        // then return the same Failed shape an in-turn failure returns (never let the runtime fail opaquely).
+        if let Err(reason) = llm_credential_status(
+            &provider,
+            credential_capability.as_deref(),
+            factory.as_ref(),
+        ) {
             let _ = sender.send(ServerEvent::Error {
                 reason: reason.clone(),
                 code: Some("no_credential".into()),
@@ -920,12 +1171,11 @@ pub fn run_engagement_turn(
             return record_precheck_failure(&mut g.store, id, task, reason, "no_credential");
         }
 
-        // The OS sandbox the turn runs under (ADR 0030): the worktree is writable;
-        // in use mode the definition surface is re-imposed read-only, so a write by
-        // ANY tool — edit, write, or bash — fails at the kernel. This is the
-        // load-bearing INV-24 enforcement. It is the SHELL's base policy only: the
-        // adapter extends it with its private needs (Pi adds its session dir +
-        // `~/.pi` as writable roots — see the Pi factory's `pi_config_for`).
+        // GaugeDesk's workspace and egress policy for this turn (ADR 0030): the
+        // worktree is writable, while use mode marks the method definition
+        // read-only. WhippleScript resolves that policy into confined native
+        // workspace capabilities, so writes outside the grant or into protected
+        // subtrees fail before filesystem execution (INV-24).
         let sandbox_policy = {
             use gaugewright_harness::sandbox::Network;
             let writable = vec![worktree.to_path_buf()];
@@ -945,42 +1195,23 @@ pub fn run_engagement_turn(
             let project_isolated = wb.lock_unpoisoned().chat_network_isolated(id);
             let forced_unfiltered =
                 std::env::var("GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS").as_deref() == Ok("1");
-            // CORE-5: only *request* Filtered where this host can actually enforce it
-            // (bwrap + a rootless userspace-net helper + verified routing). Where it
-            // can't, a non-isolated project stays on the accepted open-by-default
-            // posture (unfiltered, disclosed ceiling) rather than requesting a Filtered
-            // that the harness would fail closed to Deny — which would silently break
-            // out-of-box model access. Filtering upgrades the default automatically when
-            // a host becomes capable.
-            let filtered_enforceable =
-                gaugewright_harness::sandbox::detect_routing_caps().can_enforce_filtered();
-            let posture = egress_posture(project_isolated, forced_unfiltered, filtered_enforceable);
+            let posture = egress_posture(project_isolated, forced_unfiltered);
             match posture {
                 Network::Deny => eprintln!(
-                    "[gaugewright] NOTE: this project isolates Pi's network (fail-closed); \
+                    "[gaugewright] NOTE: this project denies WhippleScript provider egress; \
                      the model endpoint ({}) is unreachable. Turn off isolation for \
                      the project to let the agent reach the model.",
                     egress_hosts.join(", ")
                 ),
                 Network::Filtered => eprintln!(
-                    "[gaugewright] NOTE: Pi runs with FILTERED network egress — reachable \
-                     ONLY the model endpoint ({}), via the host-filtering proxy (CORE-5).",
-                    egress_hosts.join(", ")
-                ),
-                // Two ways to land here (see `egress_posture`): the conscious unfiltered
-                // opt-in, or a non-isolated project on a host that can't enforce filtering.
-                Network::Allow if forced_unfiltered => eprintln!(
-                    "[gaugewright] NOTE: Pi runs with UNFILTERED network egress \
-                     (GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1) — the agent can reach ANY host, \
-                     not just the model endpoint ({}). Unset it to fall back to filtered egress.",
+                    "[gaugewright] NOTE: WhippleScript provider egress is restricted to \
+                     the admitted model endpoint ({}) and redirects fail closed.",
                     egress_hosts.join(", ")
                 ),
                 Network::Allow => eprintln!(
-                    "[gaugewright] NOTE: Pi runs with UNFILTERED network egress — per-host \
-                     filtering (CORE-5) isn't enforceable on this host (needs bwrap + \
-                     pasta/slirp4netns with verified routing), so 'open' keeps its disclosed \
-                     lower ceiling: the agent can reach ANY host, not just the model endpoint \
-                     ({}). Isolate the project to fail closed, or install the routing helper.",
+                    "[gaugewright] NOTE: project policy allows unfiltered egress \
+                     (GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1); the current WhippleScript \
+                     package still exposes only its governed provider endpoint ({}).",
                     egress_hosts.join(", ")
                 ),
             }
@@ -995,26 +1226,123 @@ pub fn run_engagement_turn(
                 Network::Deny => base.allow_hosts(egress_hosts),
             }
         };
+        let package_capabilities: BTreeSet<String> = match mode {
+            ChatMode::Use => {
+                let root = package_root.as_deref().ok_or_else(|| {
+                    "a work chat has no selected WhippleScript package root".to_owned()
+                })?;
+                gaugewright_whip_runtime::AuthoredAgentPackage::load(root)
+                    .map_err(|error| error.to_string())?
+                    .capabilities()
+                    .iter()
+                    .cloned()
+                    .collect()
+            }
+            ChatMode::Edit => gaugewright_whip_runtime::editor_package_capabilities()
+                .map_err(|error| error.to_string())?,
+        };
+        let policy_epoch = {
+            let mut g = wb.lock_unpoisoned();
+            let project_id = g.library_project_of_chat(id);
+            let turn_purpose = g.library_chat_run_purpose(id);
+            let granted = crate::resource_store::granted_context(&g.store, id)
+                .map_err(|error| format!("{error:?}"))?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let mut resources =
+                crate::resource_store::list(&g.store, id).map_err(|error| format!("{error:?}"))?;
+            resources.retain(|record| granted.contains(&record.resource.id));
+            let org =
+                crate::org::Org::rebuild(g.store_ref()).map_err(|error| format!("{error:?}"))?;
+            // The operator's auto-keep scopes (ATTN-3) become an envelope
+            // guarantee declaration the runtime evaluates per turn (ADR 0082
+            // §5). A scope change re-canonicalizes the policy → new epoch.
+            // (Read before the mutable compile call below.)
+            let advancement_scopes = crate::advancement::AdvancementRules::parse(
+                g.account_settings()
+                    .ok()
+                    .and_then(|s| {
+                        s.get(crate::advancement::ADVANCEMENT_RULES_SETTING)
+                            .cloned()
+                    })
+                    .as_deref(),
+            )
+            .declared_scopes();
+            let actor_attributes = g.idp.as_ref().map_or_else(
+                || gaugewright_core::abac::AuthorityAttributes {
+                    clearance: gaugewright_core::abac::Clearance(3),
+                    roles: BTreeSet::from([gaugewright_core::abac::Role::owner()]),
+                    region: org
+                        .security
+                        .as_ref()
+                        .and_then(|security| security.residency_region.as_deref())
+                        .or_else(|| {
+                            org.org
+                                .as_ref()
+                                .and_then(|record| record.default_region.as_deref())
+                        })
+                        .map(gaugewright_core::abac::Region::new),
+                    ..gaugewright_core::abac::AuthorityAttributes::default()
+                },
+                |idp| idp.claims(&actor),
+            );
+            g.compile_whipple_policy(PolicyCompilationInput {
+                chat_id: id.to_owned(),
+                project_id,
+                actor: actor.as_str().to_owned(),
+                actor_attributes,
+                org_policy: org.policy(),
+                turn_purpose,
+                package_capabilities,
+                provider: provider.clone(),
+                model: provider_descriptor.model.clone(),
+                base_url: provider_descriptor.base_url.clone(),
+                credential_ref,
+                placement_kind: "local".to_owned(),
+                command_network: sandbox_policy.network
+                    != gaugewright_harness::sandbox::Network::Deny,
+                resources,
+                advancement_scopes,
+            })?
+        };
         let spec = HarnessSpec {
             chat_id: id.to_string(),
             worktree: worktree.to_path_buf(),
             mode,
+            package_root,
+            package_version_ref,
+            policy_epoch: Some(policy_epoch.epoch),
+            signed_policy_envelope: Some(policy_epoch.signed_envelope),
+            provider_binding_ref: Some(policy_epoch.provider_binding_ref),
+            credential_ref: Some(policy_epoch.credential_ref),
+            placement_ceiling_ref: Some(policy_epoch.placement_ceiling_ref),
             // Pin the codex endpoint by default (the authed OAuth provider) so a bare
             // model name can't silently resolve to an unauthenticated provider. Resolved
             // once above for the fail-closed credential check.
             provider: Some(provider),
-            model,
-            // Per-chat reasoning effort (LLM-1, ADR 0062): unset → Pi's per-model default.
+            model: Some(provider_descriptor.model),
+            // Per-chat reasoning effort (LLM-1, ADR 0062): unset → the provider default.
             thinking: config.thinking.clone(),
-            // Edit mode replaces the agent's own SYSTEM.md with the editor persona;
-            // use mode leaves it unset so the adapter discovers the agent's definition.
+            // Only the editor package receives host-supplied editor framing.
+            // Work-chat persona is immutable authored package content.
             system_prompt,
+            credential_capability,
             // A linked provider account (ACCT-1), if any — resolved above,
             // nearest-scope-wins (LLM-2, ADR 0062).
-            credentials: credential_envs,
+            credentials: Vec::new(),
             sandbox: sandbox_policy,
         };
-        drive_persistent_turn(wb, id, &gate, task, images, sender, factory.as_ref(), &spec)?
+        drive_persistent_turn(
+            wb,
+            id,
+            &gate,
+            task,
+            images,
+            sender,
+            factory.as_ref(),
+            &spec,
+            actor.as_str(),
+        )?
     };
 
     // WS-D: if this chat is homed to a workstream, greedily auto-sync its clean turn
@@ -1022,6 +1350,13 @@ pub fn run_engagement_turn(
     // hop. A non-member chat (target `main`) is untouched: its merge stays Clean for the
     // human's review, exactly as before.
     greedy_autosync(wb, id, sender);
+
+    // ADR 0082 §4: the shipped no-op rule (ATTN-1 — a turn that changed nothing
+    // has no review surface) and the operator's fail-closed advancement rules
+    // (ATTN-3) both evaluate here; anything not explicitly advanced holds.
+    // The turn's certified guarantee outcomes (when the runtime published a
+    // report) take precedence over local workspace truth (ADR 0082 §5).
+    auto_advance_turn(wb, id, sender, &result.guarantee_outcomes);
 
     let _ = sender.send(ServerEvent::Admitted {
         kind: "run".into(),
@@ -1061,9 +1396,12 @@ pub fn run_public_turn(
         session_id,
         worktree,
         sender,
-        task,
-        images,
-        ChatMode::Use,
+        EngagementTurnInput {
+            task,
+            images,
+            mode: ChatMode::Use,
+            authenticated_actor: None,
+        },
     )
 }
 
@@ -1097,6 +1435,36 @@ fn public_turn_allowed(phase: gaugewright_core::public_session::Phase) -> Result
 fn greedy_autosync(wb: &SharedWorkbench, id: &str, sender: &broadcast::Sender<ServerEvent>) {
     let mut g = wb.lock_unpoisoned();
     g.greedy_autosync(id, sender);
+}
+
+/// The settle-time auto-advance (ADR 0082 §4): a settled turn on a **mainline**
+/// chat auto-admits and advances its Clean merge when either
+///
+/// 1. **the shipped no-op rule** (ATTN-1) applies — the diff names no file at
+///    all, so the keep would gate nothing (strictly empty only: an
+///    internal-only dotfile diff still holds, `.agent-config.json` is where a
+///    policy loosening lives); or
+/// 2. **an operator advancement rule** (ATTN-3, `advancement.rs`) covers it —
+///    fail-closed, with unwaivable config-touch and external-read guards.
+///
+/// Every advance stays admitted events (`INV-2`/`INV-4`) plus a transcript
+/// citation saying *why* no human gated it. Mainline chats only: a workstream
+/// member's clean turn is `greedy_autosync`'s job; advancing it here would
+/// bypass the membership `Contribute` gate (WS-G).
+fn auto_advance_turn(
+    wb: &SharedWorkbench,
+    id: &str,
+    sender: &broadcast::Sender<ServerEvent>,
+    guarantee_outcomes: &[gaugewright_harness::GuaranteeOutcome],
+) {
+    let mut g = wb.lock_unpoisoned();
+    g.auto_advance_turn(id, sender, guarantee_outcomes);
+}
+
+/// Whether a unified diff names no file — mirrors the web client's `diffHasFiles`
+/// (changed-files.ts), so "nothing to review" means the same thing on both sides.
+fn diff_names_no_files(diff: &str) -> bool {
+    !diff.lines().any(|line| line.starts_with("diff --git "))
 }
 
 impl Workbench {
@@ -1184,6 +1552,127 @@ impl Workbench {
             }
         }
     }
+
+    // See [`auto_advance_turn`]. Split from `greedy_autosync` because the two
+    // advance different refs under different gates: the stream hop is membership-
+    // gated (Contribute), the mainline hop is emptiness/rule-gated.
+    fn auto_advance_turn(
+        &mut self,
+        id: &str,
+        sender: &broadcast::Sender<ServerEvent>,
+        guarantee_outcomes: &[gaugewright_harness::GuaranteeOutcome],
+    ) {
+        let Some(target) = self.engagements.get(id).map(|e| e.target().to_string()) else {
+            return;
+        };
+        // A workstream member is greedy_autosync's job — never advanced from here.
+        let is_member = self
+            .engagement_index
+            .get(id)
+            .and_then(|iid| self.instances.get(iid))
+            .and_then(|inst| inst.workstream_id_of(&target))
+            .is_some();
+        if is_member {
+            return;
+        }
+        if self.store.fold::<MergeState>(id).map(|m| m.phase).ok() != Some(MergePhase::Clean) {
+            return;
+        }
+        let Some(diff) = self
+            .engagements
+            .get(id)
+            .and_then(|e| e.diff_against_main().ok())
+        else {
+            return; // unreadable diff → hold (fail-closed)
+        };
+        let (citation, noop) = if diff_names_no_files(&diff) {
+            // ATTN-1, the shipped no-op rule: any named file — internal
+            // dotfiles included — falls through to the operator rules below.
+            (
+                "the turn changed no files (no-op rule, ADR 0082)".to_string(),
+                true,
+            )
+        } else {
+            // ATTN-3, the operator's advancement rules: fail-closed. Facts are
+            // GaugeDesk-owned workspace truth (write side) + the engagement's
+            // certified read-set stakeholders (read side); a fact that can't
+            // be resolved holds rather than advances.
+            let rules = crate::advancement::AdvancementRules::parse(
+                self.account_settings()
+                    .ok()
+                    .and_then(|s| {
+                        s.get(crate::advancement::ADVANCEMENT_RULES_SETTING)
+                            .cloned()
+                    })
+                    .as_deref(),
+            );
+            if rules.is_empty() {
+                return;
+            }
+            let owner = gaugewright_core::determine_scope_authority(id);
+            let external =
+                crate::resource_store::external_read_stakeholders(&self.store, id, owner.as_str())
+                    .unwrap_or_else(|_| vec!["<unresolved>".to_string()]);
+            let facts = crate::advancement::TurnFacts {
+                changed_paths: crate::advancement::TurnFacts::changed_paths_of(&diff),
+                external_read_stakeholders: external,
+            };
+            // The unwaivable guards apply before EITHER decision path — a
+            // certified write guarantee does not certify these axes.
+            if facts.violates_safety().is_some() {
+                return;
+            }
+            // Certified-first (ADR 0082 §5): a held operator guarantee advances
+            // on the runtime's certificate; a certified violation holds hard,
+            // never consulting local truth against it; unwitnessed falls back
+            // to the local-truth coverage check.
+            let citation = match rules.decide_from_guarantees(guarantee_outcomes) {
+                crate::advancement::GuaranteeVerdict::AdvanceHeld(citation) => {
+                    format!("{citation} (ADR 0082)")
+                }
+                crate::advancement::GuaranteeVerdict::HoldViolated(_) => return,
+                crate::advancement::GuaranteeVerdict::Unwitnessed => match rules.decide(&facts) {
+                    Some(citation) => format!("{citation} (ADR 0082)"),
+                    None => return,
+                },
+            };
+            (citation, false)
+        };
+        let store = &mut self.store;
+        let engagements = &self.engagements;
+        if store
+            .admit::<MergeState>(id, MergeCommand::PolicyAdmit)
+            .is_err()
+        {
+            return;
+        }
+        match engagements.get(id).map(|e| e.merge_into_main()) {
+            Some(Ok(MergeOutcome::Clean)) => {
+                let _ = store.admit::<MergeState>(id, MergeCommand::AdvanceStandingRef);
+            }
+            // Raced with another writer — leave it Clean for the review surface.
+            _ => return,
+        }
+        // ADR 0082 §4: every auto-advance is admitted as durable evidence
+        // citing the rule it matched. That WHY is governance audit, not
+        // conversation — it lands on the engagement's audit record
+        // (`GET /chats/:id/audit`), never in the user's transcript. The user
+        // surface stays silent for a no-op turn (nothing they can see moved)
+        // and says it in plain words when real changes advanced.
+        let _ = store.append_record(
+            id,
+            "audit",
+            &serde_json::json!({ "kind": "auto_advance", "citation": citation }).to_string(),
+        );
+        if !noop {
+            let advanced = ServerEvent::Admitted {
+                kind: "merge".into(),
+                text: "merged to main automatically".to_string(),
+            };
+            record_transcript(store, id, &advanced);
+            let _ = sender.send(advanced);
+        }
+    }
 }
 
 /// The sink that fans a turn's observations onto the live `sender` (skipping
@@ -1198,9 +1687,9 @@ fn live_sink(sender: &broadcast::Sender<ServerEvent>) -> impl FnMut(&Observation
 }
 
 /// Drive one turn over the engagement's session, constructed by `factory` from
-/// `spec`. A caching adapter's harness ([`HarnessFactory::reuse_across_turns`],
-/// Pi) is **persistent** — created on the first turn and reused thereafter, so
-/// the conversation thread carries context across turns (`pi-rpc.md`); a turn
+/// `spec`. A caching adapter's harness ([`HarnessFactory::reuse_across_turns`])
+/// is **persistent** — created on the first turn and reused thereafter, so
+/// the conversation thread carries context across turns; a turn
 /// that errors retires the (likely dead) harness so the next turn recreates a
 /// fresh thread. A non-caching adapter (the scripted fake) gets a fresh harness
 /// every turn.
@@ -1214,9 +1703,11 @@ fn drive_persistent_turn(
     sender: &broadcast::Sender<ServerEvent>,
     factory: &dyn HarnessFactory,
     spec: &HarnessSpec,
+    actor_ref: &str,
 ) -> Result<TaskResult, String> {
     let mut g = wb.lock_unpoisoned();
-    let result = g.drive_persistent_local_turn(id, gate, task, images, sender, factory, spec);
+    let result =
+        g.drive_persistent_local_turn(id, gate, task, images, sender, factory, spec, actor_ref);
     // Advance the onboarding checklist on a completed turn (ADR 0075 Phase 2).
     // Idempotent: once the "first_turn" item is closed, later turns match nothing.
     // Best-effort, under the lock we already hold; never affects the turn result.
@@ -1237,6 +1728,7 @@ impl Workbench {
         sender: &broadcast::Sender<ServerEvent>,
         factory: &dyn HarnessFactory,
         spec: &HarnessSpec,
+        actor_ref: &str,
     ) -> Result<TaskResult, String> {
         let store = &mut self.store;
         let engagements = &self.engagements;
@@ -1252,6 +1744,7 @@ impl Workbench {
             let mut harness = factory
                 .create(spec)
                 .map_err(|e| format!("spawn {}: {e}", factory.kind()))?;
+            harness.bind_authenticated_actor(actor_ref);
             let mut sink = live_sink(sender);
             return run_task_streaming(
                 store,
@@ -1274,6 +1767,9 @@ impl Workbench {
         }
         let harness: &mut dyn Harness =
             sessions.get_mut(id).expect("session just ensured").as_mut();
+        // Refresh on every request: a persistent chat may be answered by a
+        // different authenticated member than the one who created its harness.
+        harness.bind_authenticated_actor(actor_ref);
         // Publish this turn's interrupt handle so a concurrent Stop can terminate it
         // out-of-band (unblocking `recv`) — the registry is outside the workbench lock
         // this turn holds. A harness with nothing to interrupt registers nothing.
@@ -1354,18 +1850,63 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
 
-    // Fail-closed credential check (LLM-1, ADR 0062): a BYOK provider needs its key
-    // present in the resolved env; absent ⇒ an actionable refusal, never a silent run.
+    #[derive(Debug)]
+    struct PresentCredential;
+
+    impl gaugewright_harness::CredentialCapability for PresentCredential {
+        fn credential_ref(&self) -> &str {
+            "credential:test"
+        }
+
+        fn resolve(
+            &self,
+            credential_ref: &str,
+        ) -> io::Result<gaugewright_harness::CredentialMaterial> {
+            if credential_ref != self.credential_ref() {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong ref"));
+            }
+            Ok(gaugewright_harness::CredentialMaterial::new("secret", None))
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_crossing_is_pointer_only_position_paired_and_idempotent() {
+        let mut store = Store::open_in_memory().unwrap();
+        let pointer = r#"{"pointer_kind":"event","pointer":{"position":{"instance_ref":"whip:1","sequence":7},"evidence_ref":"whip:evidence:7"}}"#.to_owned();
+        let first = admit_runtime_evidence_pointers(
+            &mut store,
+            "chat-1",
+            std::slice::from_ref(&pointer),
+            Some("whipple-cut-1"),
+        )
+        .unwrap();
+        let replay = admit_runtime_evidence_pointers(
+            &mut store,
+            "chat-1",
+            std::slice::from_ref(&pointer),
+            Some("whipple-cut-1"),
+        )
+        .unwrap();
+        assert_eq!(first, replay);
+        let rows = store
+            .records("chat-1", RUNTIME_EVIDENCE_POINTER_KIND)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("whip:evidence:7"));
+        assert!(rows[0].contains("whipple-cut-1"));
+        assert!(!rows[0].contains("evidence_body"));
+    }
+
+    // Fail-closed credential check (LLM-1, ADR 0062): a BYOK provider needs its
+    // reference-bound capability; absent ⇒ an actionable refusal, never a silent run.
     // The BYOK leg is shell policy — the factory is never consulted for it.
     #[test]
     fn byok_provider_requires_its_linked_key() {
         let pi = gaugewright_pi_bridge::PiHarnessFactory;
-        let with_openai = vec![("OPENAI_API_KEY".to_string(), "sk-x".to_string())];
-        assert!(llm_credential_status("openai", &with_openai, &pi).is_ok());
-        // anthropic needs ITS key, not openai's
-        assert!(llm_credential_status("anthropic", &with_openai, &pi).is_err());
+        let capability = PresentCredential;
+        assert!(llm_credential_status("openai", Some(&capability), &pi).is_ok());
         // nothing linked ⇒ refused with an actionable message
-        let err = llm_credential_status("anthropic", &[], &pi).unwrap_err();
+        let err = llm_credential_status("anthropic", None, &pi).unwrap_err();
         assert!(err.contains("anthropic"), "names the provider: {err}");
         assert!(
             err.to_lowercase().contains("account settings"),
@@ -1423,7 +1964,7 @@ mod tests {
             resolve_turn_provider(Some(String::new()), None),
             "openai-codex"
         );
-        // Model: override wins, else config, else None (Pi's per-provider default).
+        // Model: override wins, else config, else None (provider default).
         assert_eq!(
             resolve_turn_model(Some("claude-3.5-sonnet".into()), Some("gpt-x".into())).as_deref(),
             Some("claude-3.5-sonnet")
@@ -1508,26 +2049,16 @@ mod tests {
             .any(|h| h == "api.cloudflare.com"));
     }
 
-    // CORE-5: the per-turn egress posture. A non-isolated project now defaults to
-    // CORE-5 posture precedence: a non-isolated project is FILTERED only where the
-    // host can enforce it, else it keeps the disclosed open-by-default (Allow) — never
-    // a Filtered that would fail closed to Deny and break model access; isolation
-    // denies; the env forces unfiltered.
+    // CORE-5: GaugeDesk decides the per-turn egress posture; WhippleScript enforces
+    // the admitted provider endpoint without relying on Pi's netns capability.
     #[test]
-    fn egress_posture_is_filtered_only_when_enforceable_else_open_default() {
+    fn egress_posture_filters_provider_calls_unless_policy_overrides() {
         use gaugewright_harness::sandbox::Network;
-        // Non-isolated + filtering enforceable ⇒ filtered egress to the model endpoints.
-        assert_eq!(egress_posture(false, false, true), Network::Filtered);
-        // Non-isolated + NOT enforceable ⇒ the accepted open-by-default (unfiltered,
-        // disclosed ceiling), NOT a Filtered that would fail closed to Deny (which would
-        // silently break out-of-box model access).
-        assert_eq!(egress_posture(false, false, false), Network::Allow);
-        // Project isolates ⇒ denied (kernel-isolated), regardless of enforceability.
-        assert_eq!(egress_posture(true, false, true), Network::Deny);
-        assert_eq!(egress_posture(true, false, false), Network::Deny);
-        // The unfiltered opt-in wins over everything, isolation and enforceability included.
-        assert_eq!(egress_posture(false, true, true), Network::Allow);
-        assert_eq!(egress_posture(true, true, false), Network::Allow);
+        assert_eq!(egress_posture(false, false), Network::Filtered);
+        assert_eq!(egress_posture(true, false), Network::Deny);
+        // The explicit operator escape hatch preserves its existing precedence.
+        assert_eq!(egress_posture(false, true), Network::Allow);
+        assert_eq!(egress_posture(true, true), Network::Allow);
     }
 
     /// A scripted Pi transport: canned stdout lines in, sent commands recorded.
@@ -1566,8 +2097,8 @@ mod tests {
         }
     }
 
-    /// INV-24 through the app-side adapter: `MembraneGate.with_mode` maps the chat
-    /// mode to the boundary write-gate, and the tool target is threaded in.
+    /// The compatibility membrane mirrors native package/control ownership for
+    /// fake and retired adapters. WhippleScript is the production authority.
     #[test]
     fn membrane_gate_enforces_the_edit_use_write_gate() {
         use gaugewright_harness::GateDecision;
@@ -1575,11 +2106,7 @@ mod tests {
         let use_gate = MembraneGate::new(&cfg, default_external_tools()).with_mode(ChatMode::Use);
         // use mode: writing the definition surface is blocked…
         assert!(matches!(
-            use_gate.classify_tool("edit", Some(".pi/SYSTEM.md")),
-            GateDecision::Block(_)
-        ));
-        assert!(matches!(
-            use_gate.classify_tool("write", Some("AGENTS.md")),
+            use_gate.classify_tool("edit", Some(".whipple/draft/persona.md")),
             GateDecision::Block(_)
         ));
         assert!(matches!(
@@ -1592,44 +2119,43 @@ mod tests {
             GateDecision::Allow
         ));
         assert!(matches!(
-            use_gate.classify_tool("read", Some(".pi/SYSTEM.md")),
+            use_gate.classify_tool("read", Some(".whipple/versions/1/persona.md")),
+            GateDecision::Allow
+        ));
+        assert!(matches!(
+            use_gate.classify_tool("edit", Some("AGENTS.md")),
             GateDecision::Allow
         ));
 
         // edit mode: the editor may write the definition surface.
         let edit_gate = MembraneGate::new(&cfg, default_external_tools()).with_mode(ChatMode::Edit);
         assert!(matches!(
-            edit_gate.classify_tool("edit", Some(".pi/SYSTEM.md")),
+            edit_gate.classify_tool("edit", Some(".whipple/draft/persona.md")),
             GateDecision::Allow
+        ));
+        assert!(matches!(
+            edit_gate.classify_tool("edit", Some(".agent-config.json")),
+            GateDecision::Block(_)
         ));
     }
 
-    /// ADR 0030: the sandbox read-only roots = the existing definition surface in
-    /// use mode, and nothing in edit mode (the editor edits the definition).
+    /// Package selection is load-bearing; the OS roots are defense in depth.
     #[test]
     fn method_surface_readonly_roots_use_vs_edit() {
         let dir = tempfile::tempdir().unwrap();
         let wt = dir.path();
-        std::fs::create_dir_all(wt.join(".pi")).unwrap();
-        std::fs::write(wt.join(".pi/SYSTEM.md"), "x").unwrap();
-        std::fs::write(wt.join("AGENTS.md"), "y").unwrap();
-        // .agent-config.json absent → not included (a bind needs an existing source)
+        std::fs::create_dir_all(wt.join(".whipple/versions/1")).unwrap();
+        std::fs::create_dir_all(wt.join(".whipple/draft")).unwrap();
+        std::fs::write(wt.join(".agent-config.json"), "{}").unwrap();
 
         let ro = method_surface_readonly_roots(wt, ChatMode::Use);
-        assert!(
-            ro.contains(&wt.join(".pi")),
-            "use mode protects .pi: {ro:?}"
-        );
-        assert!(ro.contains(&wt.join("AGENTS.md")));
-        assert!(
-            !ro.iter().any(|p| p.ends_with(".agent-config.json")),
-            "absent file skipped"
-        );
+        assert!(ro.contains(&wt.join(".whipple")));
+        assert!(ro.contains(&wt.join(".agent-config.json")));
 
-        assert!(
-            method_surface_readonly_roots(wt, ChatMode::Edit).is_empty(),
-            "edit mode leaves the definition writable"
-        );
+        let edit_ro = method_surface_readonly_roots(wt, ChatMode::Edit);
+        assert!(edit_ro.contains(&wt.join(".whipple/versions")));
+        assert!(edit_ro.contains(&wt.join(".agent-config.json")));
+        assert!(!edit_ro.contains(&wt.join(".whipple/draft")));
     }
 
     /// The Phase-2 gate, end-to-end and headless: a default agent works in a
@@ -1815,6 +2341,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn precheck_failure_does_not_terminalize_a_suspended_epoch() {
+        let mut store = Store::open_in_memory().unwrap();
+        for command in [
+            RunCommand::RequestRun,
+            RunCommand::AdmitRun,
+            RunCommand::StartRun,
+            RunCommand::AwaitHuman,
+        ] {
+            store.admit::<RunState>("eng-wait", command).unwrap();
+        }
+
+        let result = record_precheck_failure(
+            &mut store,
+            "eng-wait",
+            "blue",
+            "Reconnect the model credential.".to_owned(),
+            "no_credential",
+        )
+        .unwrap();
+
+        assert_eq!(result.run_phase, RunPhase::AwaitingHuman);
+        assert_eq!(
+            store.fold::<RunState>("eng-wait").unwrap().phase,
+            RunPhase::AwaitingHuman
+        );
+    }
+
     /// The streaming sink receives each observation live (the SSE seam).
     #[test]
     fn streaming_sink_receives_observations_live() {
@@ -1850,10 +2404,83 @@ mod tests {
         assert!(streamed.contains(&"egress".to_string()));
     }
 
-    /// The prompt sent to the model is the **raw task** — no framing prefix
-    /// (ADR 0029). The agent's persona is a Pi-native method resource
-    /// (`.pi/SYSTEM.md` in use mode, or `--system-prompt` in edit mode), never
-    /// prepended to the user message; the transcript records the raw task too.
+    #[test]
+    fn human_question_suspends_without_commit_then_resumes_same_run() {
+        use gaugewright_harness::testing::ScriptedHarness;
+
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("e1").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let ask = HumanPrompt {
+            ask_ref: "ask-1".to_owned(),
+            question: "Which color?".to_owned(),
+            choices: vec!["blue".to_owned(), "green".to_owned()],
+            freeform_allowed: false,
+            label_ref: "label-1".to_owned(),
+            evidence_ref: "evidence-1".to_owned(),
+        };
+        let mut harness = ScriptedHarness::new(vec![
+            TurnOutcome {
+                assistant_text: ask.question.clone(),
+                observations: vec![Observation {
+                    kind: "human_ask",
+                    detail: ask.question.clone(),
+                    tool: None,
+                }],
+                pending_human: Some(ask.clone()),
+                ..TurnOutcome::default()
+            },
+            TurnOutcome {
+                assistant_text: "Blue it is.".to_owned(),
+                ..TurnOutcome::default()
+            },
+        ]);
+        let mut store = Store::open_in_memory().unwrap();
+        let mut sink = |_: &Observation| {};
+
+        let suspended = run_task_streaming(
+            &mut store,
+            "e1",
+            &eng,
+            &mut harness,
+            &gate,
+            "ask if needed",
+            &[],
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(suspended.run_phase, RunPhase::AwaitingHuman);
+        assert_eq!(suspended.pending_human, Some(ask));
+        assert!(suspended.pending_approvals.is_empty());
+        assert!(suspended.commit.is_none());
+        assert_eq!(
+            store.fold::<RunState>("e1").unwrap().phase,
+            RunPhase::AwaitingHuman
+        );
+
+        let completed = run_task_streaming(
+            &mut store,
+            "e1",
+            &eng,
+            &mut harness,
+            &gate,
+            "blue",
+            &[],
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(completed.run_phase, RunPhase::Completed);
+        assert!(completed.pending_human.is_none());
+        assert_eq!(
+            store.fold::<RunState>("e1").unwrap().phase,
+            RunPhase::Completed
+        );
+    }
+
+    /// The prompt sent to the model is the **raw task** — no framing prefix.
+    /// Persona belongs to the selected authored package (or editor package),
+    /// while the transcript records only the raw user task.
     #[test]
     fn the_prompt_sent_is_the_raw_task_no_framing_prefix() {
         let dir = tempfile::tempdir().unwrap();
@@ -1899,7 +2526,7 @@ mod tests {
     }
 
     /// Mock-LLM mode: `run_engagement_turn` completes a turn deterministically
-    /// (no Pi spawn) with a real worktree diff — the same path the E2E suite uses.
+    /// (no runtime/model call) with a real worktree diff — the E2E path.
     #[test]
     fn fake_agent_mode_completes_a_turn_with_a_real_diff() {
         use std::sync::{Arc, Mutex};
@@ -1926,9 +2553,12 @@ mod tests {
             "e1",
             &worktree,
             &tx,
-            "do the thing",
-            &[],
-            ChatMode::Use,
+            EngagementTurnInput {
+                task: "do the thing",
+                images: &[],
+                mode: ChatMode::Use,
+                authenticated_actor: None,
+            },
         )
         .unwrap();
 
@@ -1978,8 +2608,19 @@ mod tests {
 
         let _fake_agent = fake_agent_env();
         let (tx, _rx) = broadcast::channel(16);
-        let result =
-            run_engagement_turn(&wb, "e1", &worktree, &tx, "go", &[], ChatMode::Use).unwrap();
+        let result = run_engagement_turn(
+            &wb,
+            "e1",
+            &worktree,
+            &tx,
+            EngagementTurnInput {
+                task: "go",
+                images: &[],
+                mode: ChatMode::Use,
+                authenticated_actor: None,
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             result.mediated_tool_calls,

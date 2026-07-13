@@ -15,11 +15,13 @@
  * it is never read back.
  */
 
-import { createSignal, Show, type JSX } from "solid-js";
+import { createSignal, onCleanup, Show, type JSX } from "solid-js";
+import { waitForCodexLink } from "./codex-link-poll";
 
 /** The slice of the control-plane API this flow needs. */
 export interface FirstRunApi {
     codexLoginStart(): Promise<{ url: string }>;
+    codexStatus(): Promise<{ linked: boolean; expired: boolean }>;
     accountLinkCredential(provider: string, token: string): Promise<void>;
 }
 
@@ -33,6 +35,8 @@ export function FirstRunOverlay(props: {
     api: FirstRunApi;
     /** Product name to greet with (e.g. "GaugeDesk"). */
     productName: string;
+    /** Whether this runtime can complete the local Codex OAuth helper flow. */
+    codexLoginAvailable?: boolean;
     /** A credential was just linked — the host refetches status, which dismisses us. */
     onConnected: () => void;
     /** "I'll do this later" — dismiss for the session without connecting. */
@@ -61,6 +65,27 @@ export function FirstRunOverlay(props: {
         }
     };
 
+    // The sign-in completes in the external tab and the credential lands
+    // server-side, so watch the status projection and advance on our own; the
+    // Continue button stays as the manual escape hatch.
+    let disposed = false;
+    onCleanup(() => {
+        disposed = true;
+    });
+    let watchingLink = false;
+    const watchForLink = async () => {
+        if (watchingLink) return;
+        watchingLink = true;
+        try {
+            const linked = await waitForCodexLink(() => props.api.codexStatus(), {
+                cancelled: () => disposed,
+            });
+            if (linked && !disposed) props.onConnected();
+        } finally {
+            watchingLink = false;
+        }
+    };
+
     const linkCodex = async () => {
         if (busy()) return;
         setBusy(true);
@@ -70,7 +95,8 @@ export function FirstRunOverlay(props: {
             const { url } = await props.api.codexLoginStart();
             setAuthUrl(url);
             window.open(url, "_blank", "noopener,noreferrer");
-            setStatus("finish signing in in the new tab, then choose Continue");
+            setStatus("finish signing in in the new tab — this screen continues by itself");
+            void watchForLink();
         } catch (err) {
             setStatus(`couldn't start sign-in — ${String(err)}`);
         } finally {
@@ -125,31 +151,33 @@ export function FirstRunOverlay(props: {
                     </button>
                 </form>
 
-                <div class="firstrun-or">or</div>
+                <Show when={props.codexLoginAvailable ?? true}>
+                    <div class="firstrun-or">or</div>
 
-                <button
-                    class="firstrun-codex"
-                    data-firstrun-codex
-                    type="button"
-                    onClick={linkCodex}
-                    disabled={busy()}
-                >
-                    Sign in with OpenAI
-                </button>
-                <Show when={authUrl()}>
-                    <div class="firstrun-codex-follow">
-                        <a href={authUrl()} target="_blank" rel="noopener noreferrer">
-                            Open the sign-in page
-                        </a>
-                        <button
-                            class="firstrun-codex-continue"
-                            data-firstrun-codex-continue
-                            type="button"
-                            onClick={() => props.onConnected()}
-                        >
-                            Continue
-                        </button>
-                    </div>
+                    <button
+                        class="firstrun-codex"
+                        data-firstrun-codex
+                        type="button"
+                        onClick={linkCodex}
+                        disabled={busy()}
+                    >
+                        Sign in with OpenAI
+                    </button>
+                    <Show when={authUrl()}>
+                        <div class="firstrun-codex-follow">
+                            <a href={authUrl()} target="_blank" rel="noopener noreferrer">
+                                Open the sign-in page
+                            </a>
+                            <button
+                                class="firstrun-codex-continue"
+                                data-firstrun-codex-continue
+                                type="button"
+                                onClick={() => props.onConnected()}
+                            >
+                                Continue
+                            </button>
+                        </div>
+                    </Show>
                 </Show>
 
                 <Show when={status()}>

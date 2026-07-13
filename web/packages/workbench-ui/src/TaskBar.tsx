@@ -1,9 +1,11 @@
 /**
  * The human task queue (`navigation.md` B1, `15-task-queue`): the top bar surfaces
- * **review-needed** work, current-first. M0 sources it from our own merge
- * lifecycle — a finished turn awaiting keep/reject is a "Review: {chat}" task.
- * Click a tab to open that chat; ✓ on the active task **keeps** it (admit→advance),
- * clearing it from the queue. Milestones / focus input / delegate are M1+.
+ * ask-typed work, current-first (ADR 0082 §2). Each pill's kind is the **verb**
+ * the human is asked to perform — `review` a clean merge (keep/reject), `answer`
+ * the agent's pending question, `repair` a merge conflict — plus the onboarding
+ * `issue` checklist (ADR 0075). Click a pill to open that chat; ✓ on the active
+ * *review* keeps it (admit→advance). `answer`/`repair` never offer a one-click
+ * action: their ask is discharged inside the chat.
  *
  * A thin renderer (`INV-5`): it shows a projection (`GET /tasks`) and submits the
  * existing merge command; it owns no truth.
@@ -12,6 +14,26 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import type { EngagementId, HumanTask } from "@gaugewright/control-plane-client";
 import { displayChatTitle } from "./chat-title";
+
+/** Per-ask presentation: the pill's verb chip and its hover explanation. */
+const ASK_COPY: Record<string, { verb: string; hint: (title: string) => string }> = {
+    review: {
+        verb: "review",
+        hint: (t) => `Open "${t}" to review the agent's work — keep it or discard it`,
+    },
+    answer: {
+        verb: "answer",
+        hint: (t) => `The agent asked a question — open "${t}" to answer it`,
+    },
+    repair: {
+        verb: "repair",
+        hint: (t) => `The merge conflicted — open "${t}" to repair it`,
+    },
+    reply: {
+        verb: "reply",
+        hint: (t) => `The agent finished — open "${t}" to continue the conversation`,
+    },
+};
 
 /** A stable accent colour for a task, derived from the agent it's pinned to (#22):
  *  tasks group visually by their agent. An unpinned task (no agent) stays neutral. */
@@ -77,10 +99,12 @@ export function TaskBar(props: {
                                 </span>
                             );
                         }
-                        // Review task: id is an EngagementId (narrowed by kind).
+                        // Chat ask (review/answer/repair): id is an EngagementId
+                        // (narrowed by kind).
                         const engagement = t.id as EngagementId;
                         const active = () => props.selected === engagement;
                         const color = agentColor(t.agent);
+                        const ask = ASK_COPY[t.kind] ?? ASK_COPY.review;
                         // One canonical title everywhere (#4): never leak the raw
                         // "new chat" placeholder — show the same "Untitled" the tree
                         // and chat header show, so the pill is recognisably the same chat.
@@ -88,8 +112,9 @@ export function TaskBar(props: {
                         return (
                             <span
                                 class="task-tab"
-                                classList={{ active: active() }}
+                                classList={{ active: active(), [`task-${t.kind}`]: true }}
                                 data-task={t.id}
+                                data-task-kind={t.kind}
                                 data-task-agent={t.agent}
                                 // Keyboard/SR reachable (#4 round-5): the review pills
                                 // were clickable spans with no role/tabindex, so the one
@@ -97,18 +122,21 @@ export function TaskBar(props: {
                                 // keyboard users. Make each pill a real focusable button.
                                 role="button"
                                 tabindex="0"
-                                aria-label={`open review for ${title()}`}
-                                title={`Open "${title()}" to review the agent's work — keep it or discard it`}
+                                aria-label={`open ${ask.verb} for ${title()}`}
+                                title={ask.hint(title())}
                                 style={color ? { "border-left": `3px solid ${color}` } : undefined}
                                 onKeyDown={(e) => {
                                     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setArming(null); props.onSelect(engagement); }
                                 }}
                                 onClick={() => { setArming(null); props.onSelect(engagement); }}
                             >
-                                <span class="task-kind">review</span>
+                                <span class="task-kind">{ask.verb}</span>
                                 <span class="task-title">{title()}</span>
                                 <span class="task-agent">{t.agent}</span>
-                                <Show when={active()}>
+                                {/* Only a *review* carries the one-click keep — an answer
+                                    or repair is discharged inside the chat, never from
+                                    the chrome. */}
+                                <Show when={active() && t.kind === "review"}>
                                     {/* A change that loosens the assistant's permissions
                                         is never one-click-kept from the bar (#5): the pill
                                         opens the in-panel review, where the keep is gated

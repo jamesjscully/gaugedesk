@@ -101,17 +101,23 @@ a recent x86-64 Linux with WebKitGTK and `git` installed.
 
 !!! warning "Builds are currently unsigned"
     Code-signing and notarization are <span class="status none">Not implemented</span>
-    today, so desktop builds are unsigned. Your OS will warn on first launch. The
-    per-OS override is below — this is expected, not a sign of a bad download.
+    today, so desktop builds are unsigned. Your OS will warn on first launch —
+    macOS may even say the app is *"damaged and can't be opened"*. The per-OS
+    override is below — this is expected, **not** a corrupt or bad download.
 
 Get the build for your platform from
 [gaugewright.com/download](https://gaugewright.com/download), then:
 
 === "macOS"
-    1. Open the `.dmg` and drag **GaugeWright** to Applications.
-    2. On first launch, Gatekeeper will block it. **Right-click the app icon →
-       Open**, then confirm **Open** in the dialog. (Double-clicking will only
-       offer "Move to Trash" — you must use the right-click menu.)
+    1. Open the `.dmg` and drag **GaugeDesk** to Applications.
+    2. Because the build is un-notarized, first launch is blocked. Open
+       **System Settings → Privacy &amp; Security**, scroll to the **Security**
+       section, and click **Open Anyway** next to the GaugeDesk notice, then
+       confirm.
+    3. If macOS instead says the app *"is damaged and can't be opened"* and no
+       **Open Anyway** button appears, clear the download-quarantine flag from
+       **Terminal**, then launch normally:
+       `xattr -dr com.apple.quarantine /Applications/GaugeDesk.app`
 
 === "Windows"
     1. Run the `.msi` installer.

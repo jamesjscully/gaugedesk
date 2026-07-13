@@ -302,6 +302,25 @@ async fn send(app: &Router, method: &str, uri: &str, body: Option<&str>) -> (Sta
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
+/// `send` for GETs, also returning the `x-workspace-cut` header — the
+/// addressable base a cut-carrying save sends back (SUB-6 §12).
+async fn send_with_cut(app: &Router, uri: &str) -> (StatusCode, Option<String>, String) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let cut = resp
+        .headers()
+        .get("x-workspace-cut")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, cut, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
 #[tokio::test]
 async fn transcript_is_durable_across_a_fresh_read() {
     let _fake_agent = fake_agent_env();
@@ -873,6 +892,7 @@ async fn project_home_rolls_up_runs_outputs_and_audit() {
             name: "Acme".into(),
             is_default: false,
             network_isolated: false,
+            run_purpose: None,
             deployment_mode: None,
         });
         g.write_instance_record(InstanceRecord {
@@ -1020,12 +1040,22 @@ async fn agent_authoring_config_round_trips_and_rejects_garbage() {
     assert_eq!(body.trim(), "{}");
 
     // valid config is parsed-then-persisted
-    let cfg =
-        r#"{"model":"gpt-5.5","policy":{"posture":"policy-only-block","allow_tools":["read"]}}"#;
+    let cfg = r#"{"provider":"openai-codex","model":"gpt-5.5","thinking":"high"}"#;
     let (s, _) = send(&app, "PUT", "/chats/a1/config", Some(cfg)).await;
     assert_eq!(s, StatusCode::OK);
     let (_, body) = send(&app, "GET", "/chats/a1/config", None).await;
-    assert!(body.contains("policy-only-block"), "got {body}");
+    assert!(body.contains("openai-codex"), "got {body}");
+
+    // Package capabilities cannot be smuggled back into host runtime settings.
+    let (s, body) = send(
+        &app,
+        "PUT",
+        "/chats/a1/config",
+        Some(r#"{"policy":{"block_tools":["bash"]}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body.contains("package-owned"), "got {body}");
 
     // malformed config is rejected at the boundary, not written
     let (s, _) = send(&app, "PUT", "/chats/a1/config", Some("{ not json")).await;
@@ -1330,8 +1360,17 @@ async fn context_upload_ingests_files_into_the_engagement() {
 
 #[tokio::test]
 async fn workspace_seeds_a_default_agent_then_agents_and_chats_appear() {
-    let (_d, wb) = seeded_workbench();
+    let (d, wb) = seeded_workbench();
     let app = open_control_plane(wb);
+
+    let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(
+        d.path()
+            .join("instances")
+            .join(DEFAULT_INSTANCE)
+            .join("repo/.whipple/versions/1"),
+    )
+    .expect("seeded version is a native WhippleScript package");
+    assert!(package.version_ref().starts_with("whip:agent-package:"));
 
     // fresh root seeds the default agent under the Agents facet.
     let (s, body) = send(&app, "GET", "/workspace", None).await;
@@ -1379,6 +1418,328 @@ async fn workspace_seeds_a_default_agent_then_agents_and_chats_appear() {
     assert_eq!(s, StatusCode::OK);
     let (_, body) = send(&app, "GET", "/workspace", None).await;
     assert!(!body.contains("first chat"), "deleted chat is gone: {body}");
+}
+
+#[tokio::test]
+async fn publish_freezes_native_package_and_upgrade_installs_that_exact_ref() {
+    let (dir, wb) = seeded_workbench();
+    let edit_draft = |wb: &SharedWorkbench, body: &str| {
+        let guard = wb.lock_unpoisoned();
+        let workspace = guard
+            .instances
+            .get(DEFAULT_INSTANCE)
+            .expect("authoring workspace");
+        let id = library::gen_id("test-edit");
+        let edit = workspace.create_engagement(&id).expect("edit engagement");
+        edit.write_file(".whipple/draft/persona.md", body)
+            .expect("edit persona");
+        edit.commit_turn("edit package draft")
+            .expect("commit draft");
+        assert_eq!(
+            edit.merge_into_main().expect("merge draft"),
+            gaugewright_workspace::MergeOutcome::Clean
+        );
+        workspace.remove_engagement(&id).expect("remove edit");
+    };
+    edit_draft(&wb, "published persona");
+
+    let app = open_control_plane(wb.clone());
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{DEFAULT_AGENT}/publish"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "publish: {body}");
+    assert!(body.contains("\"version\":2"), "publish: {body}");
+
+    let frozen_root = dir
+        .path()
+        .join("instances")
+        .join(DEFAULT_INSTANCE)
+        .join("repo/.whipple/versions/2");
+    let frozen =
+        gaugewright_whip_runtime::AuthoredAgentPackage::load(&frozen_root).expect("frozen package");
+    let frozen_ref = frozen.version_ref().to_owned();
+    assert_eq!(
+        std::fs::read_to_string(frozen_root.join("persona.md")).unwrap(),
+        "published persona"
+    );
+
+    // Further draft work cannot mutate version 2 or its content address.
+    edit_draft(&wb, "unpublished persona");
+    assert_eq!(
+        gaugewright_whip_runtime::AuthoredAgentPackage::load(&frozen_root)
+            .unwrap()
+            .version_ref(),
+        frozen_ref
+    );
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/placements/{DEFAULT_PLACEMENT}/upgrade"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "upgrade: {body}");
+    let installed_root = dir
+        .path()
+        .join("instances")
+        .join(DEFAULT_PLACEMENT)
+        .join("repo/.whipple/versions/2");
+    let installed = gaugewright_whip_runtime::AuthoredAgentPackage::load(installed_root)
+        .expect("installed package");
+    assert_eq!(installed.version_ref(), frozen_ref);
+}
+
+#[tokio::test]
+async fn base_carrying_save_merges_concurrent_edits_and_folds_conflicts() {
+    // SUB-6: the editor's save carries the content it loaded (the
+    // three-way base). Concurrent disjoint edits merge through whip's
+    // token-level engine; overlapping rewrites 409 with the fold payload
+    // and write nothing; the merge fact reaches the transcript while the
+    // piece-level provenance lands on the audit plane.
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (status, body) = send(&app, "POST", "/chats", Some(r#"{"id":"sub6"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED, "chat: {body}");
+    let base = "The quick brown fox jumps over the lazy dog tonight.";
+    let (status, _) = send(&app, "PUT", "/chats/sub6/file?path=notes.md", Some(base)).await;
+    assert_eq!(status, StatusCode::OK);
+    // An "agent" write moves the file (legacy unconditional PUT stands in
+    // for the turn's mediated write).
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/chats/sub6/file?path=notes.md",
+        Some("The swift brown fox jumps over the lazy dog tonight."),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The editor saves a draft based on the ORIGINAL content, editing a
+    // distant word: the save merges, keeping both edits.
+    let save = serde_json::json!({
+        "content": "The quick brown fox jumps over the lazy dog today.",
+        "base_content": base,
+    })
+    .to_string();
+    let (status, body) = send(&app, "PUT", "/chats/sub6/file?path=notes.md", Some(&save)).await;
+    assert_eq!(status, StatusCode::OK, "merged save: {body}");
+    let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(merged["merged"], true);
+    assert_eq!(
+        merged["content"],
+        "The swift brown fox jumps over the lazy dog today."
+    );
+    let (_, file) = send(&app, "GET", "/chats/sub6/file?path=notes.md", None).await;
+    assert_eq!(file, "The swift brown fox jumps over the lazy dog today.");
+    // Provenance is audit evidence; the transcript states only the fact.
+    let (_, audit) = send(&app, "GET", "/chats/sub6/audit", None).await;
+    assert!(audit.contains("save_merged"), "audit provenance: {audit}");
+    let (_, transcript) = send(&app, "GET", "/chats/sub6/transcript", None).await;
+    assert!(
+        transcript.contains("merged with concurrent changes"),
+        "the fact reaches the conversation: {transcript}"
+    );
+    // Overlapping rewrites: 409 with the fold payload, nothing written.
+    let head = "The swift brown fox jumps over the lazy dog today.";
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/chats/sub6/file?path=notes.md",
+        Some("The swift brown fox jumps over the lazy TIGER today."),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let save = serde_json::json!({
+        "content": "The swift brown fox jumps over the lazy LION today.",
+        "base_content": head,
+    })
+    .to_string();
+    let (status, body) = send(&app, "PUT", "/chats/sub6/file?path=notes.md", Some(&save)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "fold payload: {body}");
+    let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(conflict["conflict"], true);
+    assert!(
+        conflict["pieces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|piece| piece["kind"] == "conflict"),
+        "structured regions: {body}"
+    );
+    let (_, file) = send(&app, "GET", "/chats/sub6/file?path=notes.md", None).await;
+    assert_eq!(
+        file, "The swift brown fox jumps over the lazy TIGER today.",
+        "a conflicted save writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn cut_carrying_saves_mint_region_memory_and_preview_folds() {
+    // The §12 endgame over HTTP: GET names the state it serves
+    // (x-workspace-cut), the save carries that cut back, a fold-settled
+    // region rides the resolve as durable memory, and the SAME divergence
+    // in ANOTHER file later folds cleanly through the read-only preview —
+    // resolved provenance, no re-ask.
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (status, body) = send(&app, "POST", "/chats", Some(r#"{"id":"cut1"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED, "chat: {body}");
+    let base = "Alpha beta gamma delta epsilon zeta eta theta.";
+    let agent = "Alpha beta AGENT-GAMMA delta epsilon zeta eta theta.";
+    let editor = "Alpha beta EDITOR-GAMMA delta epsilon zeta eta theta.";
+
+    send(&app, "PUT", "/chats/cut1/file?path=one.md", Some(base)).await;
+    let (status, cut, body) = send_with_cut(&app, "/chats/cut1/file?path=one.md").await;
+    assert_eq!(status, StatusCode::OK, "read: {body}");
+    let cut = cut.expect("the read names its cut");
+    // The agent moves the file; the editor saves an overlapping draft
+    // against the cut it loaded → 409, structured regions, re-save base.
+    send(&app, "PUT", "/chats/cut1/file?path=one.md", Some(agent)).await;
+    let save = serde_json::json!({ "content": editor, "base_cut": cut }).to_string();
+    let (status, body) = send(&app, "PUT", "/chats/cut1/file?path=one.md", Some(&save)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "fold payload: {body}");
+    let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let resave_cut = conflict["current_cut"]
+        .as_str()
+        .expect("re-save base")
+        .to_owned();
+    let pieces = conflict["pieces"].as_array().unwrap().clone();
+    let region = pieces
+        .iter()
+        .find(|piece| piece["kind"] == "conflict")
+        .expect("a conflict region")
+        .clone();
+    // The user settles the region; the composed document re-saves with
+    // the settled triple riding along.
+    let composed: String = pieces
+        .iter()
+        .map(|piece| {
+            if piece["kind"] == "merged" {
+                piece["text"].as_str().unwrap().to_owned()
+            } else {
+                "SETTLED-GAMMA".to_owned()
+            }
+        })
+        .collect();
+    let resolve = serde_json::json!({
+        "content": composed,
+        "base_cut": resave_cut,
+        "resolutions": [{
+            "base_text": region["base_text"],
+            "ours_text": region["ours_text"],
+            "theirs_text": region["theirs_text"],
+            "resolution_text": "SETTLED-GAMMA",
+        }],
+    })
+    .to_string();
+    let (status, body) = send(&app, "PUT", "/chats/cut1/file?path=one.md", Some(&resolve)).await;
+    assert_eq!(status, StatusCode::OK, "resolved save: {body}");
+    let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(saved["cut"].is_string(), "the save names its cut: {body}");
+    let (_, file) = send(&app, "GET", "/chats/cut1/file?path=one.md", None).await;
+    assert!(
+        file.contains("SETTLED-GAMMA"),
+        "settled text landed: {file}"
+    );
+    // Minted memory is audit-plane evidence.
+    let (_, audit) = send(&app, "GET", "/chats/cut1/audit", None).await;
+    assert!(
+        audit.contains("region_resolutions_recorded"),
+        "memory minting is recorded: {audit}"
+    );
+
+    // Pay-forward through the read-only preview: same divergence, other
+    // file — folds clean with resolved provenance, nothing moves.
+    send(&app, "PUT", "/chats/cut1/file?path=two.md", Some(base)).await;
+    let (_, cut2, _) = send_with_cut(&app, "/chats/cut1/file?path=two.md").await;
+    let cut2 = cut2.expect("second read names its cut");
+    send(&app, "PUT", "/chats/cut1/file?path=two.md", Some(agent)).await;
+    let preview =
+        serde_json::json!({ "path": "two.md", "draft": editor, "base_cut": cut2 }).to_string();
+    let (status, body) = send(&app, "POST", "/chats/cut1/merge-preview", Some(&preview)).await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    let preview: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(preview["known_base"], true, "known base: {body}");
+    assert_eq!(preview["clean"], true, "memory folds it clean: {body}");
+    assert!(
+        preview["merged"]
+            .as_str()
+            .unwrap()
+            .contains("SETTLED-GAMMA"),
+        "the fold carries the remembered text: {body}"
+    );
+    assert!(
+        preview["pieces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|piece| piece["provenance"] == "resolved"),
+        "remembered regions are honestly tagged: {body}"
+    );
+    // Preview moved nothing: the file still holds the agent's body.
+    let (_, file) = send(&app, "GET", "/chats/cut1/file?path=two.md", None).await;
+    assert_eq!(file, agent, "read-only preview");
+}
+
+#[tokio::test]
+async fn file_edits_respect_draft_version_and_host_control_ownership() {
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{DEFAULT_AGENT}/chats"),
+        Some(r#"{"title":"edit package"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "edit chat: {body}");
+    let edit_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/chats/{edit_id}/file?path=.whipple%2Fdraft%2Fpersona.md"),
+        Some("new draft"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/chats/{edit_id}/file?path=.whipple%2Fversions%2F1%2Fpersona.md"),
+        Some("tamper"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "frozen write: {body}");
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/chats/{edit_id}/file?path=.agent-config.json"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "host config write: {body}");
+
+    let (status, body) = send(&app, "POST", "/chats", Some("{}")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let work_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/chats/{work_id}/file?path=.whipple%2Fdraft%2Fpersona.md"),
+        Some("tamper"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "work package write: {body}");
 }
 
 /// The All-chats "+ new chat" quick-start: `POST /chats` with no id mints one
@@ -1459,6 +1820,7 @@ async fn legacy_store_with_unactivated_default_instance_self_heals_on_open() {
             instance_id: DEFAULT_INSTANCE.into(),
             config: "{}".into(),
             current_version: 1,
+            package_versions: Default::default(),
             auto_upgrade: false,
             forked_from: None,
         };
@@ -1603,8 +1965,8 @@ async fn forking_an_archetype_copies_config_and_is_independent() {
 }
 
 /// Chat fork (ADR 0038): clone a chat into a linked new chat that inherits the
-/// parent's worktree files. (The Pi-session clone's effect — the fork remembers
-/// the parent's conversation — is an @live real-Pi scenario.)
+/// parent's worktree files. Runtime thread continuity is covered by the
+/// WhippleScript adapter and the @live real-model fork scenario.
 #[tokio::test]
 async fn forking_a_chat_links_it_and_inherits_the_parent_worktree() {
     let (_d, wb) = seeded_workbench();
@@ -1948,6 +2310,249 @@ async fn task_queue_lists_a_pending_review_then_clears_on_keep() {
     assert!(
         !body.contains(r#""kind":"review""#),
         "review cleared: {body}"
+    );
+}
+
+/// ATTN-1 (ADR 0082 §4, the shipped no-op rule): a settled turn that changed no
+/// files auto-advances — recorded and explained — instead of queuing "needs
+/// review"; a turn that did change a file still holds for the human.
+#[tokio::test]
+async fn noop_turn_auto_advances_instead_of_queuing_review() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    send(&app, "POST", "/chats", Some(r#"{"id":"noop1"}"#)).await;
+
+    // A no-op turn (`[no-write]` keeps the fake agent's hands off the worktree):
+    // no review task; the merge advanced without a human.
+    send(
+        &app,
+        "POST",
+        "/chats/noop1/task",
+        Some(r#"{"prompt":"[no-write] just think"}"#),
+    )
+    .await;
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(
+        !body.contains(r#""kind":"review""#),
+        "no review for a no-op turn: {body}"
+    );
+    let (_, merge) = send(&app, "GET", "/chats/noop1/merge", None).await;
+    assert!(merge.contains("Advanced"), "auto-advanced: {merge}");
+
+    // The advance is durable, admitted evidence that explains itself — on
+    // the AUDIT record (ADR 0082 §4), not in the user's conversation: a
+    // no-op advance is invisible to the user, and rule citations never
+    // reach the transcript.
+    let (_, audit) = send(&app, "GET", "/chats/noop1/audit", None).await;
+    assert!(
+        audit.contains("no-op rule"),
+        "the audit trail cites the rule: {audit}"
+    );
+    let (_, transcript) = send(&app, "GET", "/chats/noop1/transcript", None).await;
+    assert!(
+        !transcript.contains("advanced automatically") && !transcript.contains("ADR 0082"),
+        "internal advancement rationale never reaches the user transcript: {transcript}"
+    );
+
+    // The rule is narrow: the next turn writes a file → review queues as before.
+    send(
+        &app,
+        "POST",
+        "/chats/noop1/task",
+        Some(r#"{"prompt":"now write"}"#),
+    )
+    .await;
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(
+        body.contains(r#""id":"noop1""#) && body.contains(r#""kind":"review""#),
+        "a real change still queues: {body}"
+    );
+}
+
+/// ADR 0082 §2: each chat task is typed by its **ask** — a conflicted merge
+/// queues `repair` (not `review`), and a turn suspended on a human question
+/// queues `answer` (outranking merge state).
+#[tokio::test]
+async fn task_queue_types_asks_repair_and_answer() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+
+    // Two chats off the same base: both fake turns create `agent-note.txt`, so
+    // keeping the first makes the second's addition an add/add conflict.
+    send(&app, "POST", "/chats", Some(r#"{"id":"ra"}"#)).await;
+    send(&app, "POST", "/chats", Some(r#"{"id":"rb"}"#)).await;
+    send(
+        &app,
+        "POST",
+        "/chats/ra/task",
+        Some(r#"{"prompt":"alpha"}"#),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        "/chats/ra/merge/command",
+        Some(r#"{"action":"admit"}"#),
+    )
+    .await;
+    send(&app, "POST", "/chats/rb/task", Some(r#"{"prompt":"beta"}"#)).await;
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(
+        body.contains(r#""id":"rb""#) && body.contains(r#""kind":"repair""#),
+        "conflicted chat queues repair: {body}"
+    );
+    assert!(
+        !body.contains(r#""kind":"review""#),
+        "the conflict is not mislabeled review: {body}"
+    );
+
+    // Suspend rb's run on a human question: `answer` outranks its merge state.
+    for cmd in [
+        "\"RetryRun\"",
+        "\"AdmitRun\"",
+        "\"StartRun\"",
+        "\"AwaitHuman\"",
+    ] {
+        send(&app, "POST", "/scopes/rb/run/command", Some(cmd)).await;
+    }
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(
+        body.contains(r#""kind":"answer""#),
+        "suspended turn queues answer: {body}"
+    );
+    assert!(
+        !body.contains(r#""kind":"repair""#),
+        "answer outranks repair for the same chat: {body}"
+    );
+}
+
+/// ATTN-2 (ADR 0082 §3): the operator's attention rules re-shape the queue —
+/// muting `changes` drops the review task *and* its nav badge, while opting
+/// `turn-settled` into the queue raises the `reply` ask the defaults never show
+/// (the muted signal falls through; it does not silence the chat).
+#[tokio::test]
+async fn attention_rules_reshape_queue_and_badges() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    send(&app, "POST", "/chats", Some(r#"{"id":"at1"}"#)).await;
+    send(&app, "POST", "/chats/at1/task", Some(r#"{"prompt":"go"}"#)).await;
+
+    // Defaults: the clean merge queues `review`; no `reply` pill.
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(
+        body.contains(r#""kind":"review""#) && !body.contains(r#""kind":"reply""#),
+        "defaults hold: {body}"
+    );
+
+    // Mute `changes`, opt `turn-settled` into the queue.
+    let rules = serde_json::json!({
+        "value": r#"{"version":1,"rules":[{"signal":"changes","attention":"mute"},{"signal":"turn-settled","attention":"queue"}]}"#
+    })
+    .to_string();
+    let (s, _) = send(
+        &app,
+        "PUT",
+        "/account/settings/attention.rules",
+        Some(&rules),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(!body.contains(r#""kind":"review""#), "review muted: {body}");
+    assert!(
+        body.contains(r#""id":"at1""#) && body.contains(r#""kind":"reply""#),
+        "reply queued via fall-through: {body}"
+    );
+
+    // The muted signal's nav badge goes with it (badge surface, same rules).
+    let (_, ws) = send(&app, "GET", "/workspace", None).await;
+    let v: serde_json::Value = serde_json::from_str(&ws).unwrap();
+    let chat = v["recent"]
+        .as_array()
+        .and_then(|chats| chats.iter().find(|c| c["id"] == "at1"))
+        .expect("at1 in recent")
+        .clone();
+    assert_eq!(
+        chat["changes"], false,
+        "muted changes shows no badge: {chat}"
+    );
+}
+
+/// ATTN-3 (ADR 0082 §4): an operator advancement rule auto-advances a covered
+/// turn — recorded with a citation — while an uncovered scope holds for review
+/// (and with no rules configured everything holds, per the other tests).
+#[tokio::test]
+async fn advancement_rules_auto_advance_covered_turns_only() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+
+    // A rule covering the fake agent's write (`agent-note.txt` at the root).
+    let rules = serde_json::json!({
+        "value": r#"{"version":1,"rules":[{"advance":"writes-within","paths":["*.txt"]}]}"#
+    })
+    .to_string();
+    send(
+        &app,
+        "PUT",
+        "/account/settings/advancement.rules",
+        Some(&rules),
+    )
+    .await;
+
+    send(&app, "POST", "/chats", Some(r#"{"id":"adv1"}"#)).await;
+    send(&app, "POST", "/chats/adv1/task", Some(r#"{"prompt":"go"}"#)).await;
+    let (_, merge) = send(&app, "GET", "/chats/adv1/merge", None).await;
+    assert!(
+        merge.contains("Advanced"),
+        "covered turn auto-advanced: {merge}"
+    );
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(
+        !body.contains(r#""kind":"review""#),
+        "no review queued: {body}"
+    );
+    // The rationale is AUDIT-plane evidence (ADR 0082 posture): the
+    // conversation says only that the merge happened; the rule citation
+    // lives on the audit trail, never in the transcript.
+    let (_, audit) = send(&app, "GET", "/chats/adv1/audit", None).await;
+    assert!(
+        audit.contains("writes-within(*.txt)"),
+        "the audit trail cites the rule: {audit}"
+    );
+    let (_, transcript) = send(&app, "GET", "/chats/adv1/transcript", None).await;
+    assert!(
+        !transcript.contains("writes-within"),
+        "policy rationale never leaks into the conversation: {transcript}"
+    );
+
+    // Narrow the scope so the same write is no longer covered → holds.
+    let rules = serde_json::json!({
+        "value": r#"{"version":1,"rules":[{"advance":"writes-within","paths":["docs/**"]}]}"#
+    })
+    .to_string();
+    send(
+        &app,
+        "PUT",
+        "/account/settings/advancement.rules",
+        Some(&rules),
+    )
+    .await;
+    send(&app, "POST", "/chats", Some(r#"{"id":"adv2"}"#)).await;
+    send(&app, "POST", "/chats/adv2/task", Some(r#"{"prompt":"go"}"#)).await;
+    let (_, merge) = send(&app, "GET", "/chats/adv2/merge", None).await;
+    assert!(
+        merge.contains("Clean") && !merge.contains("Advanced"),
+        "uncovered turn holds for review: {merge}"
+    );
+    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    assert!(
+        body.contains(r#""id":"adv2""#) && body.contains(r#""kind":"review""#),
+        "held turn queues review: {body}"
     );
 }
 

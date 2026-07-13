@@ -4,11 +4,6 @@
     "beforeBuildCommand": null
   },
   "bundle": {
-    "createUpdaterArtifacts": true,
-    "resources": {
-      "vendor/bin/*": "bin/",
-      "vendor/bin/theme/*": "bin/theme/",
-      "vendor/plugin/*": "plugin/"
-    }
+    "createUpdaterArtifacts": true
   }
 }

@@ -184,6 +184,9 @@ pub use gaugewright_app::workbench_auth::{deny, req_scope};
 /// its own audience auth.
 fn entsec_exempt(path: &str) -> bool {
     path == "/health"
+        // Stripe authenticates delivery with its signed webhook header. The route must
+        // reach that verifier without a browser/member bearer; it grants no account access.
+        || path == "/stripe/webhook"
         || path.starts_with("/auth/")
         || path.starts_with("/scim/")
         || path.starts_with("/saml/")
@@ -197,7 +200,7 @@ fn entsec_exempt(path: &str) -> bool {
 /// channel). Exempt paths keep their own auth / pre-auth flow. Fail-closed (`INV-20`).
 pub async fn enterprise_auth(
     axum::extract::State(wb): axum::extract::State<SharedWorkbench>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     // CORS preflight carries no credentials — let it through (the CORS layer answers it).
@@ -232,6 +235,8 @@ pub async fn enterprise_auth(
         if guard.has_idp() && !is_admin && (mutating || sensitive_read) {
             gaugewright_app::audit::record(&mut guard, &actor, &format!("{method} {path}"), &path);
         }
+        req.extensions_mut()
+            .insert(gaugewright_app::identity::AuthenticatedActor(actor.into()));
     }
     next.run(req).await
 }
@@ -1368,5 +1373,82 @@ mod onb5_tests {
         assert!(!txt_matches(&[], "acme.com"));
         // the token is domain-bound — acme's value does not verify evil.com.
         assert_ne!(expected_txt("acme.com"), expected_txt("evil.com"));
+    }
+}
+
+#[cfg(test)]
+mod authenticated_actor_tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use axum::extract::Extension;
+    use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use gaugewright_app::identity::{AuthenticatedActor, LoopbackIdentityProvider};
+    use gaugewright_app::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
+    use gaugewright_app::Workbench;
+    use gaugewright_core::abac::AuthorityAttributes;
+    use gaugewright_core::ids::AuthorityId;
+    use gaugewright_store::Store;
+    use gaugewright_workspace::Instance;
+
+    use super::{enterprise_auth, write_membership, RecordOp};
+
+    async fn who_am_i(Extension(actor): Extension<AuthenticatedActor>) -> String {
+        actor.0.as_str().to_owned()
+    }
+
+    #[tokio::test]
+    async fn authenticated_member_is_carried_to_the_data_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let idp = LoopbackIdentityProvider::new().enroll(
+            "alice-token",
+            AuthorityId::new("authority:alice"),
+            AuthorityAttributes::default(),
+        );
+        let mut workbench =
+            Workbench::with_instance("inst-test", instance, Store::open_in_memory().unwrap())
+                .with_identity_provider(Arc::new(idp));
+        write_membership(
+            &mut workbench,
+            ORG_SCOPE,
+            &MembershipRecord {
+                id: "alice".to_owned(),
+                op: RecordOp::Upsert,
+                org_id: "org".to_owned(),
+                authority: "authority:alice".to_owned(),
+                email: "alice@example.test".to_owned(),
+                role: "owner".to_owned(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            },
+        );
+        let shared = Arc::new(Mutex::new(workbench));
+        let app = Router::new()
+            .route("/whoami", get(who_am_i))
+            .route_layer(axum::middleware::from_fn_with_state(
+                shared.clone(),
+                enterprise_auth,
+            ))
+            .with_state(shared);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/whoami")
+                    .header("authorization", "Bearer alice-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"authority:alice");
     }
 }

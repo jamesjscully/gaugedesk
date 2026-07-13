@@ -45,8 +45,8 @@ untie.db
 # Tauri build artifacts
 src-tauri/target/
 
-# Vendored bundle payload — Pi binary + plugin, fetched/compiled by the release
-# lane (.github/workflows/release.yml), never committed (SELFHOST-1 Phase B).
+# Release-staged bundle payload (for example a future portable Git tree), never
+# committed. WhippleScript is linked into the control plane; Pi is not bundled.
 src-tauri/vendor/
 
 # Apalache (TLA+) model-checker output

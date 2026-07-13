@@ -11,9 +11,12 @@
 //! never crossing as payload (`INV-10`). Adds no protection invariant (ADR 0020).
 
 use std::collections::BTreeMap;
+use std::io;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use gaugewright_harness::{CredentialCapability, CredentialMaterial};
 use gaugewright_store::{AdmitError, Store};
 
 use crate::at_rest::{Encryptor, LocalAeadEncryptor};
@@ -188,9 +191,9 @@ pub fn resolve_token(store: &Store, key: [u8; 32], provider: &str) -> Option<Str
 
 /// The provider → API-key env-var mapping — the ONE map (the engine's fail-closed
 /// BYOK precheck keys off it too, so "which providers are BYOK" is answered here
-/// only). Only mapped providers are injected into the runtime; an unmappable
-/// provider is skipped (its OAuth-token path writes Pi's AuthStorage rather than
-/// an env var — a follow-on).
+/// only). Only mapped BYOK providers use the transitional env-shaped resolver;
+/// OAuth providers travel through their separate GaugeDesk-owned resolved
+/// binding path.
 pub(crate) fn provider_env_var(provider: &str) -> Option<&'static str> {
     match provider {
         "openai" => Some("OPENAI_API_KEY"),
@@ -314,11 +317,41 @@ impl Workbench {
         }
     }
 
-    /// Runtime credential env vars for one chat, with project BYOK pins overriding
-    /// account defaults per provider.
-    pub(crate) fn resolved_credential_envs_for_chat(&self, chat_id: &str) -> Vec<(String, String)> {
+    /// Stable, non-secret identity for the credential selected by the same
+    /// nearest-scope-wins rule as the ephemeral secret resolver.
+    pub(crate) fn credential_ref_for_chat(&self, chat_id: &str, provider: &str) -> String {
         let project = self.library_project_of_chat(chat_id);
-        resolved_credential_envs(self.store_ref(), self.account_key(), project.as_deref())
+        let scope = project
+            .as_deref()
+            .filter(|project_id| {
+                credentials_in_scope(self.store_ref(), &project_scope(project_id))
+                    .contains_key(provider)
+            })
+            .map(|project_id| format!("project:{project_id}"))
+            .unwrap_or_else(|| "account".to_owned());
+        format!("gaugedesk:credential:{scope}:{provider}")
+    }
+
+    /// Resolve the nearest-scope BYOK credential into an exact-reference
+    /// capability. The secret remains private to this in-memory object and is
+    /// released only after WhippleScript admits the matching reference.
+    pub(crate) fn credential_capability_for_chat(
+        &self,
+        chat_id: &str,
+        provider: &str,
+    ) -> Option<Arc<dyn CredentialCapability>> {
+        let project = self.library_project_of_chat(chat_id);
+        let project_record = project.as_deref().and_then(|project_id| {
+            credentials_in_scope(self.store_ref(), &project_scope(project_id)).remove(provider)
+        });
+        let record = project_record
+            .or_else(|| credentials_in_scope(self.store_ref(), ACCOUNT_SCOPE).remove(provider))?;
+        let secret = unseal_token(self.account_key(), &record.sealed_token)?;
+        Some(resolved_credential_capability(
+            self.credential_ref_for_chat(chat_id, provider),
+            secret,
+            None,
+        ))
     }
 
     /// Provider ids pinned as BYOK credentials in one project's coordination scope.
@@ -593,6 +626,49 @@ impl Workbench {
     pub fn account_tenancy(&self) -> Result<crate::tenancy::Tenancy, AdmitError> {
         self.account_tenancy_in(ACCOUNT_SCOPE)
     }
+}
+
+#[derive(Clone)]
+struct ResolvedCredentialCapability {
+    credential_ref: String,
+    material: CredentialMaterial,
+}
+
+impl std::fmt::Debug for ResolvedCredentialCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedCredentialCapability")
+            .field("credential_ref", &self.credential_ref)
+            .field("material", &self.material)
+            .finish()
+    }
+}
+
+impl CredentialCapability for ResolvedCredentialCapability {
+    fn credential_ref(&self) -> &str {
+        &self.credential_ref
+    }
+
+    fn resolve(&self, credential_ref: &str) -> io::Result<CredentialMaterial> {
+        if credential_ref != self.credential_ref {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "credential capability reference mismatch",
+            ));
+        }
+        Ok(self.material.clone())
+    }
+}
+
+pub(crate) fn resolved_credential_capability(
+    credential_ref: String,
+    secret: String,
+    account_id: Option<String>,
+) -> Arc<dyn CredentialCapability> {
+    Arc::new(ResolvedCredentialCapability {
+        credential_ref,
+        material: CredentialMaterial::new(secret, account_id),
+    })
 }
 
 // --- ACCT-2 core: the sealed sync blob + the readable directory record ----------
@@ -964,5 +1040,23 @@ mod tests {
         // A project with no pin resolves exactly to the account default.
         let other = resolved_credential_envs(&s, KEY, Some("proj-other"));
         assert_eq!(other, resolved_credential_envs(&s, KEY, None));
+    }
+
+    #[test]
+    fn resolved_credential_capability_is_exact_reference_bound_and_redacted() {
+        let capability = resolved_credential_capability(
+            "gaugedesk:credential:account:openai".to_owned(),
+            "sk-secret-value".to_owned(),
+            None,
+        );
+        assert!(capability
+            .resolve("gaugedesk:credential:project:other:openai")
+            .is_err());
+        let material = capability
+            .resolve("gaugedesk:credential:account:openai")
+            .expect("exact ref resolves");
+        assert_eq!(material.secret(), "sk-secret-value");
+        assert!(!format!("{capability:?}").contains("sk-secret-value"));
+        assert!(!format!("{material:?}").contains("sk-secret-value"));
     }
 }

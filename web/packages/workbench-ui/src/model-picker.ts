@@ -1,10 +1,10 @@
 /**
- * The composer **model picker**, derived from the Pi runtime's model catalog
+ * The composer **model picker**, derived from GaugeDesk's model catalog
  * (`model-catalog.generated.ts`) and the operator's **linked accounts** (LLM-1,
  * [ADR 0062](../../specs/decisions/0062-llm-access-byok-and-managed-with-per-project-credentials.md)).
  *
- * The catalog is the source of truth for *what exists* (every model Pi can run, with its
- * provider and supported reasoning/`--thinking` levels); the linked accounts decide *what
+ * The catalog is product truth for *what exists* (provider plus supported
+ * reasoning levels); linked accounts decide *what
  * is reachable*. We never call provider `/v1/models` at run time: the catalog is what the
  * runtime actually resolves, it carries the per-model thinking levels no listing reports,
  * and it works for `openai-codex` OAuth, which has no listing endpoint.
@@ -29,7 +29,8 @@ interface AccountSource {
 
 const ACCOUNT_SOURCES: Record<string, AccountSource> = {
     // Codex runs its own GPT-5.x line (primary) and can also serve the regular OpenAI
-    // catalog (secondary) — both pinned to `openai-codex` so Pi uses the OAuth endpoint.
+    // catalog (secondary) — both pinned to `openai-codex` so the governed
+    // provider binding uses the OAuth endpoint.
     "openai-codex": { pin: "openai-codex", primary: ["openai-codex"], secondary: ["openai"] },
     openai: { pin: "openai", primary: ["openai"], secondary: [] },
     anthropic: { pin: "anthropic", primary: ["anthropic"], secondary: [] },
@@ -134,10 +135,32 @@ export interface ModelOption {
 /** The "Default" (no per-chat override) option — always first. */
 export const DEFAULT_OPTION: ModelOption = { id: "", provider: "", label: "Default", thinking: ["off"] };
 
+/** The engine's resolved no-pin default, as reported by `/account/default-model`. */
+export interface ResolvedDefault {
+    readonly provider: string;
+    readonly model: string | null;
+}
+
+/** The picker's first row. When the engine's resolved no-pin default is known,
+ *  name it — "GPT-5.5 (default)" — so the row says what will actually run; a
+ *  blind "Default" is only the fallback while that's unknown (or the resolved
+ *  provider has no default model). The value stays empty: picking it still
+ *  means "no per-chat override", not a pin. */
+export function defaultOption(
+    resolvedDefault?: ResolvedDefault | null,
+    catalog: readonly CatalogModel[] = MODEL_CATALOG,
+): ModelOption {
+    const id = resolvedDefault?.model;
+    if (!id) return DEFAULT_OPTION;
+    const m = catalog.find((c) => c.provider === resolvedDefault?.provider && c.id === id);
+    return { ...DEFAULT_OPTION, label: `${m?.name ?? id} (default)` };
+}
+
 /**
  * The picker options for the linked accounts and the operator's enabled-set preference:
  * `enabled` null/empty → the default-visible subset; otherwise exactly the enabled models.
- * Always leads with "Default", and keeps a `pinned` model present even if it's filtered out
+ * Always leads with the default row (named when `resolvedDefault` is known), and keeps a
+ * `pinned` model present even if it's filtered out
  * (so the `<select>` reflects the chat's real config rather than snapping to the first row).
  */
 export function modelOptions(
@@ -145,6 +168,7 @@ export function modelOptions(
     enabled: ReadonlySet<string> | null,
     pinned?: { id: string; provider: string },
     catalog: readonly CatalogModel[] = MODEL_CATALOG,
+    resolvedDefault?: ResolvedDefault | null,
 ): ModelOption[] {
     const all = pickableModels(linkedAccountProviders, catalog);
     // `null` = never curated → the default-visible subset. A present set (even empty) is
@@ -156,7 +180,10 @@ export function modelOptions(
         if (found) visible.push(found);
     }
 
-    return [DEFAULT_OPTION, ...visible.map((m) => ({ id: m.id, provider: m.provider, label: m.label, thinking: m.thinking }))];
+    return [
+        defaultOption(resolvedDefault, catalog),
+        ...visible.map((m) => ({ id: m.id, provider: m.provider, label: m.label, thinking: m.thinking })),
+    ];
 }
 
 // --- the operator's "which models show in the picker" preference (managed in the
@@ -212,7 +239,7 @@ export function thinkingLevelsFor(
  * on the unknown:** the default model (no pin) or a model absent from the catalog returns
  * `true` — we never *claim* a model can't see images unless the catalog says so, so the
  * composer only blocks an image attach on a **known non-vision** model rather than
- * second-guessing Pi's own default resolution.
+ * second-guessing the provider binding's default resolution.
  */
 export function modelAcceptsImages(
     pinned: { id: string; provider: string } | null | undefined,

@@ -37,6 +37,13 @@ impl Signature {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Borrow the canonical raw `r ‖ s` bytes for a cryptographic protocol
+    /// adapter. This does not expose key material; it avoids making external
+    /// attestation formats depend on this crate's serde representation.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Why a signature could not be verified (as opposed to verifying to `false`).

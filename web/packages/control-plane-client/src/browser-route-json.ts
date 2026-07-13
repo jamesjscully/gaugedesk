@@ -8,7 +8,7 @@ export interface BrowserRouteJsonOptions {
 
 /** Build a route error that carries the server's own message when it sent one.
  *  Control-plane failures return `{ "error": "…" }` (e.g. a 502 whose body explains a
- *  missing Pi runtime); without this the UI only ever saw the bare status code. Falls
+ *  unavailable runtime); without this the UI only ever saw the bare status code. Falls
  *  back to the raw body, then to just the status when the body is empty/unreadable. */
 async function routeError(
     method: string,

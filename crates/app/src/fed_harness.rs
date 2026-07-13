@@ -248,13 +248,52 @@ pub async fn broker_accept_loop_chaos(
                 None => {
                     waiting.lock().await.insert(token, sock);
                 }
-                // `sock` is the second leg to arrive (the target, which dials out
-                // after the source has parked); `other` is the parked source leg.
+                // Arrival order is not a role signal: Compose starts the target
+                // first, while the loopback test commonly schedules the source
+                // first. Detect the source as the leg that sends a framed
+                // envelope after its token; the target stays read-only until it
+                // has received that envelope.
                 Some(other) => {
-                    let _ = chaos_splice(other, sock, policy).await;
+                    let _ = chaos_splice_by_activity(other, sock, policy).await;
                 }
             }
         });
+    }
+}
+
+/// Orient a chaos pairing by wire activity instead of connection order. Only
+/// the source writes after the rendezvous token; the target waits for that frame
+/// before it can write a verdict.
+async fn chaos_splice_by_activity(
+    first: TcpStream,
+    second: TcpStream,
+    policy: ChaosPolicy,
+) -> std::io::Result<()> {
+    let mut first_probe = [0u8; 1];
+    let mut second_probe = [0u8; 1];
+    let first_is_source = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = first.peek(&mut first_probe) => result.map(|n| (true, n)),
+            result = second.peek(&mut second_probe) => result.map(|n| (false, n)),
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "neither chaos leg sent an envelope",
+        )
+    })??;
+    if first_is_source.1 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "chaos source leg closed before its envelope",
+        ));
+    }
+    if first_is_source.0 {
+        chaos_splice(first, second, policy).await
+    } else {
+        chaos_splice(second, first, policy).await
     }
 }
 
@@ -401,6 +440,9 @@ pub async fn target_serve(
 /// The single session the chaos (`RF-C6`) lane uses: one *genuine*, correctly
 /// signed crossing, so the only adversary is the Byzantine relay itself.
 pub const CHAOS_SESSION: &str = "sess-chaos-genuine";
+/// Correlation id for that single crossing, used even when relay tampering makes
+/// the envelope undecodable and the target must synthesize a deny verdict.
+pub const CHAOS_CORRELATION: &str = "xc-chaos";
 
 /// Target side of the chaos lane: serve exactly the chaos session, but treat a
 /// mangled frame (a relay that corrupted or truncated the envelope) as a
@@ -415,21 +457,28 @@ pub async fn chaos_target_once(
     let mut stream = connect_with_retry(broker).await?;
     stream.write_all(&token_bytes(CHAOS_SESSION)).await?;
 
-    // A corrupt/truncated frame fails to read or decode; that IS the deny.
-    let admitted = match read_frame(&mut stream).await {
+    // A corrupt/truncated frame fails to read or decode; that IS the deny. Send
+    // an explicit deny verdict in every case so a broken return path cannot be
+    // mistaken for security evidence by the source driver.
+    let verdict = match read_frame(&mut stream).await {
         Ok(bytes) => match serde_json::from_slice::<EnvelopeWire>(&bytes) {
-            Ok(wire) => {
-                let v = admit_one(store, target_scope, &wire);
-                // Send a verdict back so the source's read completes.
-                if let Ok(vbytes) = serde_json::to_vec(&v) {
-                    let _ = write_frame(&mut stream, &vbytes).await;
-                }
-                v.admitted
-            }
-            Err(_) => false, // decode failed → denied
+            Ok(wire) => admit_one(store, target_scope, &wire),
+            Err(_) => Verdict {
+                correlation: CHAOS_CORRELATION.to_owned(),
+                admitted: false,
+                admitted_handle: None,
+            },
         },
-        Err(_) => false, // truncated/corrupt frame → denied
+        Err(_) => Verdict {
+            correlation: CHAOS_CORRELATION.to_owned(),
+            admitted: false,
+            admitted_handle: None,
+        },
     };
+    if let Ok(vbytes) = serde_json::to_vec(&verdict) {
+        let _ = write_frame(&mut stream, &vbytes).await;
+    }
+    let admitted = verdict.admitted;
     let _ = stream.shutdown().await;
     let fact_written = crate::federation_relay::admitted(store, target_scope)
         .map(|f| !f.is_empty())

@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use gaugewright_app::fed_harness::{SourceClient, CHAOS_SESSION};
+use gaugewright_app::fed_harness::{SourceClient, CHAOS_CORRELATION, CHAOS_SESSION};
 use gaugewright_app::key_store::LoopbackKeyStore;
 
 #[tokio::main]
@@ -24,22 +24,23 @@ async fn main() {
         "=== gaugewright chaos lane — driver (genuine crossing through a Byzantine relay) ==="
     );
     let source = SourceClient::new(broker_addr, LoopbackKeyStore);
-    let wire = source.genuine_envelope("xc-chaos", "A", "B", "SECRET-HANDLE");
+    let wire = source.genuine_envelope(CHAOS_CORRELATION, "A", "B", "SECRET-HANDLE");
 
-    // The tampered frame may also break the source's own verdict read; a
-    // timeout-or-error is itself "not admitted" (the crossing did not succeed).
+    // The target must return an explicit deny over the untampered reverse path.
+    // A timeout or decode error is an inconclusive harness failure, not evidence
+    // that the target refused the crossing.
     let admitted =
         match tokio::time::timeout(Duration::from_secs(10), source.cross(CHAOS_SESSION, &wire))
             .await
         {
             Ok(Ok(verdict)) => verdict.admitted,
             Ok(Err(e)) => {
-                eprintln!("[chaos-driver] transport error (counts as denied): {e}");
-                false
+                eprintln!("[chaos-driver] FAIL: target verdict transport error: {e}");
+                std::process::exit(1);
             }
             Err(_) => {
-                eprintln!("[chaos-driver] verdict timed out (counts as denied)");
-                false
+                eprintln!("[chaos-driver] FAIL: target deny verdict timed out");
+                std::process::exit(1);
             }
         };
 

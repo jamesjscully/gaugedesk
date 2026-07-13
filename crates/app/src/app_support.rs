@@ -45,7 +45,7 @@ pub const DEFAULT_PROJECT: &str = "proj-default";
 /// The default archetype placement on the default "Personal" project.
 pub const DEFAULT_PLACEMENT: &str = "inst-placement-default";
 
-/// Starter Pi-native definition for the default agent (ADR 0029).
+/// Starter method definition for the default agent (ADR 0029).
 pub(crate) const DEFAULT_AGENT_SYSTEM_MD: &str = "\
 You are **assistant**, a general-purpose agent built and run inside gaugewright.
 
@@ -124,6 +124,19 @@ pub(crate) fn prepare_workbench_root(root: &Path) -> std::io::Result<(PathBuf, P
 }
 
 impl Workbench {
+    pub(crate) fn whip_harness_factory(
+        &self,
+    ) -> std::io::Result<gaugewright_whip_runtime::WhipHarnessFactory> {
+        let signing_key =
+            gaugewright_core::signature::SigningKey::from_seed(&self.governance_seed())
+                .map_err(|error| std::io::Error::other(error.reason))?;
+        Ok(gaugewright_whip_runtime::WhipHarnessFactory::new(
+            self.authority().clone(),
+            signing_key,
+            self.root_path().join("whip-runtimes"),
+        ))
+    }
+
     /// Set how attested acceptance verifies quotes (C-3). Production reads
     /// `GAUGEWRIGHT_ATTESTATION_VERIFIER` (see `open_workbench`); the loopback/e2e shape
     /// sets [`AttestationMode::Loopback`] explicitly. Builder-style.

@@ -1,30 +1,24 @@
-Feature: Round 4 — config-edit safety, legible diffs, and one canonical chat title
+Feature: Round 4 — ownership-safe editing, legible diffs, and one canonical chat title
 
-  The round-4 review found that the assistant's settings file could be saved as
-  garbage JSON with no validation, the split diff was illegible at the panel's
-  width, and the TASKS bar still leaked the raw "new chat" placeholder. These
-  scenarios lock in the fixes.
+  GaugeDesk runtime settings are changed through Settings, while authored
+  behavior is changed in the WhippleScript package draft. The split diff must
+  remain legible and the TASKS bar must use one canonical chat title.
 
-  Scenario: editing the assistant's settings file rejects invalid JSON with a plain message
+  Scenario: the host settings file is read-only in the worktree editor
     Given a new engagement
     When I task the agent with "make a note"
     Then the run phase is "Completed"
     When I reveal the internal files
     And I select the file ".agent-config.json" in the workspace
     And I open the "edit" tab
-    Then the editor warns that this is the assistant's settings file
-    When I replace the editor content with "{ this is not valid json"
-    And I try to save the file
-    Then the save is rejected with a plain-language message
+    Then the selected file is read-only in the editor
 
-  Scenario: a valid edit to the settings file still saves
-    Given a new engagement
-    When I task the agent with "make a note"
-    Then the run phase is "Completed"
-    When I reveal the internal files
-    And I select the file ".agent-config.json" in the workspace
+  Scenario: an edit chat can save authored behavior in the package draft
+    Given the workbench is open
+    When I create an edit chat under the archetype "assistant"
+    And I select the file ".whipple/draft/persona.md" in the workspace
     And I open the "edit" tab
-    And I replace the editor content with "{}"
+    And I replace the editor content with "You are a concise research assistant."
     And I save the file
 
   Scenario: the split diff toggle is hidden when the review panel is too narrow

@@ -1,5 +1,5 @@
 # Keep the Docker build context small for the Tier-1 harness (docker/compose.yml).
-# The harness build needs only Cargo.toml, Cargo.lock, and crates/.
+# The harness build needs only the backend workspace and its embedded sidecar.
 target
 **/target
 web

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { type Attachment, buildOutgoing, classifyAttachment } from "./attachments";
 
 describe("classifyAttachment", () => {
-    it("treats the Pi-native image mimes as images", () => {
+    it("treats the runtime-native image mimes as images", () => {
         for (const type of ["image/png", "image/jpeg", "image/webp", "image/gif"]) {
             expect(classifyAttachment({ type, name: `pic.${type.split("/")[1]}` })).toBe("image");
         }

@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use gaugewright_core::ids::AuthorityId;
 use gaugewright_store::Store;
 use gaugewright_tracker::WhipTrackerHandle;
-use gaugewright_workspace::{ChatWorkspace, GitWorkspaceProvider, Workspace, WorkspaceProvider};
+use gaugewright_workspace::{
+    ChatWorkspace, WhippleWorkspaceProvider, Workspace, WorkspaceProvider,
+};
 use tokio::sync::broadcast;
 
 use crate::app_support::{attestation_enabled, attestation_mode_from_env, prepare_workbench_root};
@@ -26,27 +28,26 @@ use crate::{
 /// Workspace construction providers, keyed by substrate id.
 pub(crate) type WorkspaceProviders = BTreeMap<&'static str, Arc<dyn WorkspaceProvider>>;
 
-/// The git substrate's registry key.
-const GIT_SUBSTRATE: &str = "git";
+/// The native WhippleScript workspace substrate's registry key.
+const WHIPPLE_SUBSTRATE: &str = "whipplescript";
 
 /// The account/global trust boundary — the one scope the v1 onboarding tracker
 /// lives on (ADR 0075 §2): no project, no client-tainted data, bottom taint.
 /// Per-project boundaries (which key by `project::<id>`) are deferred to Phase 4.
 pub(crate) const ACCOUNT_GLOBAL_BOUNDARY: &str = "account::global";
 
-/// The substrate id every instance resolves in SUB-0 — hardcoded, in-memory
-/// only (the durable per-instance substrate stamp + migration of existing
-/// instance dirs is SUB-2).
+/// Every instance now resolves to the native WhippleScript workspace. The
+/// provider writes a durable per-instance stamp and migrates a legacy checked-
+/// out instance snapshot on first open.
 pub(crate) fn instance_substrate_id(_inst_id: &str) -> &'static str {
-    GIT_SUBSTRATE
+    WHIPPLE_SUBSTRATE
 }
 
-/// The default registry: the git provider under its substrate id. A future
-/// substrate registers a second provider here, not new construction sites.
+/// The default registry contains the one standing workspace authority.
 pub(crate) fn default_workspace_providers() -> WorkspaceProviders {
     BTreeMap::from([(
-        GIT_SUBSTRATE,
-        Arc::new(GitWorkspaceProvider) as Arc<dyn WorkspaceProvider>,
+        WHIPPLE_SUBSTRATE,
+        Arc::new(WhippleWorkspaceProvider) as Arc<dyn WorkspaceProvider>,
     )])
 }
 
@@ -137,7 +138,7 @@ pub struct Workbench {
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
 
 /// Open (or initialize) the local workbench under `root`. Agents/projects/chats
-/// are rehydrated from the library records + git (ADR 0027): for each instance
+/// are rehydrated from the library records + native workspace (ADR 0027): for each instance
 /// record we open its repo and reconcile its engagements. A fresh root is seeded
 /// with a default agent so the user can chat immediately.
 pub fn open_workbench(root: &std::path::Path) -> std::io::Result<SharedWorkbench> {

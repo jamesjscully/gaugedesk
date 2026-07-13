@@ -182,6 +182,51 @@ impl Store {
         Ok(position)
     }
 
+    /// Atomically append one non-lifecycle record under an idempotency key.
+    /// The returned tuple is `(position, inserted)`: a replay returns the
+    /// original assigned position and `false` without duplicating the pointer.
+    pub fn append_record_with_key(
+        &mut self,
+        scope_id: &str,
+        command_key: &str,
+        kind: &str,
+        payload: &str,
+    ) -> Result<(i64, bool), AdmitError> {
+        let stored = match &self.codec {
+            Some(codec) => codec.encode(scope_id, kind, payload),
+            None => payload.to_string(),
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(position) = tx
+            .query_row(
+                "SELECT applied_at FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
+                params![scope_id, command_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            tx.commit()?;
+            return Ok((position, false));
+        }
+        let position: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            params![scope_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![scope_id, position, kind, stored],
+        )?;
+        tx.execute(
+            "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
+            params![scope_id, command_key, position],
+        )?;
+        tx.commit()?;
+        Ok((position, true))
+    }
+
     /// All records of one `kind` in a scope, in order — a durable projection
     /// source (e.g. the transcript snapshot). A content codec (`SECAUD-9/6`) decodes
     /// each row; a crypto-erased row (`decode` ⇒ `None`) is dropped (content gone).
@@ -535,6 +580,23 @@ mod tests {
             .admit_with_key::<RunState>(scope, "admit-key-1", AdmitRun)
             .unwrap();
         assert_eq!(s.phase, RunPhase::Admitted);
+    }
+
+    #[test]
+    fn append_record_with_key_returns_the_stable_position_on_replay() {
+        let mut store = Store::open_in_memory().unwrap();
+        let first = store
+            .append_record_with_key("chat-1", "whip:event:4", "runtime_pointer", "pointer-a")
+            .unwrap();
+        let replay = store
+            .append_record_with_key("chat-1", "whip:event:4", "runtime_pointer", "pointer-b")
+            .unwrap();
+        assert_eq!(first, (0, true));
+        assert_eq!(replay, (0, false));
+        assert_eq!(
+            store.records("chat-1", "runtime_pointer").unwrap(),
+            vec!["pointer-a"]
+        );
     }
 
     /// A rejected keyed command leaves no receipt, so a corrected retry under the

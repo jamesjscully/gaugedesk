@@ -25,7 +25,29 @@ export interface EmbedSessionApi {
     runTask(id: EngagementId, prompt: string, images?: { data: string; mimeType: string }[]): Promise<unknown>;
     mergeCommand(id: EngagementId, action: MergeAction): Promise<MergeState>;
     getFile(id: EngagementId, path: string): Promise<string>;
+    /** `getFile` plus the cut the read serves (SUB-6 §12) — the base a
+     *  cut-carrying save sends back. Optional so test fakes and older
+     *  hosts stay valid; panels fall back to content-named bases. */
+    getFileWithCut?(
+        id: EngagementId,
+        path: string,
+    ): Promise<{ content: string; cut: string | null }>;
     putFile(id: EngagementId, path: string, content: string): Promise<void>;
+    /** Base-carrying save (SUB-6); fold resolutions mint region memory. */
+    saveFile?(
+        id: EngagementId,
+        path: string,
+        content: string,
+        base: workbenchClient.SaveBase,
+        resolutions?: workbenchClient.RegionResolution[],
+    ): Promise<workbenchClient.SaveFileResult>;
+    /** Read-only save preview (the live fold, §12.3). */
+    previewMerge?(
+        id: EngagementId,
+        path: string,
+        draft: string,
+        baseCut: string,
+    ): Promise<workbenchClient.MergePreviewResult>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
     embedMyChats(): Promise<{ chat: string; title: string }[]>;
     embedGetConfig(): Promise<{ white_label: boolean }>;
@@ -126,8 +148,41 @@ export class EmbedControlPlane implements EmbedSessionApi {
         return workbenchClient.getFile(this.workbenchTransport(), id, path);
     }
 
+    getFileWithCut(
+        id: EngagementId,
+        path: string,
+    ): Promise<{ content: string; cut: string | null }> {
+        return workbenchClient.getFileWithCut(this.workbenchTransport(), id, path);
+    }
+
     putFile(id: EngagementId, path: string, content: string): Promise<void> {
         return workbenchClient.putFile(this.workbenchTransport(), id, path, content);
+    }
+
+    saveFile(
+        id: EngagementId,
+        path: string,
+        content: string,
+        base: workbenchClient.SaveBase,
+        resolutions?: workbenchClient.RegionResolution[],
+    ): Promise<workbenchClient.SaveFileResult> {
+        return workbenchClient.saveFile(
+            this.workbenchTransport(),
+            id,
+            path,
+            content,
+            base,
+            resolutions,
+        );
+    }
+
+    previewMerge(
+        id: EngagementId,
+        path: string,
+        draft: string,
+        baseCut: string,
+    ): Promise<workbenchClient.MergePreviewResult> {
+        return workbenchClient.previewMerge(this.workbenchTransport(), id, path, draft, baseCut);
     }
 
     getTree(id: EngagementId): Promise<FileEntry[]> {

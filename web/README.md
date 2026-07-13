@@ -25,7 +25,7 @@ facet-browser nav), `packages/workbench-ui/src/DiffView.tsx`,
 `packages/workbench-ui/src/styles.css` build the workbench against the
 projection core. The transcript is fed by a **live SSE
 stream** (`api.subscribe`), so model tokens render token-by-token; the task
-composer drives a real Pi turn; the content panel shows the diff with a
+composer drives a real WhippleScript turn; the content panel shows the diff with a
 keep → `main` action.
 
 **Built on Solid 1.x.** Solid 2.0 (`2.0.0-experimental.16`) ships no client DOM

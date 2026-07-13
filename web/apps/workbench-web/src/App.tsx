@@ -101,6 +101,10 @@ import {
 import { isMobileHarness, MobileApp } from "@gaugewright/mobile-web";
 
 const api = new WorkbenchControlPlane(controlPlaneBase());
+// The Codex helper owns a localhost callback listener, which only works when the
+// workbench and helper run on the same machine. Hosted Console builds set this
+// false so they never offer a dead-end sign-in action.
+const codexLoginAvailable = import.meta.env.VITE_CODEX_LOGIN !== "false";
 // OIDC login (ID-3): if we just returned from `/auth/callback`, capture the id-token
 // from the URL fragment before the first request, then hand the bearer to the
 // transport so gated `/admin/*` calls carry it. Signed-out / single-user local is the
@@ -274,7 +278,7 @@ export function App() {
     const chatProvider = () => readChatProvider(chatConfig() ?? "");
     const chatThinking = () => readChatThinking(chatConfig() ?? "");
     // The model picker + reasoning-effort toggle offer only what the operator's linked
-    // accounts actually provide (LLM-1, ADR 0062), derived from the Pi model catalog.
+    // accounts actually provide (LLM-1, ADR 0062), derived from the GaugeDesk catalog.
     // Keyed on `selected` so opening/switching a chat — the only time the picker shows —
     // re-reads the linked providers (a key linked or the codex OAuth signed in elsewhere
     // shows up on the next chat open). Failures degrade to "nothing linked" → just Default.
@@ -314,8 +318,19 @@ export function App() {
         return ps;
     });
     const enabledModels = createMemo(() => parseEnabledModels(acctSettings()?.[ENABLED_MODELS_SETTING]));
+    // The engine's resolved no-pin default (provider + model), so the picker's
+    // first row names what "Default" actually runs. Startup-time server truth (it
+    // changes only with host config); a failed probe degrades to the blind
+    // "Default" label rather than blocking the picker.
+    const [resolvedDefault] = createResource(() => api.defaultModel().catch(() => null));
     const modelChoices = createMemo<ModelOption[]>(() =>
-        modelOptions(linkedAccounts(), enabledModels(), { id: chatModel(), provider: chatProvider() }),
+        modelOptions(
+            linkedAccounts(),
+            enabledModels(),
+            { id: chatModel(), provider: chatProvider() },
+            undefined,
+            resolvedDefault() ?? null,
+        ),
     );
     // The current pin as the `<select>` value: `provider:id`, or "" for Default.
     const modelValue = () => (chatModel() ? modelKey({ id: chatModel(), provider: chatProvider() }) : "");
@@ -338,7 +353,7 @@ export function App() {
             setStatus(`couldn't set the model — ${String(e)}`);
         }
     }
-    // Pin the reasoning effort (Pi `--thinking`) for this chat; "" clears it (model default).
+    // Pin the reasoning effort for this chat; "" clears it (model default).
     async function pickThinking(level: string) {
         const id = selected();
         if (!id) return;
@@ -561,8 +576,11 @@ export function App() {
     const saveFilterDefault = () => savePrefs(filterStorage, filterPrefs());
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
     const [showShelf, setShowShelf] = createSignal(false);
-    const [showContext, setShowContext] = createSignal(false);
-    const [contextPath, setContextPath] = createSignal("");
+    // "Add files"/"Add a file" in the browser open native OS pickers via these hidden
+    // inputs; their contents are uploaded (UX-14 / UX-1 / ENTSEC-5). The desktop shell
+    // takes the native-path route instead (see addFiles/addFile).
+    let addFolderInput: HTMLInputElement | undefined;
+    let addFileInput: HTMLInputElement | undefined;
     // The context-sources panel (RF-E1 / O-1): lists what context the chat holds.
     const [showSources, setShowSources] = createSignal(false);
 
@@ -673,7 +691,7 @@ export function App() {
         }
     }
 
-    // Stop a running turn (run-chat.md): aborts the agent's Pi child; the in-flight
+    // Stop a running turn (run-chat.md): requests WhippleScript cancellation; the in-flight
     // task POST then resolves as failed and the composer re-enables.
     async function stopTurn() {
         const id = selected();
@@ -712,6 +730,7 @@ export function App() {
         // Adopt the first message as the chat's title before the transcript fills.
         await maybeAutoTitle(id, prompt);
         setPendingApprovals([]); // a fresh turn clears the prior turn's pending approvals
+        let awaitingHuman = false;
         try {
             const res = (await api.runTask(id, prompt, images)) as {
                 pending_approvals?: string[];
@@ -724,10 +743,17 @@ export function App() {
             // status. Report it honestly instead of a blanket "turn complete" — the
             // reason itself is also a durable transcript line (loadSnapshot shows it).
             const failed = res?.run_phase === "Failed";
+            awaitingHuman = res?.run_phase === "AwaitingHuman";
             setRunTone(id, failed ? "error" : null);
             bumpNav(); // refresh nav + tasks (auto-title, review dot)
             if (isCurrent()) {
-                setStatus(failed ? `turn failed${res?.error ? ` — ${res.error}` : ""}` : "turn complete");
+                setStatus(
+                    failed
+                        ? `turn failed${res?.error ? ` — ${res.error}` : ""}`
+                        : awaitingHuman
+                          ? "waiting for your answer"
+                          : "turn complete",
+                );
                 await Promise.all([loadSnapshot(id), refetchRun(), refetchDiff(), refetchMerge()]);
             }
         } catch (e) {
@@ -742,7 +768,7 @@ export function App() {
             retireSend(rid);
             if (isCurrent()) {
                 setActivity("");
-                pump();
+                if (!awaitingHuman) pump();
             }
         }
     }
@@ -785,7 +811,7 @@ export function App() {
 
     // Build the outgoing turn from the draft + pending attachments, then clear them
     // (attachments are message-scoped). Text files inline into the prompt as delimited
-    // blocks; images become native `images[]` (sent to Pi as image content blocks, not
+    // blocks; images become native `images[]` (resolved as WhippleScript resources, not
     // inlined) with only a byte-free `[attached image: …]` note left in the text so the
     // durable transcript honestly shows one rode along (run-chat.md "Message
     // attachments"; base64 never enters the log — INV-10).
@@ -817,7 +843,7 @@ export function App() {
     }
 
     // Paperclip attach (UX-14): a plain <input type=file> (works in the browser and
-    // the Tauri webview — no plugin, no backend). Images go to Pi as native image
+    // the Tauri webview — no plugin, no backend). Images go to WhippleScript as native image
     // blocks; text files inline into the prompt. PDF/Office aren't supported yet — the
     // classify() seam is where future client-side extraction (text + images) lands.
     async function onAttachInput(e: Event) {
@@ -923,24 +949,58 @@ export function App() {
         try {
             const c = await api.ingestContext(id, path);
             setStatus(`ingested ${c} file(s)`);
-            setShowContext(false);
-            setContextPath("");
             await Promise.all([refetchDiff(), refetchMerge()]);
         } catch (e) {
             setStatus(`context error: ${String(e)}`);
         }
     }
 
-    // Browser/test build: attach the path typed into the fallback box.
-    const attachContext = () => ingestPath(contextPath().trim());
+    // Files too big to inline as text are skipped rather than uploaded — the ingest
+    // endpoint stores content as text, so binaries/blobs don't round-trip anyway.
+    const MAX_UPLOAD_BYTES = 1024 * 1024;
 
-    // "add files": in the desktop shell, open the native OS folder picker; in a
-    // plain browser (incl. e2e) fall back to the paste-a-path box. The backend
-    // ingests by absolute filesystem path (it copies the folder recursively),
-    // which is exactly what the native picker returns.
+    // Browser context ingest: a native picker (folder or single file) hands us
+    // `File`s; we read their text and upload it (ENTSEC-5). No absolute path is
+    // involved — browsers hide those — so this is the path-free counterpart to the
+    // desktop shell's native-path ingest. Called from the hidden inputs' onChange.
+    async function uploadPickedFiles(input: HTMLInputElement | undefined) {
+        const id = selected();
+        if (!id || !input) return;
+        const picked = Array.from(input.files ?? []);
+        input.value = ""; // let the same folder/file be picked again later
+        if (!picked.length) return;
+        const files: { name: string; content: string }[] = [];
+        const skipped: string[] = [];
+        for (const f of picked) {
+            if (f.size > MAX_UPLOAD_BYTES) {
+                skipped.push(f.name);
+                continue;
+            }
+            try {
+                files.push({ name: f.name, content: await f.text() });
+            } catch {
+                skipped.push(f.name);
+            }
+        }
+        if (!files.length) {
+            setStatus(`nothing ingested — ${skipped.length} file(s) too large or unreadable`);
+            return;
+        }
+        try {
+            const n = await api.ingestContextUpload(id, files);
+            setStatus(skipped.length ? `ingested ${n} file(s); skipped ${skipped.length}` : `ingested ${n} file(s)`);
+            await Promise.all([refetchDiff(), refetchMerge()]);
+        } catch (e) {
+            setStatus(`context error: ${String(e)}`);
+        }
+    }
+
+    // "add files": in the desktop shell, open the native OS folder picker (which
+    // returns a real path the backend ingests by copying recursively); in the
+    // browser, open the native folder picker and upload the files' contents.
     async function addFiles() {
         if (!isTauri()) {
-            setShowContext((v) => !v);
+            addFolderInput?.click();
             return;
         }
         const { open } = await import("@tauri-apps/plugin-dialog");
@@ -952,11 +1012,11 @@ export function App() {
         if (typeof dir === "string") await ingestPath(dir);
     }
 
-    // "add a file" (UX-1): single-file native picker in the desktop shell; the browser
-    // falls back to the same paste-a-path box. The backend ingests a file path directly.
+    // "add a file" (UX-1): single-file native picker. Desktop ingests the path; the
+    // browser opens the native file picker and uploads the file's contents.
     async function addFile() {
         if (!isTauri()) {
-            setShowContext((v) => !v);
+            addFileInput?.click();
             return;
         }
         const { open } = await import("@tauri-apps/plugin-dialog");
@@ -980,6 +1040,7 @@ export function App() {
         // decision the human must make (WS-H c) — then working / needs-review / ready.
         const t = runToneOf(selected());
         if (merge()?.phase === "Repairing") return { tone: "conflict", label: "Conflict" };
+        if (phase() === "AwaitingHuman") return { tone: "review", label: "Needs answer" };
         if (t === "working") return { tone: "working", label: "Working" };
         if (t === "review" || merge()?.phase === "Clean") return { tone: "review", label: "Needs review" };
         return { tone: "ready", label: "Ready" };
@@ -1201,7 +1262,12 @@ export function App() {
             </Show>
             {/* Settings (FED-7): a gear to the right of the network toggle; opens the
                 settings menu → Devices, the single device-management modal. */}
-            <SettingsMenu api={api} openAccount={accountRequest} openInvite={inviteDeepLink} />
+            <SettingsMenu
+                api={api}
+                codexLoginAvailable={codexLoginAvailable}
+                openAccount={accountRequest}
+                openInvite={inviteDeepLink}
+            />
         </div>
     );
 
@@ -1230,7 +1296,7 @@ export function App() {
                             title="Add a folder of files for the agent to work with (copied into this chat's workspace)"
                             onClick={addFiles}
                         >
-                            <Icon name="add-files" />
+                            <Icon name="add-folder" />
                         </button>
                         <button
                             class="icon-btn"
@@ -1243,24 +1309,30 @@ export function App() {
                     </span>
                 </Show>
             </h2>
+            {/* Hidden native pickers behind the header's "Add files"/"Add a file"
+                buttons (browser build). `webkitdirectory` (set via ref — it isn't a
+                typed JSX attribute) makes the first a folder picker; the second is a
+                single-file picker. Selected files' contents are uploaded (ENTSEC-5).
+                Kept outside `.composer` so composer input steps don't match them. */}
+            <input
+                ref={(el) => {
+                    addFolderInput = el;
+                    el.setAttribute("webkitdirectory", "");
+                }}
+                type="file"
+                multiple
+                data-add-folder-input
+                style={{ display: "none" }}
+                onChange={() => void uploadPickedFiles(addFolderInput)}
+            />
+            <input
+                ref={(el) => (addFileInput = el)}
+                type="file"
+                data-add-file-input
+                style={{ display: "none" }}
+                onChange={() => void uploadPickedFiles(addFileInput)}
+            />
             <Show when={selected()} fallback={<div class="status">Open a chat to see the files it's working with.</div>}>
-                <Show when={showContext()}>
-                    {/* In the desktop app "add files" opens a real OS folder picker
-                        (see addFiles); this typed path is the browser fallback only. */}
-                    <div class="add-files-fallback" style={{ "margin-bottom": "8px" }}>
-                        <div class="bar">
-                            <input
-                                data-context-path
-                                placeholder="paste a folder location…"
-                                value={contextPath()}
-                                onInput={(e) => setContextPath(e.currentTarget.value)}
-                                onKeyDown={(e) => e.key === "Enter" && attachContext()}
-                            />
-                            <button data-context-attach onClick={attachContext}>attach</button>
-                        </div>
-                        <span class="status">In the desktop app this opens a folder picker — no typing needed.</span>
-                    </div>
-                </Show>
                 <Workspace />
             </Show>
         </>
@@ -1470,7 +1542,7 @@ export function App() {
                     />
                     {/* The per-chat model picker + reasoning-effort toggle (LLM-1, ADR 0062):
                         a thin toolbar above the input. The picker lists the models the
-                        linked accounts provide (from the Pi catalog); the effort toggle
+                        linked accounts provide (from the GaugeDesk catalog); the effort toggle
                         appears only for models that support reasoning, and its options are
                         that model's `--thinking` levels. Both write the chat's config
                         (model+provider / thinking) — the global→archetype→chat axis; the
@@ -1837,6 +1909,7 @@ export function App() {
                 <FirstRunOverlay
                     api={api}
                     productName="GaugeDesk"
+                    codexLoginAvailable={codexLoginAvailable}
                     onConnected={() => {
                         void refetchStartupCreds();
                         void refetchStartupCodex();

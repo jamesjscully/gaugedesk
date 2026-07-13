@@ -35,11 +35,12 @@ import {
     controlPlaneBase,
     type RouteJson,
 } from "@gaugewright/control-plane-client";
+import type { ControlPlane } from "@gaugewright/control-plane-client";
 
 export { controlPlaneBase };
 
 /** App-owned control-plane edge for the open workbench shell. */
-export class WorkbenchControlPlane {
+export class WorkbenchControlPlane implements ControlPlane {
     private bearer: string | null = null;
     private readonly route: RouteJson;
 
@@ -295,8 +296,41 @@ export class WorkbenchControlPlane {
         return workbenchClient.getFile(this.workbenchTransport(), id, path);
     }
 
+    getFileWithCut(
+        id: EngagementId,
+        path: string,
+    ): Promise<{ content: string; cut: string | null }> {
+        return workbenchClient.getFileWithCut(this.workbenchTransport(), id, path);
+    }
+
     putFile(id: EngagementId, path: string, content: string): Promise<void> {
         return workbenchClient.putFile(this.workbenchTransport(), id, path, content);
+    }
+
+    saveFile(
+        id: EngagementId,
+        path: string,
+        content: string,
+        base: workbenchClient.SaveBase,
+        resolutions?: workbenchClient.RegionResolution[],
+    ): Promise<workbenchClient.SaveFileResult> {
+        return workbenchClient.saveFile(
+            this.workbenchTransport(),
+            id,
+            path,
+            content,
+            base,
+            resolutions,
+        );
+    }
+
+    previewMerge(
+        id: EngagementId,
+        path: string,
+        draft: string,
+        baseCut: string,
+    ): Promise<workbenchClient.MergePreviewResult> {
+        return workbenchClient.previewMerge(this.workbenchTransport(), id, path, draft, baseCut);
     }
 
     getConfig(id: EngagementId): Promise<string> {
@@ -309,6 +343,10 @@ export class WorkbenchControlPlane {
 
     ingestContext(id: EngagementId, path: string): Promise<number> {
         return workbenchClient.ingestContext(this.workbenchTransport(), id, path);
+    }
+
+    ingestContextUpload(id: EngagementId, files: workbenchClient.UploadContextFile[]): Promise<number> {
+        return workbenchClient.ingestContextUpload(this.workbenchTransport(), id, files);
     }
 
     openPairing(device: string, bridgeGrant: string | null): Promise<{ pairingId: string; bridgeGrant: string }> {
@@ -541,6 +579,10 @@ export class WorkbenchControlPlane {
 
     onboardingStatus(): Promise<{ credentialRequired: boolean }> {
         return accountClient.onboardingStatus(this.routeJson());
+    }
+
+    defaultModel(): Promise<{ provider: string; model: string | null }> {
+        return accountClient.defaultModel(this.routeJson());
     }
 
     codexLoginStart(): Promise<{ url: string }> {

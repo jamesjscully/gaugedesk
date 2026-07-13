@@ -1,87 +1,108 @@
 #!/usr/bin/env node
-/**
- * OpenAI **codex OAuth** link helper (LLM-1, ADR 0062).
+/** GaugeDesk-owned OpenAI Codex OAuth helper.
  *
- * Reuses Pi's own tested codex OAuth flow (`@mariozechner/pi-ai`
- * `utils/oauth/openai-codex.js` — `loginOpenAICodex`): PKCE authorize, a local
- * `:1455/auth/callback` server, token exchange. On success it writes the credential
- * into `~/.pi/agent/auth.json` under `openai-codex` (the exact shape Pi stores and the
- * gaugewright engine reads), so a real codex turn can authenticate.
- *
- * The control plane spawns this and reads newline-delimited JSON events on stdout:
- *   {"event":"auth_url","url":"…"}   — open this in a browser to authorize
- *   {"event":"linked","accountId":"…","expires":<ms>}
- *   {"event":"error","message":"…"}
- *
- * We never see the user's password — OAuth is the user's action in their browser.
- * Locate the pi-ai module from GAUGEWRIGHT_PI_BIN (the same binary the engine spawns).
+ * Runs PKCE + the loopback callback and emits the resulting credential bundle
+ * only over its private stdout pipe to the GaugeDesk control plane. GaugeDesk
+ * seals and stores it; this helper never writes Pi, Codex, or WhippleScript
+ * configuration files.
  */
 
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { createServer } from "node:http";
 
-const emit = (o) => process.stdout.write(JSON.stringify(o) + "\n");
-const fail = (message) => {
-    emit({ event: "error", message: String(message) });
+const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
+const TOKEN_URL = "https://auth.openai.com/oauth/token";
+const REDIRECT_URI = "http://localhost:1455/auth/callback";
+const SCOPE = "openid profile email offline_access";
+const JWT_CLAIM = "https://api.openai.com/auth";
+
+const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+const fail = (error) => {
+    emit({ event: "error", message: String(error?.message || error) });
     process.exit(1);
 };
+const base64url = (bytes) => Buffer.from(bytes).toString("base64url");
 
-function codexOAuthModulePath() {
-    const piBin = process.env.GAUGEWRIGHT_PI_BIN || "pi";
-    let real;
+function accountId(access) {
     try {
-        real = realpathSync(piBin);
+        const payload = JSON.parse(Buffer.from(access.split(".")[1], "base64url").toString("utf8"));
+        const value = payload?.[JWT_CLAIM]?.chatgpt_account_id;
+        return typeof value === "string" && value ? value : null;
     } catch {
-        return null; // not an absolute/resolvable path
+        return null;
     }
-    // real = <root>/dist/cli.js  ⇒  package root = dirname(dirname(real))
-    const root = dirname(dirname(real));
-    const p = join(root, "node_modules", "@mariozechner", "pi-ai", "dist", "utils", "oauth", "openai-codex.js");
-    return existsSync(p) ? p : null;
 }
 
-const modPath = codexOAuthModulePath();
-if (!modPath) fail("could not locate the pi-ai codex OAuth module from GAUGEWRIGHT_PI_BIN");
-
-const { loginOpenAICodex } = await import(modPath);
-if (typeof loginOpenAICodex !== "function") fail("pi-ai does not export loginOpenAICodex (incompatible Pi version)");
+async function exchange(code, verifier) {
+    const response = await fetch(TOKEN_URL, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: CLIENT_ID,
+            code,
+            code_verifier: verifier,
+            redirect_uri: REDIRECT_URI,
+        }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.access_token || !body.refresh_token || typeof body.expires_in !== "number") {
+        throw new Error(`OpenAI Codex token exchange failed (${response.status})`);
+    }
+    const account = accountId(body.access_token);
+    if (!account) throw new Error("OpenAI Codex access token has no account id");
+    return {
+        access: body.access_token,
+        refresh: body.refresh_token,
+        expires: Date.now() + body.expires_in * 1000,
+        accountId: account,
+    };
+}
 
 try {
-    const cred = await loginOpenAICodex({
-        originator: "pi",
-        onAuth: ({ url }) => {
-            // The orchestrator (control plane → web client) opens this in the user's
-            // browser; the helper only runs the callback server + token exchange.
-            emit({ event: "auth_url", url });
-        },
-        // The browser callback is the happy path; if no code arrives we fail cleanly
-        // rather than hang on an interactive prompt (this runs headless under the CP).
-        onPrompt: async () => {
-            throw new Error("no authorization code received on the callback");
-        },
-    });
+    const verifier = base64url(randomBytes(32));
+    const challenge = base64url(createHash("sha256").update(verifier).digest());
+    const state = randomBytes(16).toString("hex");
+    const authorize = new URL(AUTHORIZE_URL);
+    for (const [key, value] of Object.entries({
+        response_type: "code",
+        client_id: CLIENT_ID,
+        redirect_uri: REDIRECT_URI,
+        scope: SCOPE,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state,
+        id_token_add_organizations: "true",
+        codex_cli_simplified_flow: "true",
+        originator: "gaugedesk",
+    })) authorize.searchParams.set(key, value);
 
-    const authPath = join(homedir(), ".pi", "agent", "auth.json");
-    mkdirSync(dirname(authPath), { recursive: true });
-    let store = {};
-    if (existsSync(authPath)) {
-        try {
-            store = JSON.parse(readFileSync(authPath, "utf8"));
-        } catch {
-            store = {};
-        }
-    }
-    store["openai-codex"] = {
-        type: "oauth",
-        access: cred.access,
-        refresh: cred.refresh,
-        expires: cred.expires,
-        accountId: cred.accountId,
-    };
-    writeFileSync(authPath, JSON.stringify(store, null, 2));
-    emit({ event: "linked", accountId: cred.accountId, expires: cred.expires });
-    process.exit(0);
-} catch (e) {
-    fail(e?.message || e);
+    const code = await new Promise((resolve, reject) => {
+        const server = createServer((request, response) => {
+            const url = new URL(request.url || "", "http://localhost");
+            if (url.pathname !== "/auth/callback" || url.searchParams.get("state") !== state) {
+                response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+                response.end("GaugeDesk authentication failed: invalid callback.");
+                return;
+            }
+            const value = url.searchParams.get("code");
+            if (!value) {
+                response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+                response.end("GaugeDesk authentication failed: missing code.");
+                return;
+            }
+            response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+            response.end("GaugeDesk authentication completed. You can close this window.");
+            server.close();
+            resolve(value);
+        });
+        server.once("error", reject);
+        server.listen(1455, process.env.GAUGEWRIGHT_OAUTH_CALLBACK_HOST || "127.0.0.1", () => {
+            emit({ event: "auth_url", url: authorize.toString() });
+        });
+    });
+    emit({ event: "linked", ...(await exchange(code, verifier)) });
+} catch (error) {
+    fail(error);
 }
