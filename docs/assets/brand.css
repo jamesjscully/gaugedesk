@@ -2,7 +2,7 @@
    SSOT (hub: brand/palette.css, brand/typography.css). Navy-led, brand-blue
    accent, serif-voice headings. Honest capability-status badges below. */
 
-@import url('https://fonts.googleapis.com/css2?family=STIX+Two+Text:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=STIX+Two+Text:wght@400&display=swap');
 
 @font-face {
   font-family: "Manrope";
@@ -64,12 +64,19 @@
 .md-header__title,
 .md-nav__title {
   font-family: var(--gw-serif);
+  font-weight: 400;
 }
 .md-typeset h1,
 .md-typeset h2,
 .md-typeset h3 {
-  font-weight: 400;
   letter-spacing: -0.01em;
+}
+.md-typeset h1 :is(b, strong),
+.md-typeset h2 :is(b, strong),
+.md-typeset h3 :is(b, strong),
+.md-header__title :is(b, strong),
+.md-nav__title :is(b, strong) {
+  font-weight: inherit;
 }
 
 /* Inline capability-status badges, used throughout the docs.
